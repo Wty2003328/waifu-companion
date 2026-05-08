@@ -18,7 +18,10 @@ export default function Avatar() {
   const [chatInput, setChatInput] = useState('');
   const [sending, setSending] = useState(false);
   const [modelActions, setModelActions] = useState<ModelActions>({ expressions: [], motions: [] });
+  const [pendingAudio, setPendingAudio] = useState<HTMLAudioElement | null>(null);
+  const [audioError, setAudioError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUnlockedRef = useRef(false);
   const viewerRef = useRef<Live2DViewerHandle>(null);
 
   // companion-server WS endpoint. Vite dev proxies /ws → ws://127.0.0.1:9181.
@@ -38,20 +41,39 @@ export default function Avatar() {
       if (match) viewerRef.current?.playMotion(match.group, match.index);
     },
     onAudio: (audioBase64, format, _sampleRate, lipSync) => {
+      const mime = format === 'mp3' ? 'mpeg' : format;
       const audioBlob = new Blob(
         [Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0))],
-        { type: `audio/${format === 'mp3' ? 'mpeg' : format}` }
+        { type: `audio/${mime}` }
       );
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
       audioRef.current = audio;
       audio.onended = () => {
         setIsPlaying(false);
+        setPendingAudio(null);
         URL.revokeObjectURL(audioUrl);
       };
       setIsPlaying(true);
       setLipSyncData(lipSync);
-      audio.play().catch(() => setIsPlaying(false));
+      // Browser autoplay policy: a 10–20s wait for the agent reply may
+      // exceed the user-gesture window from the original Send click.
+      // Surface the error and stash the element so the user can click a
+      // "Play" button to start it manually. Once they click once,
+      // subsequent replies in this session play automatically.
+      audio.play()
+        .then(() => {
+          audioUnlockedRef.current = true;
+          setAudioError(null);
+        })
+        .catch((err) => {
+          console.error('audio playback blocked:', err);
+          setIsPlaying(false);
+          setAudioError(err.name === 'NotAllowedError'
+            ? 'Browser blocked audio. Click "Play" to enable.'
+            : `Audio error: ${err.message}`);
+          setPendingAudio(audio);
+        });
     },
     onText: (content) => setSubtitle(content),
     onIdle: () => {
@@ -72,10 +94,30 @@ export default function Avatar() {
   }, [sendMotionRequest]);
 
   // Send a user message to upstream zeroclaw via the companion-server proxy.
-  // The reply lands back in the avatar via the SSE bridge.
+  // The reply lands back via the WS in 10–20s.
   const handleSendChat = useCallback(async () => {
     const text = chatInput.trim();
     if (!text || sending) return;
+
+    // Browser autoplay policy: this Send click is a user gesture that
+    // unlocks audio. Play a 1-frame silent buffer right now so the
+    // browser registers an active audio context. When the real audio
+    // arrives 10–20s later it can autoplay because audio is unlocked.
+    if (!audioUnlockedRef.current) {
+      const silent = new Audio(
+        // 1-frame silent WAV, base64-encoded.
+        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA='
+      );
+      silent
+        .play()
+        .then(() => {
+          audioUnlockedRef.current = true;
+        })
+        .catch(() => {
+          // Will fall back to manual click-to-play in onAudio handler.
+        });
+    }
+
     setSending(true);
     setChatInput('');
     try {
@@ -139,6 +181,39 @@ export default function Avatar() {
               <div style={{ fontSize: 32, marginBottom: 12 }}>{connected ? '🎭' : '🔌'}</div>
               <div>{connected ? 'Waiting for model info…' : 'Connecting to avatar…'}</div>
             </div>
+          </div>
+        )}
+        {pendingAudio && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 16,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              background: '#3b82f6',
+              color: '#fff',
+              padding: '10px 18px',
+              borderRadius: 10,
+              fontSize: 14,
+              cursor: 'pointer',
+              fontWeight: 600,
+              boxShadow: '0 4px 12px rgba(59,130,246,0.4)',
+            }}
+            onClick={() => {
+              pendingAudio
+                .play()
+                .then(() => {
+                  audioUnlockedRef.current = true;
+                  setIsPlaying(true);
+                  setAudioError(null);
+                  setPendingAudio(null);
+                })
+                .catch((e) => {
+                  setAudioError(`Still blocked: ${e.message}`);
+                });
+            }}
+          >
+            ▶  {audioError ?? 'Click to play audio'}
           </div>
         )}
         {subtitle && (
