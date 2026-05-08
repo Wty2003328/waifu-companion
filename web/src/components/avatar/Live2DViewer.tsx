@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState, useImperativeHandle, forwardRef } from 'react';
 import * as PIXI from 'pixi.js';
+// `@pixi/unsafe-eval` replaces PIXI's eval-based shader compiler with one
+// that doesn't need `unsafe-eval` in the CSP. Required for Tauri 2 / browser
+// extensions / any strict-CSP environment. Must run BEFORE the first PIXI
+// Application is constructed.
+import { install as installUnsafeEvalShim } from '@pixi/unsafe-eval';
 import type { LipSyncDataProto } from './useAvatarSocket';
+
+installUnsafeEvalShim(PIXI);
 
 // Required by pixi-live2d-display
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -9,8 +16,11 @@ import type { LipSyncDataProto } from './useAvatarSocket';
 // Auto-pick Cubism 2 vs Cubism 4 by sniffing the model manifest.
 // Cubism 4 files end in `.model3.json` and reference a `.moc3` mesh.
 // Cubism 2 files are usually `model.json` / `*model*.json` referencing a `.moc`.
-// `pixi-live2d-display` ships separate entry points for each.
-async function loadModel(modelUrl: string) {
+// `pixi-live2d-display` ships separate entry points for each. Return type
+// is widened to `any` because the union of the two Live2DModel types loses
+// the inherited PIXI.Container properties (width/height/scale/x/y) we use.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function loadModel(modelUrl: string): Promise<any> {
   const isCubism4 = modelUrl.toLowerCase().endsWith('.model3.json');
   if (isCubism4) {
     const mod = await import('pixi-live2d-display/cubism4');
