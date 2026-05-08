@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { HTTP_BASE } from '../lib/apiBase';
 
 interface FeedItem {
   id: string;
@@ -38,10 +39,16 @@ export default function Pulse() {
       const params = new URLSearchParams({ limit: '50' });
       if (filter) params.set('source', filter);
       const [feedR, statusR] = await Promise.all([
-        fetch(`/api/pulse/feed?${params}`),
-        fetch(`/api/pulse/status`),
+        fetch(`${HTTP_BASE}/api/pulse/feed?${params}`),
+        fetch(`${HTTP_BASE}/api/pulse/status`),
       ]);
-      if (feedR.status === 404 || statusR.status === 404) {
+      // When Pulse is disabled, /api/pulse/* isn't a route. Browser
+      // gets 404; Tauri webview gets the SPA-fallback HTML (200 + text/html).
+      // Detect both: status >= 400 OR a non-JSON content type.
+      const looksDisabled = (r: Response) =>
+        r.status === 404 ||
+        !(r.headers.get('content-type') ?? '').toLowerCase().includes('json');
+      if (looksDisabled(feedR) || looksDisabled(statusR)) {
         setError('Pulse is disabled in companion.toml. Set [pulse] enabled = true to use this.');
         setItems([]);
         setStatus(null);
@@ -68,7 +75,7 @@ export default function Pulse() {
   }, [fetchAll]);
 
   const trigger = async (cid: string) => {
-    await fetch(`/api/pulse/trigger/${cid}`, { method: 'POST' });
+    await fetch(`${HTTP_BASE}/api/pulse/trigger/${cid}`, { method: 'POST' });
     setTimeout(fetchAll, 1000);
   };
 

@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import Live2DViewer, { type Live2DViewerHandle, type ModelActions } from '../components/avatar/Live2DViewer';
 import AvatarControls from '../components/avatar/AvatarControls';
 import { useAvatarSocket, type LipSyncDataProto } from '../components/avatar/useAvatarSocket';
+import { HTTP_BASE, WS_BASE } from '../lib/apiBase';
 
 interface ModelInfo {
   modelUrl: string;
@@ -55,8 +56,7 @@ export default function Avatar() {
   const viewerRef = useRef<Live2DViewerHandle>(null);
   const historyRef = useRef<HTMLDivElement>(null);
 
-  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${wsProtocol}//${window.location.host}/ws/avatar`;
+  const wsUrl = `${WS_BASE}/ws/avatar`;
 
   // Auto-scroll history to bottom whenever it grows.
   useEffect(() => {
@@ -160,7 +160,7 @@ export default function Avatar() {
     setSending(true);
     setChatInput('');
     try {
-      const resp = await fetch('/api/chat', {
+      const resp = await fetch(`${HTTP_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),

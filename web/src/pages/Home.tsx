@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { HTTP_BASE } from '../lib/apiBase';
 
 interface CompanionStatus {
   ok: boolean;
@@ -15,7 +16,7 @@ export default function Home() {
     let cancelled = false;
     const tick = async () => {
       try {
-        const r = await fetch('/api/status');
+        const r = await fetch(`${HTTP_BASE}/api/status`);
         if (!r.ok) throw new Error(`status ${r.status}`);
         const data: CompanionStatus = await r.json();
         if (!cancelled) {
