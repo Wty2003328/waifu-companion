@@ -368,7 +368,7 @@ function SubagentEditor({
         <Button onClick={handleSave} primary disabled={!dirty || saving}>
           {saving ? 'saving…' : 'Save'}
         </Button>
-        <Button onClick={handleRestart} disabled={!savedAt}>
+        <Button onClick={handleRestart}>
           Restart
         </Button>
       </Row>

@@ -20,6 +20,7 @@ Cargo.lock.bak
 
 # Local config
 companion.toml
+companion.runtime.json
 .env
 .env.*
 
