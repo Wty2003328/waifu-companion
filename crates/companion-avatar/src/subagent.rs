@@ -69,10 +69,18 @@ impl SubagentBackend for ZeroclawWebhookBackend {
 
 /// System prompt template. `{chat_lang}` and `{tts_lang}` are substituted
 /// at call time so the subagent knows whether to translate.
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You analyze a Live2D anime avatar's spoken reply.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are the voice director for an anime avatar (Yuuki Asuna from SAO).
+You receive the raw output text from a chat agent and produce both the
+clean version users see in the chat bubble AND the natural-sounding
+version the avatar speaks out loud.
 
 Inputs:
-- The agent's text reply (in language: {chat_lang}).
+- The agent's raw output (in language: {chat_lang}). It MAY contain
+  thinking-trace preamble like "The user said …", "Let me check …",
+  "Looking at the context …", scratchpad notes, or memory bookkeeping
+  (e.g. references to "webhook_msg_…", "Let me store this as …",
+  "Let me respond naturally."). Anything before the actual reply to
+  the user is preamble that must be stripped.
 - The TTS speech language: {tts_lang}.
 
 Output ONLY a JSON object (no markdown, no commentary):
@@ -80,10 +88,16 @@ Output ONLY a JSON object (no markdown, no commentary):
   "expression": "<name>",
   "intensity": <0.0-1.0>,
   "motion": {"group": "<group>", "index": <number>} or null,
-  "translated_text": "<reply rendered in {tts_lang}>"
+  "clean_chat_text": "<reply with thinking-preamble stripped, in {chat_lang}>",
+  "translated_text": "<the same reply rendered in {tts_lang}, voiced as Asuna>"
 }
 
 Rules:
+- clean_chat_text:
+  - Drop ALL thinking-style preamble. Keep ONLY what Asuna actually
+    says to the user. The chat bubble should never show the agent's
+    internal monologue.
+  - Preserve emoji and formatting in the kept reply.
 - expression: pick a name from the model's available expressions
   (e.g. F01..F08). Default to "F01" for neutral/factual replies.
   F05 happy/closed eyes; F04 surprised; F02 sad; F03 angry; F06 wide eyes
@@ -93,10 +107,16 @@ Rules:
   group "Idle" (index 0|1) for idle; "TapBody" (index 0..3) for reactions.
   null for most replies.
 - translated_text:
-  - If {chat_lang} == {tts_lang}, copy the input text verbatim.
-  - Otherwise translate the FULL reply naturally into {tts_lang}, preserving
-    tone and emotion (this is what the avatar will SPEAK out loud).
-  - Strip any inline emotion tags like [emotion:happy] from the output.
+  - Translate the CLEANED reply (NOT the preamble) into {tts_lang}.
+  - Voice it as Asuna would say it: warm, friendly, slightly playful,
+    casual register. NOT formal/business Japanese. Use natural
+    everyday phrasing — のだ/だよ/だね/かな endings where appropriate,
+    light contractions, short sentences. Avoid dictionary-literal
+    translation; render the MEANING the way an anime girl would say it.
+  - Strip emoji and inline emotion tags before voicing.
+  - Drop markdown decorations (**bold**, headers, bullet symbols) —
+    speak the words, not the markup.
+  - If {chat_lang} == {tts_lang}, copy clean_chat_text verbatim.
   - Do NOT add narration, stage directions, or quotation marks.
 - Output ONLY the JSON object."#;
 
@@ -110,6 +130,11 @@ pub struct SubagentAnalysis {
     /// when chat and TTS languages match.
     #[serde(default)]
     pub translated_text: Option<String>,
+    /// Reply with any thinking-style preamble stripped, in the chat
+    /// language. This is what the chat bubble should display. None when
+    /// the subagent skipped or the legacy prompt was used.
+    #[serde(default)]
+    pub clean_chat_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +319,7 @@ mod tests {
             intensity: 0.85,
             motion: None,
             translated_text: None,
+            clean_chat_text: None,
         };
         let fallback = Live2DExpression {
             name: "neutral".into(),
@@ -315,6 +341,7 @@ mod tests {
             intensity: -0.5,
             motion: None,
             translated_text: None,
+            clean_chat_text: None,
         };
         let fallback = Live2DExpression {
             name: "neutral".into(),
@@ -332,6 +359,7 @@ mod tests {
             intensity: 0.7,
             motion: None,
             translated_text: None,
+            clean_chat_text: None,
         };
         let fallback = Live2DExpression {
             name: "F01".into(),
@@ -349,6 +377,7 @@ mod tests {
             intensity: 1.5,
             motion: None,
             translated_text: None,
+            clean_chat_text: None,
         };
         let fallback = Live2DExpression {
             name: "neutral".into(),

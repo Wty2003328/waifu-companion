@@ -164,7 +164,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let should_run_subagent = state.subagent.is_some()
         && (need_translation || !state.config.subagent.only_when_translating);
 
-    let (expression, tts_text_opt) = if should_run_subagent {
+    let (expression, tts_text_opt, clean_chat_opt) = if should_run_subagent {
         let subagent = state.subagent.as_ref().unwrap();
         match subagent.analyze(text, &chat_lang, &tts_lang).await {
             Some(analysis) => {
@@ -176,10 +176,11 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
                     });
                 }
                 let translated = analysis.translated_text.clone();
+                let cleaned = analysis.clean_chat_text.clone();
                 let expr = AvatarSubagent::to_expression(&analysis, &keyword_expr);
-                (expr, translated)
+                (expr, translated, cleaned)
             }
-            None => (keyword_expr, None),
+            None => (keyword_expr, None, None),
         }
     } else {
         if state.subagent.is_some() && !need_translation {
@@ -187,10 +188,18 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
                 "avatar: subagent skipped (same language; only_when_translating=true)"
             );
         }
-        (keyword_expr, None)
+        (keyword_expr, None, None)
     };
 
-    let subtitle_text = expression_mapper.strip_tags(text);
+    // Subtitle = the cleaned chat-language reply (subagent-stripped) when
+    // available, else the raw input with expression tags removed. The
+    // subagent strips thinking-style preamble like "The user said …" /
+    // "Let me check …" that some upstream agents leak into their output.
+    let raw_subtitle = expression_mapper.strip_tags(text);
+    let subtitle_text = match clean_chat_opt {
+        Some(t) if !t.trim().is_empty() => expression_mapper.strip_tags(&t),
+        _ => raw_subtitle.clone(),
+    };
     let tts_text = if chat_lang == tts_lang {
         subtitle_text.clone()
     } else {
