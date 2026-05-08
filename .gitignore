@@ -7,6 +7,8 @@ Cargo.lock.bak
 /web/node_modules/
 /web/dist/
 /web/.vite/
+/web/tsconfig.tsbuildinfo
+**/tsconfig.tsbuildinfo
 *.log
 
 # Live2D model assets (large binaries — users provide their own)
