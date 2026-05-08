@@ -101,6 +101,8 @@ fn config_for(port: u16) -> AvatarTtsConfig {
         voice: Some("alice".into()),
         language: "en".into(),
         speed: 1.25,
+        streaming: true,
+        streaming_min_chars: 8,
     }
 }
 

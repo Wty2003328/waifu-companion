@@ -62,7 +62,14 @@ interface UseAvatarSocketOptions {
     audioBase64: string,
     format: string,
     sampleRate: number,
-    lipSync: LipSyncDataProto
+    lipSync: LipSyncDataProto,
+    /** Stable id of the agent turn this chunk belongs to. Same across
+     *  all chunks of one reply; flushes the queue on change. */
+    turnId: string,
+    /** 0-based index of this chunk within its turn. */
+    seq: number,
+    /** True when this is the final chunk of the turn. */
+    last: boolean,
   ) => void;
   onText?: (content: string) => void;
   onDebug?: (frame: DebugFrame) => void;
@@ -123,12 +130,21 @@ export function useAvatarSocket(url: string, options: UseAvatarSocketOptions = {
               }
               break;
             case 'Audio':
-              if (msg.audio && msg.lip_sync && options.onAudio) {
+              // msg.audio may be empty when a chunk failed; we still
+              // forward it so the caller can resolve the queue's
+              // `last` marker.
+              if (msg.lip_sync && options.onAudio) {
                 options.onAudio(
-                  msg.audio,
+                  msg.audio ?? '',
                   msg.format ?? 'wav',
                   msg.sample_rate ?? 22050,
-                  msg.lip_sync
+                  msg.lip_sync,
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  (msg as any).turn_id ?? '',
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  (msg as any).seq ?? 0,
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  Boolean((msg as any).last),
                 );
               }
               break;

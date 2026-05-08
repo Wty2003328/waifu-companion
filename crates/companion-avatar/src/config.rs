@@ -47,6 +47,71 @@ fn default_chat_language() -> String {
     "en".into()
 }
 
+/// Split text into sentence-sized chunks for streaming synthesis.
+///
+/// Boundary characters: `.`, `!`, `?`, `。`, `！`, `？`, newlines.
+/// Chunks shorter than `min_len` are merged with the next sentence so
+/// we don't waste a whole TTS call on "Hi." or " ".
+pub fn split_sentences(text: &str, min_len: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for ch in text.chars() {
+        buf.push(ch);
+        let is_terminal = matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n');
+        if is_terminal && buf.trim().chars().count() >= min_len {
+            out.push(buf.trim().to_string());
+            buf.clear();
+        }
+    }
+    let tail = buf.trim();
+    if !tail.is_empty() {
+        // If the last fragment is too short to stand alone, fold it
+        // into the previous chunk.
+        if tail.chars().count() < min_len && !out.is_empty() {
+            let last = out.last_mut().unwrap();
+            last.push(' ');
+            last.push_str(tail);
+        } else {
+            out.push(tail.to_string());
+        }
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+#[cfg(test)]
+mod tests_split {
+    use super::*;
+
+    #[test]
+    fn splits_english_sentences() {
+        let v = split_sentences("Hello there. How are you? Good!", 4);
+        assert_eq!(v, vec!["Hello there.", "How are you?", "Good!"]);
+    }
+
+    #[test]
+    fn merges_short_tail() {
+        let v = split_sentences("Hello there. Hi", 4);
+        assert_eq!(v, vec!["Hello there. Hi"]);
+    }
+
+    #[test]
+    fn handles_japanese_terminators() {
+        let v = split_sentences("こんにちは。お元気ですか？", 2);
+        assert_eq!(v, vec!["こんにちは。", "お元気ですか？"]);
+    }
+
+    #[test]
+    fn empty_input_yields_nothing() {
+        assert!(split_sentences("", 4).is_empty());
+    }
+
+    #[test]
+    fn no_terminator_returns_whole_text() {
+        let v = split_sentences("just a phrase no period", 4);
+        assert_eq!(v, vec!["just a phrase no period"]);
+    }
+}
+
 /// TTS port configuration.
 ///
 /// The companion speaks a single, model-agnostic HTTP contract:
@@ -86,6 +151,22 @@ pub struct AvatarTtsConfig {
     pub language: String,
     #[serde(default = "default_tts_speed")]
     pub speed: f32,
+    /// When true (default), split each agent reply into sentences and
+    /// synthesize them in order, broadcasting each as its own Audio
+    /// frame. The first chunk arrives ~1–2s after the agent reply
+    /// instead of waiting for the full reply to render. Set false to
+    /// fall back to single-shot synthesis (whole reply as one WAV).
+    #[serde(default = "default_true")]
+    pub streaming: bool,
+    /// Minimum sentence length (in chars) before chunking. Anything
+    /// shorter gets merged with the next sentence so we don't waste a
+    /// TTS call on a one-word fragment.
+    #[serde(default = "default_streaming_min_chars")]
+    pub streaming_min_chars: usize,
+}
+
+fn default_streaming_min_chars() -> usize {
+    8
 }
 
 fn default_tts_engine() -> String {
@@ -120,6 +201,8 @@ impl Default for AvatarTtsConfig {
             voice: None,
             language: default_tts_language(),
             speed: default_tts_speed(),
+            streaming: true,
+            streaming_min_chars: default_streaming_min_chars(),
         }
     }
 }

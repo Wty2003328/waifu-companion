@@ -242,23 +242,71 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         subagent_used,
     });
 
-    // ONE TTS call per turn — not one per connected client.
-    match state.tts.synthesize_with(&tts_text, &tts_lang).await {
-        Ok(audio) => {
-            use base64::Engine;
-            let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
-            bcast(AvatarNotification::Audio {
-                audio: audio_b64,
-                format: audio.format,
-                sample_rate: audio.sample_rate,
-                lip_sync: crate::protocol::LipSyncDataProto {
-                    frames: Vec::new(),
-                    frame_duration_ms: 30,
-                },
-            });
-        }
-        Err(e) => {
-            tracing::warn!("avatar: TTS synthesize failed ({e}), skipping audio");
+    // Sentence-chunked synthesis when streaming is enabled. All chunks
+    // of one turn share `turn_id` so the frontend can queue them
+    // sequentially without confusing them for stale audio. The first
+    // chunk arrives ~1–2s after the agent reply lands instead of
+    // waiting for the full reply to render — the perceived latency
+    // win for long replies.
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let chunks: Vec<String> = if state.config.tts.streaming {
+        let parts = crate::config::split_sentences(
+            &tts_text,
+            state.config.tts.streaming_min_chars,
+        );
+        if parts.is_empty() { vec![tts_text.clone()] } else { parts }
+    } else {
+        vec![tts_text.clone()]
+    };
+    let total = chunks.len();
+    tracing::info!(
+        "avatar: tts streaming={} chunks={} turn_id={}",
+        state.config.tts.streaming,
+        total,
+        turn_id,
+    );
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i + 1 == total;
+        match state.tts.synthesize_with(chunk, &tts_lang).await {
+            Ok(audio) => {
+                use base64::Engine;
+                let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
+                bcast(AvatarNotification::Audio {
+                    audio: audio_b64,
+                    format: audio.format,
+                    sample_rate: audio.sample_rate,
+                    lip_sync: crate::protocol::LipSyncDataProto {
+                        frames: Vec::new(),
+                        frame_duration_ms: 30,
+                    },
+                    turn_id: turn_id.clone(),
+                    seq: i as u32,
+                    last: is_last,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "avatar: TTS synthesize failed on chunk {}/{}: {e}",
+                    i + 1, total
+                );
+                // Still mark the last chunk so the frontend doesn't
+                // wait forever for audio that won't arrive.
+                if is_last {
+                    bcast(AvatarNotification::Audio {
+                        audio: String::new(),
+                        format: "wav".into(),
+                        sample_rate: 0,
+                        lip_sync: crate::protocol::LipSyncDataProto {
+                            frames: Vec::new(),
+                            frame_duration_ms: 30,
+                        },
+                        turn_id: turn_id.clone(),
+                        seq: i as u32,
+                        last: true,
+                    });
+                }
+            }
         }
     }
 

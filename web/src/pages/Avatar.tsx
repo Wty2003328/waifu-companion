@@ -173,19 +173,68 @@ export default function Avatar() {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const audioUnlockedRef = useRef(false);
   const playbackRef = useRef<PlaybackHandle | null>(null);
+  // Sentence-chunked playback queue. The companion server can send
+  // several Audio frames per turn (one per sentence). Buffer them
+  // here and drain sequentially via `drainQueue` so back-to-back
+  // chunks play continuously without overlap or audible gaps.
+  const audioQueueRef = useRef<ArrayBuffer[]>([]);
+  const currentTurnRef = useRef<string | null>(null);
+  const drainingRef = useRef(false);
   const viewerRef = useRef<Live2DViewerHandle>(null);
   const historyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => savePrefs(prefs), [prefs]);
 
-  /** Stop any in-flight audio. Called before starting a new audio
-   *  frame and on unmount. Without this, back-to-back chats produce
-   *  two overlapping Asuna voices. */
+  /** Stop any in-flight audio AND clear the queue. Called when a new
+   *  turn arrives or on unmount. */
   const stopCurrentAudio = useCallback(() => {
     if (playbackRef.current) {
       playbackRef.current.stop();
       playbackRef.current = null;
     }
+    audioQueueRef.current = [];
+    drainingRef.current = false;
+  }, []);
+
+  /** Pull the next chunk from the queue and play it. When it ends,
+   *  recurse into the next chunk if there is one. */
+  const drainQueue = useCallback(() => {
+    if (drainingRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+    drainingRef.current = true;
+    decodeAndPlay(next, () => {
+      drainingRef.current = false;
+      if (audioQueueRef.current.length > 0) {
+        drainQueue();
+      } else {
+        setIsPlaying(false);
+        playbackRef.current = null;
+      }
+    })
+      .then((handle) => {
+        playbackRef.current = handle;
+        audioUnlockedRef.current = true;
+        setAudioError(null);
+        setPendingAudio(null);
+      })
+      .catch((err: Error) => {
+        console.error('audio decode/play failed:', err);
+        drainingRef.current = false;
+        if (err.name === 'NotAllowedError' || /suspend/i.test(err.message)) {
+          setAudioError('Browser blocked audio. Click "Play" to enable.');
+          // Re-prepend the chunk so the manual-play resume continues
+          // from where we got blocked.
+          audioQueueRef.current.unshift(next);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const stub = { play: () => { drainQueue(); return Promise.resolve(); } } as any;
+          setPendingAudio(stub);
+        } else {
+          setAudioError(`Audio error: ${err.message}`);
+          if (audioQueueRef.current.length > 0) drainQueue();
+          else setIsPlaying(false);
+        }
+      });
   }, []);
 
   const wsUrl = `${WS_BASE}/ws/avatar`;
@@ -223,56 +272,30 @@ export default function Avatar() {
       const match = modelActions.motions.find((m) => m.group === group);
       if (match) viewerRef.current?.playMotion(match.group, match.index);
     },
-    onAudio: (audioBase64, _format, _sampleRate, lipSync) => {
-      // Stop any in-flight audio before starting a new one.
-      stopCurrentAudio();
+    onAudio: (audioBase64, _format, _sampleRate, lipSync, turnId, _seq, _last) => {
+      // A new turn (different turn_id) flushes any in-flight chunks
+      // from the previous reply. Same turn_id → keep the queue
+      // intact and append.
+      if (turnId && turnId !== currentTurnRef.current) {
+        stopCurrentAudio();
+        currentTurnRef.current = turnId;
+      }
 
-      // Decode base64 → ArrayBuffer once, hand to Web Audio.
+      // Empty audio happens when the server signaled `last` for a
+      // failed chunk — nothing to play, but we still need to honor
+      // the queue contract.
+      if (!audioBase64) {
+        if (!drainingRef.current && audioQueueRef.current.length === 0) {
+          setIsPlaying(false);
+        }
+        return;
+      }
+
       const bytes = Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0));
+      audioQueueRef.current.push(bytes.buffer);
       setLipSyncData(lipSync);
       setIsPlaying(true);
-      decodeAndPlay(bytes.buffer, () => {
-        setIsPlaying(false);
-        playbackRef.current = null;
-      })
-        .then((handle) => {
-          playbackRef.current = handle;
-          audioUnlockedRef.current = true;
-          setAudioError(null);
-          setPendingAudio(null);
-        })
-        .catch((err: Error) => {
-          console.error('audio decode/play failed:', err);
-          setIsPlaying(false);
-          // AudioContext suspended (autoplay policy) is the only
-          // recoverable case — surface a "click to play" affordance.
-          if (err.name === 'NotAllowedError' || /suspend/i.test(err.message)) {
-            setAudioError('Browser blocked audio. Click "Play" to enable.');
-            // Stash the bytes so the manual-play button can replay them.
-            const replay = async () => {
-              try {
-                const handle = await decodeAndPlay(bytes.buffer, () => {
-                  setIsPlaying(false);
-                  playbackRef.current = null;
-                });
-                playbackRef.current = handle;
-                audioUnlockedRef.current = true;
-                setAudioError(null);
-                setIsPlaying(true);
-                setPendingAudio(null);
-              } catch (e) {
-                setAudioError(`Still blocked: ${(e as Error).message}`);
-              }
-            };
-            // Synthesize a stub audio element only to drive our
-            // existing "Click to play" UI; clicking it calls replay().
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const stub = { play: replay } as any;
-            setPendingAudio(stub);
-          } else {
-            setAudioError(`Audio error: ${err.message}`);
-          }
-        });
+      drainQueue();
     },
     onText: (content) => {
       setSubtitle(content);

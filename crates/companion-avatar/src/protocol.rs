@@ -57,6 +57,11 @@ pub enum AvatarNotification {
     },
 
     /// Audio data with associated lip sync frames.
+    ///
+    /// For sentence-chunked synthesis a single agent reply may produce
+    /// multiple Audio frames in sequence. The frontend uses
+    /// `turn_id` + `seq` to queue chunks of the same turn back-to-back
+    /// without overlap, while a new `turn_id` interrupts the queue.
     Audio {
         /// Base64-encoded audio bytes.
         audio: String,
@@ -66,6 +71,18 @@ pub enum AvatarNotification {
         sample_rate: u32,
         /// Lip sync frame data synchronized to audio.
         lip_sync: LipSyncDataProto,
+        /// Stable id for the agent turn this chunk belongs to. All
+        /// chunks of the same turn share this; a different value means
+        /// the user sent a new message and the queue should be flushed.
+        #[serde(default)]
+        turn_id: String,
+        /// 0-based index of this chunk within its turn.
+        #[serde(default)]
+        seq: u32,
+        /// True for the last chunk of a turn. After this fires the
+        /// frontend can clear "speaking" state once playback finishes.
+        #[serde(default)]
+        last: bool,
     },
 
     /// Agent text for optional subtitle display. Always in the chat
@@ -174,6 +191,9 @@ mod tests {
             audio: "dGVzdA==".to_string(),
             format: "wav".to_string(),
             sample_rate: 22050,
+            turn_id: "t-1".into(),
+            seq: 0,
+            last: true,
             lip_sync: LipSyncDataProto {
                 frames: vec![LipSyncFrameProto {
                     t: 0,

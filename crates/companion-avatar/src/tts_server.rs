@@ -350,6 +350,8 @@ mod tests {
             voice: Some("default".to_string()),
             language: "en".to_string(),
             speed: 1.0,
+            streaming: true,
+            streaming_min_chars: 8,
         }
     }
 
