@@ -9,6 +9,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Char-boundary-safe slice for diagnostic logging. `s[..s.len().min(n)]`
+/// panics on Windows when the byte at position n is mid-codepoint —
+/// emoji and CJK in agent replies trip this constantly. This walks
+/// back to the nearest char boundary.
+fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = s.len().min(max_bytes);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -200,11 +212,34 @@ impl AvatarSubagent {
     }
 
     /// Analyze a main agent reply. Returns `None` on timeout/parse failure.
+    /// Retries once on empty/parse failure — these are usually transient
+    /// (z.ai sometimes returns empty bodies under load) and a redo lands
+    /// before the user notices, where falling all the way back to "speak
+    /// raw English with Japanese TTS" is audibly broken.
     pub async fn analyze(
         &self,
         text: &str,
         chat_language: &str,
         tts_language: &str,
+    ) -> Option<SubagentAnalysis> {
+        for attempt in 1..=2 {
+            match self.analyze_once(text, chat_language, tts_language, attempt).await {
+                Some(a) => return Some(a),
+                None if attempt < 2 => {
+                    tracing::warn!("avatar subagent: attempt {attempt} failed, retrying");
+                }
+                None => {}
+            }
+        }
+        None
+    }
+
+    async fn analyze_once(
+        &self,
+        text: &str,
+        chat_language: &str,
+        tts_language: &str,
+        attempt: u32,
     ) -> Option<SubagentAnalysis> {
         let truncated = if text.len() > 2000 { &text[..2000] } else { text };
 
@@ -214,9 +249,9 @@ impl AvatarSubagent {
             .replace("{tts_lang}", tts_language);
 
         tracing::info!(
-            "avatar subagent: → input ({}c, chat={chat_language}, tts={tts_language}): {:?}",
+            "avatar subagent: → input attempt={attempt} ({}c, chat={chat_language}, tts={tts_language}): {:?}",
             truncated.chars().count(),
-            &truncated[..truncated.len().min(200)],
+            safe_prefix(truncated, 200),
         );
         let result =
             tokio::time::timeout(self.timeout, self.backend.ask(&system_prompt, truncated)).await;
@@ -224,10 +259,14 @@ impl AvatarSubagent {
         match result {
             Ok(Ok(response_text)) => {
                 tracing::info!(
-                    "avatar subagent: ← raw LLM response ({}c): {:?}",
+                    "avatar subagent: ← raw LLM response attempt={attempt} ({}c): {:?}",
                     response_text.chars().count(),
-                    &response_text[..response_text.len().min(500)],
+                    safe_prefix(&response_text, 500),
                 );
+                if response_text.trim().is_empty() {
+                    tracing::warn!("avatar subagent: empty response (attempt {attempt})");
+                    return None;
+                }
                 let cleaned = response_text
                     .trim()
                     .trim_start_matches("```json")
@@ -240,32 +279,30 @@ impl AvatarSubagent {
                             "avatar subagent: parsed expr={} clean_chat={:?} translated={:?}",
                             analysis.expression,
                             analysis.clean_chat_text.as_ref().map(|s| {
-                                let n = s.chars().count();
-                                format!("{}c: {:?}", n, &s[..s.len().min(120)])
+                                format!("{}c: {:?}", s.chars().count(), safe_prefix(s, 120))
                             }),
                             analysis.translated_text.as_ref().map(|s| {
-                                let n = s.chars().count();
-                                format!("{}c: {:?}", n, &s[..s.len().min(120)])
+                                format!("{}c: {:?}", s.chars().count(), safe_prefix(s, 120))
                             }),
                         );
                         Some(analysis)
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "avatar subagent: JSON parse failed ({e}), raw: {}",
-                            &cleaned[..cleaned.len().min(200)]
+                            "avatar subagent: JSON parse failed attempt={attempt} ({e}), raw: {}",
+                            safe_prefix(cleaned, 200)
                         );
                         None
                     }
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("avatar subagent: LLM call failed: {e}");
+                tracing::warn!("avatar subagent: LLM call failed (attempt {attempt}): {e}");
                 None
             }
             Err(_) => {
                 tracing::warn!(
-                    "avatar subagent: timed out after {}s",
+                    "avatar subagent: timed out (attempt {attempt}) after {}s",
                     self.timeout.as_secs()
                 );
                 None

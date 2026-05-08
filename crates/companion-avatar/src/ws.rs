@@ -22,6 +22,17 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
 };
+
+/// Char-boundary-safe slice for diagnostic logging. Prevents panics when
+/// the byte-position cap lands inside a multi-byte UTF-8 codepoint
+/// (emoji and CJK in agent replies trip this constantly).
+fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = s.len().min(max_bytes);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 use tokio::sync::broadcast;
 
 use crate::config::AvatarConfig;
@@ -200,6 +211,16 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         Some(t) if !t.trim().is_empty() => expression_mapper.strip_tags(&t),
         _ => raw_subtitle.clone(),
     };
+    // tts_text is what the TTS engine actually synthesizes.
+    //
+    // - same-language: speak the subtitle as-is.
+    // - cross-language with translation: speak the translation.
+    // - cross-language WITHOUT translation (subagent failed): SKIP TTS.
+    //   Feeding English bytes to a Japanese-configured TTS produces
+    //   garbled phonetic transliteration that often sounds duplicated
+    //   ("thank you twice" reports trace back here). The user can
+    //   still read the chat bubble — silence is strictly better than
+    //   audibly-broken speech for that turn.
     let tts_text = if chat_lang == tts_lang {
         subtitle_text.clone()
     } else {
@@ -208,9 +229,11 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             _ => {
                 tracing::warn!(
                     "avatar: chat_language={chat_lang} != tts_language={tts_lang} \
-                     but subagent returned no translation; speaking original text"
+                     but subagent returned no translation; SKIPPING TTS \
+                     (subtitle still shown). Bump max_tokens or check the \
+                     LLM logs above for the parse/timeout reason."
                 );
-                subtitle_text.clone()
+                String::new()
             }
         }
     };
@@ -225,11 +248,11 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     );
     tracing::info!(
         "avatar: process_speak SUBTITLE = {:?}",
-        &subtitle_text[..subtitle_text.len().min(300)]
+        safe_prefix(&subtitle_text, 300)
     );
     tracing::info!(
         "avatar: process_speak TTS_TEXT = {:?}",
-        &tts_text[..tts_text.len().min(300)]
+        safe_prefix(&tts_text, 300)
     );
 
     let bcast = |frame: AvatarNotification| {
@@ -258,6 +281,16 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         expression: expression.name,
         subagent_used,
     });
+
+    // Empty tts_text means we deliberately skipped speech for this turn
+    // (cross-language without a translation). Emit Idle and bail out so
+    // the frontend doesn't receive an Audio frame containing zero bytes
+    // synthesized by the TTS server.
+    if tts_text.trim().is_empty() {
+        tracing::info!("avatar: process_speak skipping TTS (no spoken text)");
+        bcast(AvatarNotification::Idle);
+        return Ok(subtitle_text);
+    }
 
     // Sentence-chunked synthesis when streaming is enabled. All chunks
     // of one turn share `turn_id` so the frontend can queue them
@@ -288,7 +321,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         tracing::info!(
             "avatar: TTS chunk {}/{} ({}c, last={is_last}, turn_id={turn_id}): {:?}",
             i + 1, total, chunk.chars().count(),
-            &chunk[..chunk.len().min(120)]
+            safe_prefix(chunk, 120)
         );
         match state.tts.synthesize_with(chunk, &tts_lang).await {
             Ok(audio) => {
