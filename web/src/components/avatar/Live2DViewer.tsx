@@ -1,10 +1,25 @@
 import { useEffect, useRef, useState, useImperativeHandle, forwardRef } from 'react';
 import * as PIXI from 'pixi.js';
-import { Live2DModel } from 'pixi-live2d-display/cubism4';
 import type { LipSyncDataProto } from './useAvatarSocket';
 
 // Required by pixi-live2d-display
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 (window as any).PIXI = PIXI;
+
+// Auto-pick Cubism 2 vs Cubism 4 by sniffing the model manifest.
+// Cubism 4 files end in `.model3.json` and reference a `.moc3` mesh.
+// Cubism 2 files are usually `model.json` / `*model*.json` referencing a `.moc`.
+// `pixi-live2d-display` ships separate entry points for each.
+async function loadModel(modelUrl: string) {
+  const isCubism4 = modelUrl.toLowerCase().endsWith('.model3.json');
+  if (isCubism4) {
+    const mod = await import('pixi-live2d-display/cubism4');
+    return mod.Live2DModel.from(modelUrl, { autoInteract: false });
+  } else {
+    const mod = await import('pixi-live2d-display/cubism2');
+    return mod.Live2DModel.from(modelUrl, { autoInteract: false });
+  }
+}
 
 export interface Live2DViewerHandle {
   setExpression: (name: string) => void;
@@ -104,7 +119,7 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
 
     (async () => {
       try {
-        const model = await Live2DModel.from(modelUrl, { autoInteract: false });
+        const model = await loadModel(modelUrl);
         if (cancelled || !appRef.current) return;
 
         // Fit model to container
