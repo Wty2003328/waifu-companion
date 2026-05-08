@@ -1,11 +1,16 @@
 [package]
 name = "companion-tauri"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+authors = ["zeroclaw-companion contributors"]
 description = "Tauri 2 desktop shell for the zeroclaw companion. Bundles companion-server as a sidecar."
 publish = false
+
+# This crate is intentionally NOT a member of the parent workspace
+# (its build.rs requires the sidecar binary to exist before compile).
+# So all metadata is inlined here, NOT inherited via `.workspace = true`.
 
 [lib]
 name = "companion_tauri_lib"
@@ -21,12 +26,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tokio.workspace = true
-anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+anyhow = "1"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

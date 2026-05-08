@@ -37,3 +37,7 @@ Thumbs.db
 # Local AI assistant config
 CLAUDE.md
 .claude/
+
+# Tauri binaries (the sidecar is staged from target/release per build,
+# don't commit a stale copy). Real icons can stay tracked.
+/apps/companion-tauri/binaries/

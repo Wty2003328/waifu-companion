@@ -5,9 +5,7 @@
   "identifier": "ai.zeroclaw.companion",
   "build": {
     "frontendDist": "../../web/dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm --prefix ../../web run dev",
-    "beforeBuildCommand": "npm --prefix ../../web run build"
+    "devUrl": "http://localhost:5173"
   },
   "app": {
     "windows": [
