@@ -5,6 +5,13 @@ export interface LipSyncDataProto {
   frame_duration_ms: number;
 }
 
+export interface DebugFrame {
+  chat_text: string;
+  spoken_text: string;
+  expression: string;
+  subagent_used: boolean;
+}
+
 export interface AvatarNotification {
   type: string;
   // Connected
@@ -27,6 +34,11 @@ export interface AvatarNotification {
   lip_sync?: LipSyncDataProto;
   // Text
   content?: string;
+  // Debug — companion-emitted diagnostic info per turn
+  chat_text?: string;
+  spoken_text?: string;
+  expression?: string;
+  subagent_used?: boolean;
   // Error
   message?: string;
 }
@@ -53,6 +65,7 @@ interface UseAvatarSocketOptions {
     lipSync: LipSyncDataProto
   ) => void;
   onText?: (content: string) => void;
+  onDebug?: (frame: DebugFrame) => void;
   onIdle?: () => void;
   onError?: (message: string) => void;
 }
@@ -122,6 +135,16 @@ export function useAvatarSocket(url: string, options: UseAvatarSocketOptions = {
             case 'Text':
               if (msg.content && options.onText) {
                 options.onText(msg.content);
+              }
+              break;
+            case 'Debug':
+              if (options.onDebug) {
+                options.onDebug({
+                  chat_text: msg.chat_text ?? '',
+                  spoken_text: msg.spoken_text ?? '',
+                  expression: msg.expression ?? '',
+                  subagent_used: msg.subagent_used ?? false,
+                });
               }
               break;
             case 'Idle':

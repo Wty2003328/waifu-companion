@@ -149,10 +149,12 @@ async fn handle_speak_event(
 
     let keyword_expr = expression_mapper.detect(text);
     let mut motion_to_send: Option<AvatarNotification> = None;
+    let mut subagent_used = false;
 
     let (expression, tts_text_opt) = if let Some(ref subagent) = state.subagent {
         match subagent.analyze(text, chat_lang, tts_lang).await {
             Some(analysis) => {
+                subagent_used = true;
                 if let Some(ref motion) = analysis.motion {
                     motion_to_send = Some(AvatarNotification::Motion {
                         group: motion.group.clone(),
@@ -185,6 +187,7 @@ async fn handle_speak_event(
         }
     };
 
+    let expr_name_for_debug = expression.name.clone();
     let expr = AvatarNotification::Expression {
         name: expression.name,
         intensity: expression.intensity,
@@ -197,9 +200,25 @@ async fn handle_speak_event(
     }
 
     let text_msg = AvatarNotification::Text {
-        content: subtitle_text,
+        content: subtitle_text.clone(),
     };
     send_notification(socket, &text_msg).await?;
+
+    // Diagnostic frame: surfaces what the subagent actually sent to TTS
+    // so the user can sanity-check the translation is happening.
+    let debug_msg = AvatarNotification::Debug {
+        chat_text: subtitle_text.clone(),
+        spoken_text: tts_text.clone(),
+        expression: expr_name_for_debug,
+        subagent_used,
+    };
+    send_notification(socket, &debug_msg).await?;
+    tracing::info!(
+        "avatar: chat_lang={chat_lang} → tts_lang={tts_lang}, subagent_used={subagent_used}, \
+         chat_chars={}, spoken_chars={}",
+        subtitle_text.chars().count(),
+        tts_text.chars().count(),
+    );
 
     match state.tts.synthesize_with(&tts_text, tts_lang).await {
         Ok(audio) => {

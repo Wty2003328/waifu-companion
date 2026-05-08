@@ -68,9 +68,28 @@ pub enum AvatarNotification {
         lip_sync: LipSyncDataProto,
     },
 
-    /// Agent text for optional subtitle display.
+    /// Agent text for optional subtitle display. Always in the chat
+    /// language (companion.toml `[avatar] chat_language`), regardless
+    /// of what TTS speaks.
     Text {
         content: String,
+    },
+
+    /// Optional debug frame: what the subagent actually fed to TTS,
+    /// alongside metadata about the analysis. Helps users verify the
+    /// translation is happening (and is correct) without reading
+    /// server logs.
+    Debug {
+        /// Original chat-language text the subagent received.
+        chat_text: String,
+        /// What the subagent decided to speak (this is what TTS got).
+        /// Equals `chat_text` when chat_language == tts_language.
+        spoken_text: String,
+        /// Live2D expression name the subagent picked.
+        expression: String,
+        /// Whether the subagent ran successfully (true) or fell back
+        /// to keyword detection because it failed/was disabled (false).
+        subagent_used: bool,
     },
 
     /// Idle state — no audio playing, return to neutral pose.

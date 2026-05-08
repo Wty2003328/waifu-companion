@@ -1,7 +1,11 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import Live2DViewer, { type Live2DViewerHandle, type ModelActions } from '../components/avatar/Live2DViewer';
 import AvatarControls from '../components/avatar/AvatarControls';
-import { useAvatarSocket, type LipSyncDataProto } from '../components/avatar/useAvatarSocket';
+import {
+  useAvatarSocket,
+  type LipSyncDataProto,
+  type DebugFrame,
+} from '../components/avatar/useAvatarSocket';
 import { HTTP_BASE, WS_BASE } from '../lib/apiBase';
 
 interface ModelInfo {
@@ -15,10 +19,39 @@ interface ChatTurn {
   role: 'user' | 'assistant';
   text: string;
   ts: number; // epoch ms
+  /** Diagnostic info attached to assistant turns (subagent translation). */
+  debug?: DebugFrame;
 }
 
 const HISTORY_KEY = 'companion.chatHistory.v1';
 const HISTORY_LIMIT = 200; // keep last N turns
+
+// ── Canvas / panel preferences ──────────────────────────────────
+interface CanvasPrefs {
+  background: string;     // CSS color, e.g. '#0a0a0a' or 'transparent'
+  transparent: boolean;
+  showControls: boolean;  // expressions/motions panel
+}
+const PREFS_KEY = 'companion.avatarPrefs.v1';
+const DEFAULT_PREFS: CanvasPrefs = {
+  background: '#0a0a0a',
+  transparent: false,
+  showControls: false, // hidden by default per user request
+};
+function loadPrefs(): CanvasPrefs {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (!raw) return { ...DEFAULT_PREFS };
+    return { ...DEFAULT_PREFS, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
+}
+function savePrefs(p: CanvasPrefs) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(p));
+  } catch { /* non-fatal */ }
+}
 
 function loadHistory(): ChatTurn[] {
   try {
@@ -51,10 +84,32 @@ export default function Avatar() {
   const [pendingAudio, setPendingAudio] = useState<HTMLAudioElement | null>(null);
   const [audioError, setAudioError] = useState<string | null>(null);
   const [history, setHistory] = useState<ChatTurn[]>(() => loadHistory());
+  const [prefs, setPrefs] = useState<CanvasPrefs>(() => loadPrefs());
+  const [showSettings, setShowSettings] = useState<boolean>(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUnlockedRef = useRef(false);
+  const audioUrlRef = useRef<string | null>(null);
   const viewerRef = useRef<Live2DViewerHandle>(null);
   const historyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => savePrefs(prefs), [prefs]);
+
+  /** Stop any audio currently playing and free its blob URL. Called
+   *  before starting a new audio frame OR on unmount. Without this,
+   *  back-to-back chats produce two simultaneous Asuna voices. */
+  const stopCurrentAudio = useCallback(() => {
+    if (audioRef.current) {
+      try {
+        audioRef.current.pause();
+        audioRef.current.src = '';
+      } catch { /* ignore */ }
+      audioRef.current = null;
+    }
+    if (audioUrlRef.current) {
+      try { URL.revokeObjectURL(audioUrlRef.current); } catch { /* ignore */ }
+      audioUrlRef.current = null;
+    }
+  }, []);
 
   const wsUrl = `${WS_BASE}/ws/avatar`;
 
@@ -92,6 +147,12 @@ export default function Avatar() {
       if (match) viewerRef.current?.playMotion(match.group, match.index);
     },
     onAudio: (audioBase64, format, _sampleRate, lipSync) => {
+      // Critical: stop any in-flight audio before starting a new one.
+      // Otherwise back-to-back chats stack — you'd hear two Asunas
+      // overlapping. Pause the previous element AND revoke its blob
+      // URL so no orphan plays.
+      stopCurrentAudio();
+
       const mime = format === 'mp3' ? 'mpeg' : format;
       const audioBlob = new Blob(
         [Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0))],
@@ -100,10 +161,14 @@ export default function Avatar() {
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
       audioRef.current = audio;
+      audioUrlRef.current = audioUrl;
       audio.onended = () => {
         setIsPlaying(false);
         setPendingAudio(null);
-        URL.revokeObjectURL(audioUrl);
+        if (audioUrlRef.current === audioUrl) {
+          URL.revokeObjectURL(audioUrl);
+          audioUrlRef.current = null;
+        }
       };
       setIsPlaying(true);
       setLipSyncData(lipSync);
@@ -126,6 +191,21 @@ export default function Avatar() {
       // Append the assistant's reply to history (the chat-language text
       // shown in the subtitle, NOT the TTS-language version).
       appendTurn({ role: 'assistant', text: content, ts: Date.now() });
+    },
+    onDebug: (frame) => {
+      // Attach the diagnostic frame to the most-recent assistant turn
+      // so the user can verify the subagent translated correctly via
+      // the chat bubble's "details" expander.
+      setHistory((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === 'assistant') {
+            next[i] = { ...next[i], debug: frame };
+            break;
+          }
+        }
+        return next;
+      });
     },
     onIdle: () => {
       setSubtitle('');
@@ -189,17 +269,16 @@ export default function Avatar() {
   }, [chatInput, sending, appendTurn]);
 
   useEffect(() => {
-    return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-    };
-  }, []);
+    return () => stopCurrentAudio();
+  }, [stopCurrentAudio]);
+
+  const canvasBg = prefs.transparent
+    ? 'transparent'
+    : (prefs.background || '#0a0a0a');
 
   return (
     <div style={{ display: 'flex', flexDirection: 'row', height: '100%', gap: 12, padding: 12 }}>
-      {/* Left column: avatar + controls */}
+      {/* Left column: avatar + (collapsible) controls */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
         <div
           style={{
@@ -207,8 +286,15 @@ export default function Avatar() {
             position: 'relative',
             borderRadius: 12,
             overflow: 'hidden',
-            background: '#0a0a0a',
+            background: canvasBg,
             minHeight: 0,
+            // Subtle checker pattern when transparent so the user can
+            // see the canvas extents.
+            backgroundImage: prefs.transparent
+              ? 'linear-gradient(45deg, #1a1a1a 25%, transparent 25%), linear-gradient(-45deg, #1a1a1a 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #1a1a1a 75%), linear-gradient(-45deg, transparent 75%, #1a1a1a 75%)'
+              : undefined,
+            backgroundSize: prefs.transparent ? '20px 20px' : undefined,
+            backgroundPosition: prefs.transparent ? '0 0, 0 10px, 10px -10px, -10px 0px' : undefined,
           }}
         >
           {modelInfo ? (
@@ -288,23 +374,57 @@ export default function Avatar() {
               {subtitle}
             </div>
           )}
+          {/* Floating top-right settings/toggle row */}
+          <div
+            style={{
+              position: 'absolute',
+              top: 12,
+              right: 12,
+              display: 'flex',
+              gap: 6,
+            }}
+          >
+            <CanvasButton
+              title="Canvas settings"
+              onClick={() => setShowSettings((s) => !s)}
+              active={showSettings}
+            >
+              ⚙
+            </CanvasButton>
+            <CanvasButton
+              title={prefs.showControls ? 'Hide expressions / motions' : 'Show expressions / motions'}
+              onClick={() => setPrefs((p) => ({ ...p, showControls: !p.showControls }))}
+              active={prefs.showControls}
+            >
+              {prefs.showControls ? '✕' : '☰'}
+            </CanvasButton>
+          </div>
+          {showSettings && (
+            <CanvasSettingsPopover
+              prefs={prefs}
+              onChange={setPrefs}
+              onClose={() => setShowSettings(false)}
+            />
+          )}
         </div>
 
-        <div
-          style={{
-            background: '#16181c',
-            borderRadius: 10,
-            padding: 12,
-            flexShrink: 0,
-          }}
-        >
-          <AvatarControls
-            expressions={modelActions.expressions}
-            motions={modelActions.motions}
-            onExpressionRequest={handleExpression}
-            onMotionRequest={handleMotion}
-          />
-        </div>
+        {prefs.showControls && (
+          <div
+            style={{
+              background: '#16181c',
+              borderRadius: 10,
+              padding: 12,
+              flexShrink: 0,
+            }}
+          >
+            <AvatarControls
+              expressions={modelActions.expressions}
+              motions={modelActions.motions}
+              onExpressionRequest={handleExpression}
+              onMotionRequest={handleMotion}
+            />
+          </div>
+        )}
       </div>
 
       {/* Right column: chat history + input */}
@@ -436,6 +556,9 @@ export default function Avatar() {
 
 function ChatBubble({ turn }: { turn: ChatTurn }) {
   const isUser = turn.role === 'user';
+  const [showDetails, setShowDetails] = useState(false);
+  const hasDetails = !isUser && !!turn.debug;
+
   return (
     <div
       style={{
@@ -443,16 +566,28 @@ function ChatBubble({ turn }: { turn: ChatTurn }) {
         flexDirection: 'column',
         alignItems: isUser ? 'flex-end' : 'flex-start',
         gap: 2,
+        maxWidth: '100%',
       }}
     >
-      <div
-        style={{
-          fontSize: 10,
-          color: '#666',
-          padding: '0 4px',
-        }}
-      >
+      <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>
         {isUser ? 'you' : 'asuna'} · {fmtTime(turn.ts)}
+        {hasDetails && (
+          <button
+            type="button"
+            onClick={() => setShowDetails((s) => !s)}
+            style={{
+              marginLeft: 6,
+              background: 'transparent',
+              border: 'none',
+              color: '#3b82f6',
+              fontSize: 10,
+              cursor: 'pointer',
+              padding: 0,
+            }}
+          >
+            {showDetails ? 'hide details' : 'details'}
+          </button>
+        )}
       </div>
       <div
         style={{
@@ -468,6 +603,220 @@ function ChatBubble({ turn }: { turn: ChatTurn }) {
         }}
       >
         {turn.text}
+      </div>
+      {hasDetails && showDetails && turn.debug && (
+        <div
+          style={{
+            maxWidth: '88%',
+            marginTop: 4,
+            padding: '8px 10px',
+            background: '#0d0e12',
+            border: '1px solid #1f2227',
+            borderRadius: 8,
+            fontSize: 11,
+            color: '#aaa',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+          }}
+        >
+          <DebugRow label="expression" value={turn.debug.expression} />
+          <DebugRow
+            label="subagent"
+            value={turn.debug.subagent_used ? '✓ used (LLM-driven)' : '✗ fell back to keyword detection'}
+            tone={turn.debug.subagent_used ? '#10b981' : '#f59e0b'}
+          />
+          <DebugRow label="chat text" value={turn.debug.chat_text} mono />
+          <DebugRow
+            label="spoken text"
+            value={turn.debug.spoken_text}
+            mono
+            highlight={turn.debug.chat_text !== turn.debug.spoken_text}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DebugRow({
+  label,
+  value,
+  mono,
+  highlight,
+  tone,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+  highlight?: boolean;
+  tone?: string;
+}) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+      <span style={{ minWidth: 80, color: '#666', fontSize: 10 }}>{label}</span>
+      <span
+        style={{
+          flex: 1,
+          color: tone ?? (highlight ? '#a5b4fc' : '#ddd'),
+          fontFamily: mono ? 'ui-monospace, monospace' : undefined,
+          fontSize: 11,
+          wordBreak: 'break-word',
+        }}
+      >
+        {value || <em style={{ color: '#555' }}>(empty)</em>}
+      </span>
+    </div>
+  );
+}
+
+function CanvasButton({
+  children,
+  onClick,
+  title,
+  active,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  title: string;
+  active?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      style={{
+        width: 32,
+        height: 32,
+        background: active ? '#3b82f6' : 'rgba(0,0,0,0.6)',
+        color: '#fff',
+        border: '1px solid rgba(255,255,255,0.1)',
+        borderRadius: 8,
+        fontSize: 14,
+        cursor: 'pointer',
+        backdropFilter: 'blur(4px)',
+        padding: 0,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function CanvasSettingsPopover({
+  prefs,
+  onChange,
+  onClose,
+}: {
+  prefs: CanvasPrefs;
+  onChange: (next: CanvasPrefs) => void;
+  onClose: () => void;
+}) {
+  const palette = ['#0a0a0a', '#1f1f23', '#1a1f2e', '#2a1a1a', '#1a2a1a', '#ffffff'];
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 52,
+        right: 12,
+        width: 240,
+        background: '#16181c',
+        border: '1px solid #2a2d33',
+        borderRadius: 10,
+        padding: 12,
+        boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+        zIndex: 10,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Canvas</div>
+        <button
+          type="button"
+          onClick={onClose}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: '#888',
+            cursor: 'pointer',
+            fontSize: 14,
+          }}
+          aria-label="Close"
+        >
+          ✕
+        </button>
+      </div>
+
+      <div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#aaa', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={prefs.transparent}
+            onChange={(e) => onChange({ ...prefs, transparent: e.target.checked })}
+          />
+          Transparent background
+        </label>
+      </div>
+
+      <div style={{ opacity: prefs.transparent ? 0.4 : 1 }}>
+        <div style={{ fontSize: 12, color: '#aaa', marginBottom: 6 }}>Background color</div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          {palette.map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => onChange({ ...prefs, background: c })}
+              disabled={prefs.transparent}
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 4,
+                background: c,
+                border:
+                  prefs.background === c
+                    ? '2px solid #3b82f6'
+                    : '1px solid #2a2d33',
+                cursor: prefs.transparent ? 'not-allowed' : 'pointer',
+                padding: 0,
+              }}
+              aria-label={`Background ${c}`}
+              title={c}
+            />
+          ))}
+          <input
+            type="color"
+            value={prefs.background.startsWith('#') ? prefs.background : '#0a0a0a'}
+            onChange={(e) => onChange({ ...prefs, background: e.target.value })}
+            disabled={prefs.transparent}
+            style={{
+              width: 24,
+              height: 24,
+              border: '1px solid #2a2d33',
+              borderRadius: 4,
+              background: 'transparent',
+              cursor: prefs.transparent ? 'not-allowed' : 'pointer',
+              padding: 0,
+            }}
+            title="Custom color"
+          />
+        </div>
+      </div>
+
+      <div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#aaa', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={prefs.showControls}
+            onChange={(e) => onChange({ ...prefs, showControls: e.target.checked })}
+          />
+          Show expression / motion controls
+        </label>
       </div>
     </div>
   );
