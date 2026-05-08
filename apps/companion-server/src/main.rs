@@ -1,0 +1,269 @@
+//! companion-server — entry point for the zeroclaw companion.
+//!
+//! Lifecycle:
+//! 1. Load `companion.toml` (or use defaults).
+//! 2. Health-check the upstream zeroclaw daemon.
+//! 3. Build the avatar subsystem (subagent + TTS port + WS state).
+//! 4. Spawn the SSE bridge: subscribe to zeroclaw `/api/events`, forward
+//!    `agent.reply` events to the avatar broadcast channel.
+//! 5. Auto-start the configured TTS server (e.g. the Asuna v4 wrapper).
+//! 6. Serve the companion UI + WS routes on its own HTTP port.
+//!
+//! The fork's old approach was: edit zeroclaw, rebuild zeroclaw, ship a
+//! patched zeroclaw. The new approach is: zeroclaw stays vanilla, the
+//! companion runs as a sidecar and consumes zeroclaw's public API.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use axum::routing::get;
+use axum::Router;
+use futures_util::StreamExt;
+use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+
+use companion_avatar::{
+    AnimeTtsManager, AvatarConfig, AvatarEvent, AvatarSubagent, AvatarWsState,
+    handle_ws_avatar,
+};
+use companion_core::{AgentEvent, CompanionConfig, ZeroclawClient};
+
+mod state;
+use state::AppState;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    let config_path = config_path()?;
+    tracing::info!("companion: loading config from {}", config_path.display());
+    let cfg = CompanionConfig::load(&config_path)?;
+
+    // ── 1. Talk to upstream zeroclaw ──────────────────────────────
+    let zc = ZeroclawClient::new(&cfg.zeroclaw)?;
+    match zc.health().await {
+        Ok(true) => tracing::info!("companion: zeroclaw at {} is up", cfg.zeroclaw.url),
+        Ok(false) | Err(_) => tracing::warn!(
+            "companion: zeroclaw at {} unreachable — chat features will be limited until it comes up",
+            cfg.zeroclaw.url
+        ),
+    }
+
+    // ── 2. Build the avatar subsystem (if enabled) ───────────────
+    let avatar_state = build_avatar(&cfg).await?;
+
+    // ── 3. SSE bridge: zeroclaw /api/events → avatar broadcast ────
+    if let Some(ref state) = avatar_state {
+        let event_tx = state.event_tx.clone();
+        let zc_clone = zc.clone();
+        tokio::spawn(async move {
+            run_sse_bridge(zc_clone, event_tx).await;
+        });
+    }
+
+    // ── 4. Build the axum app ─────────────────────────────────────
+    let app_state = AppState {
+        avatar: avatar_state,
+        zeroclaw: Arc::new(zc),
+    };
+
+    let mut router = Router::new()
+        .route("/health", get(handle_health))
+        .route("/api/status", get(handle_status));
+
+    if app_state.avatar.is_some() {
+        let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
+        router = router.route(
+            "/ws/avatar",
+            get(handle_ws_avatar).with_state(avatar_state),
+        );
+    }
+
+    // Serve the companion web bundle (Vite build output).
+    let web_dir = resolve_web_dist(&cfg.server.web_dist_dir);
+    if web_dir.exists() {
+        tracing::info!("companion: serving web from {}", web_dir.display());
+        router = router.fallback_service(ServeDir::new(web_dir));
+    } else {
+        tracing::warn!(
+            "companion: web bundle not found at {}; UI will 404 until you `npm run build` in web/",
+            web_dir.display()
+        );
+    }
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = router
+        .layer(cors)
+        .layer(TraceLayer::new_for_http())
+        .with_state(app_state);
+
+    // ── 5. Bind ───────────────────────────────────────────────────
+    let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    tracing::info!("companion: listening on http://{addr}");
+    tracing::info!("            • avatar UI:  http://{addr}/avatar");
+    tracing::info!("            • WS avatar:  ws://{addr}/ws/avatar");
+    tracing::info!("            • health:     http://{addr}/health");
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// ── helpers ───────────────────────────────────────────────────────
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,companion=debug"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
+}
+
+fn config_path() -> Result<PathBuf> {
+    if let Ok(env) = std::env::var("COMPANION_CONFIG") {
+        return Ok(PathBuf::from(env));
+    }
+    let cwd = std::env::current_dir()?;
+    let local = cwd.join("companion.toml");
+    if local.exists() {
+        return Ok(local);
+    }
+    if let Some(home) = directories::UserDirs::new() {
+        let home_cfg = home.home_dir().join(".zeroclaw-companion").join("companion.toml");
+        return Ok(home_cfg);
+    }
+    Ok(local)
+}
+
+fn resolve_web_dist(configured: &Option<String>) -> PathBuf {
+    if let Some(p) = configured {
+        return PathBuf::from(p);
+    }
+    // Look for ./web/dist relative to the binary, then to CWD.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("web").join("dist");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join("web")
+        .join("dist")
+}
+
+async fn build_avatar(cfg: &CompanionConfig) -> Result<Option<Arc<AvatarWsState>>> {
+    // Avatar config lives under [avatar] in companion.toml. We deserialize
+    // here (companion-core kept it as a Value to stay decoupled).
+    let avatar_cfg: AvatarConfig = serde_json::from_value(cfg.avatar.clone())
+        .unwrap_or_default();
+    if !avatar_cfg.enabled {
+        tracing::info!("companion: avatar disabled in config");
+        return Ok(None);
+    }
+
+    // Optional subagent (expression analysis + translation).
+    let subagent = if avatar_cfg.subagent.enabled {
+        match AvatarSubagent::new(&avatar_cfg.subagent) {
+            Ok(s) => {
+                tracing::info!(
+                    "companion: avatar subagent ready (model={})",
+                    avatar_cfg.subagent.llm.model
+                );
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!("companion: avatar subagent init failed; using keyword fallback: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // TTS port. Auto-start the configured server in the background so the
+    // avatar UI can still load if the TTS server is down.
+    let tts = Arc::new(
+        AnimeTtsManager::new(&avatar_cfg.tts).context("companion: avatar TTS init failed")?,
+    );
+    if avatar_cfg.tts.auto_start {
+        let tts_clone = Arc::clone(&tts);
+        tokio::spawn(async move {
+            if let Err(e) = tts_clone.start_server().await {
+                tracing::warn!("companion: TTS auto-start failed: {e}");
+            }
+        });
+    }
+
+    let (event_tx, _event_rx) = broadcast::channel(64);
+
+    tracing::info!(
+        "companion: avatar enabled (chat_lang={}, tts_lang={}, engine={})",
+        avatar_cfg.chat_language,
+        avatar_cfg.tts.language,
+        avatar_cfg.tts.engine,
+    );
+
+    Ok(Some(Arc::new(AvatarWsState {
+        config: avatar_cfg,
+        event_tx,
+        subagent,
+        tts,
+    })))
+}
+
+/// Subscribe to zeroclaw's SSE event stream and forward agent replies to
+/// the avatar broadcast channel. Reconnects on failure with exponential
+/// backoff capped at 30s.
+async fn run_sse_bridge(zc: ZeroclawClient, tx: broadcast::Sender<AvatarEvent>) {
+    let mut backoff = 1u64;
+    loop {
+        match zc.events().await {
+            Ok(stream) => {
+                tracing::info!("companion: SSE bridge connected");
+                backoff = 1;
+                tokio::pin!(stream);
+                while let Some(ev) = stream.next().await {
+                    if let AgentEvent::AgentReply { text, .. } = ev {
+                        // ignore receiver-count-zero errors; viewers may
+                        // not be connected yet
+                        let _ = tx.send(AvatarEvent::Speak { text });
+                    }
+                }
+                tracing::warn!("companion: SSE stream ended; reconnecting");
+            }
+            Err(e) => {
+                tracing::warn!("companion: SSE bridge connect failed: {e}; backoff={backoff}s");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+async fn handle_health() -> &'static str {
+    "ok"
+}
+
+async fn handle_status(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let zc_up = state.zeroclaw.health().await.unwrap_or(false);
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "zeroclaw_up": zc_up,
+        "avatar_enabled": state.avatar.is_some(),
+    }))
+}

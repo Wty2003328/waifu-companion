@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Frontend
+/web/node_modules/
+/web/dist/
+/web/.vite/
+*.log
+
+# Live2D model assets (large binaries — users provide their own)
+/web/public/avatar/models/
+/web/public/live2dcubismcore.min.js
+
+# Local config
+companion.toml
+.env
+.env.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local AI assistant config
+CLAUDE.md
+.claude/

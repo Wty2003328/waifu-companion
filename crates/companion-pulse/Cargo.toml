@@ -1,0 +1,15 @@
+[package]
+name = "companion-pulse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pulse dashboard subsystem (collectors, scheduler, storage) for the zeroclaw companion. STUB — full migration tracked in docs/PULSE-MIGRATION.md."
+
+[dependencies]
+companion-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

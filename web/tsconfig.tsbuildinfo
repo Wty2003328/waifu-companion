@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/avatar/avatarcontrols.tsx","./src/components/avatar/live2dviewer.tsx","./src/components/avatar/useavatarsocket.ts","./src/pages/avatar.tsx","./src/pages/home.tsx","./src/pages/pulse.tsx"],"version":"5.7.3"}

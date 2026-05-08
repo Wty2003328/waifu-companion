@@ -1,0 +1,96 @@
+# zeroclaw-companion configuration.
+# Copy this to `companion.toml` next to the binary, or set
+# COMPANION_CONFIG=/abs/path/to/companion.toml.
+
+# ─── Upstream zeroclaw connection ────────────────────────────────
+[zeroclaw]
+url = "http://127.0.0.1:8080"   # where the upstream zeroclaw daemon listens
+# pair_token = "..."            # only if zeroclaw requires pairing
+timeout_secs = 60
+
+# ─── Companion's own bind ────────────────────────────────────────
+[server]
+host = "127.0.0.1"
+port = 9181
+# web_dist_dir = "/abs/path/to/web/dist"   # auto-detected if next to binary
+
+# ─── Live2D avatar ───────────────────────────────────────────────
+[avatar]
+enabled = true
+chat_language = "en"   # what the agent reasons / replies in (subtitles)
+
+[avatar.tts]
+# Engine label is informational. The wire contract is the same regardless:
+#   POST {api_url}/tts {text, language, voice?, speed?} -> audio bytes
+#   GET  {api_url}/health -> 200 OK
+engine = "edge-tts"               # or: "gpt-sovits-v4", "fish-speech", etc.
+api_url = "http://127.0.0.1:9880" # where your TTS server listens
+port = 9880
+language = "en"                   # what the avatar SPEAKS (can differ from chat_language!)
+voice = "en-US-AriaNeural"
+speed = 1.0
+auto_start = false
+
+# When `chat_language` ≠ `language`, the avatar subagent translates each
+# reply into `language` before TTS — subtitles stay in chat_language.
+
+# launch_command = ""                     # leave empty if you start TTS manually
+# model_path = "/path/to/model"           # forwarded as $TTS_MODEL_PATH
+# reference_audio = "/path/to/clip.wav"   # forwarded as $TTS_REFERENCE_AUDIO
+# reference_text = "..."                  # forwarded as $TTS_REFERENCE_TEXT
+# reference_language = "ja"               # forwarded as $TTS_REFERENCE_LANG
+# gpu_device = 0                          # sets $CUDA_VISIBLE_DEVICES (-1 = CPU)
+
+# ─── Avatar subagent (expression analysis + cross-language translation) ─
+[avatar.subagent]
+enabled = false   # turn on once you have an LLM endpoint configured below
+timeout_secs = 3
+# system_prompt = "..."   # optional override; supports {chat_lang}/{tts_lang}
+
+[avatar.subagent.llm]
+# OpenAI-compatible endpoint — works with OpenAI, OpenRouter, Together,
+# Groq, DeepInfra, vLLM, Ollama (`http://127.0.0.1:11434/v1`), LM Studio, …
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+# api_key = "sk-..."                # or rely on OPENAI_API_KEY env var
+# api_key_env = "OPENROUTER_API_KEY"
+temperature = 0.3
+max_tokens = 400
+timeout_secs = 30
+
+# ─── Live2D model placement ──────────────────────────────────────
+[avatar.model]
+# model_dir = "/avatar/models/haru/Haru.model3.json"  # bundle a model here
+default_expression = "neutral"
+scale = 0.2
+anchor = "center"
+
+# ─── Pulse dashboard (stub — full migration tracked in docs/PULSE-MIGRATION.md) ──
+[pulse]
+enabled = false
+
+
+# ───────────────────────────────────────────────────────────────────
+# Example: Asuna GPT-SoVITS v4 voice (anime cross-lingual)
+# ───────────────────────────────────────────────────────────────────
+# Chat with the agent in English, hear Asuna reply in Japanese.
+#
+# 1. Train your GPT-SoVITS v4 model (see GPT-SoVITS docs).
+# 2. Edit tools/avatar/asuna_tts_server.py to point at your weights.
+# 3. Replace the [avatar.tts] block above with:
+#
+# [avatar.tts]
+# engine = "gpt-sovits-v4"
+# port = 9880
+# language = "ja"
+# voice = "asuna"
+# speed = 1.0
+# auto_start = true
+# launch_command = "python tools/avatar/asuna_tts_server.py"
+# model_path = "/path/to/GPT-SoVITS"
+# reference_audio = "/path/to/asuna_reference.wav"
+# reference_text = "ここは私に任せて私を選んでくれる"
+# reference_language = "ja"
+# gpu_device = 0
+#
+# And enable [avatar.subagent] so cross-language replies get translated.
