@@ -159,6 +159,17 @@ async function decodeAndPlay(
   };
 }
 
+// True when this window is the transparent always-on-top "desktop pet"
+// overlay (Tauri opens it with `/avatar?overlay=1`). Overlay windows
+// must NOT manage chat history: they're a second WebView2 process that
+// also subscribes to /ws/avatar, and if both windows append assistant
+// turns + race to write localStorage, the overlay's stale state can
+// erase user turns it never received (the user types into the main
+// window, not the overlay). Detect once at module scope so it's stable.
+const IS_OVERLAY =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).has('overlay');
+
 export default function Avatar() {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [subtitle, setSubtitle] = useState<string>('');
@@ -169,7 +180,7 @@ export default function Avatar() {
   const [modelActions, setModelActions] = useState<ModelActions>({ expressions: [], motions: [] });
   const [pendingAudio, setPendingAudio] = useState<HTMLAudioElement | null>(null);
   const [audioError, setAudioError] = useState<string | null>(null);
-  const [history, setHistory] = useState<ChatTurn[]>(() => loadHistory());
+  const [history, setHistory] = useState<ChatTurn[]>(() => (IS_OVERLAY ? [] : loadHistory()));
   const [prefs, setPrefs] = useState<CanvasPrefs>(() => loadPrefs());
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const audioUnlockedRef = useRef(false);
@@ -254,12 +265,15 @@ export default function Avatar() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [history]);
 
-  // Persist history on every change.
+  // Persist history on every change. Overlay window never writes —
+  // it isn't authoritative for the chat panel; main window owns it.
   useEffect(() => {
+    if (IS_OVERLAY) return;
     saveHistory(history);
   }, [history]);
 
   const appendTurn = useCallback((turn: ChatTurn) => {
+    if (IS_OVERLAY) return; // overlay isn't authoritative for chat history
     setHistory((prev) => {
       const next = [...prev, turn].slice(-HISTORY_LIMIT);
       console.log(
@@ -586,7 +600,12 @@ export default function Avatar() {
         )}
       </div>
 
-      {/* Right column: chat history + input */}
+      {/* Right column: chat history + input.
+          Overlay window (Tauri's transparent always-on-top "desktop pet")
+          renders ONLY the avatar — no chat panel. The main window is
+          the authoritative chat surface; the overlay just animates the
+          avatar based on broadcast WS frames. */}
+      {!IS_OVERLAY && (
       <div
         style={{
           width: 380,
@@ -709,6 +728,7 @@ export default function Avatar() {
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }

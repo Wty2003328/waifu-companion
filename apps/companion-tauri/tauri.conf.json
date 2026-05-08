@@ -28,7 +28,7 @@
       {
         "label": "avatar",
         "title": "Avatar",
-        "url": "/avatar",
+        "url": "/avatar?overlay=1",
         "width": 400,
         "height": 540,
         "transparent": true,
