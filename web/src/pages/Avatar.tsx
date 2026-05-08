@@ -81,6 +81,52 @@ function saveHistory(history: ChatTurn[]) {
   }
 }
 
+// Shared AudioContext. Reusing one context across turns avoids the
+// WebView2 quirk where each `new Audio(blob)` element gets routed
+// through a fresh decoder; this gave noticeably worse playback in
+// Tauri vs the browser. Web Audio decodes once, plays via
+// AudioBufferSourceNode at the file's native rate — bit-exact
+// regardless of host.
+let sharedAudioCtx: AudioContext | null = null;
+function getAudioContext(): AudioContext {
+  if (sharedAudioCtx) return sharedAudioCtx;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+  sharedAudioCtx = new Ctor();
+  return sharedAudioCtx as AudioContext;
+}
+
+interface PlaybackHandle {
+  source: AudioBufferSourceNode;
+  duration: number;
+  stop: () => void;
+}
+
+async function decodeAndPlay(
+  bytes: ArrayBuffer,
+  onEnded: () => void,
+): Promise<PlaybackHandle> {
+  const ctx = getAudioContext();
+  if (ctx.state === 'suspended') {
+    await ctx.resume();
+  }
+  // decodeAudioData mutates the input on some browsers; copy first.
+  const buf = await ctx.decodeAudioData(bytes.slice(0));
+  const source = ctx.createBufferSource();
+  source.buffer = buf;
+  source.connect(ctx.destination);
+  source.onended = onEnded;
+  source.start();
+  return {
+    source,
+    duration: buf.duration,
+    stop: () => {
+      try { source.stop(); } catch { /* already stopped */ }
+      try { source.disconnect(); } catch { /* ignore */ }
+    },
+  };
+}
+
 export default function Avatar() {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [subtitle, setSubtitle] = useState<string>('');
@@ -94,28 +140,20 @@ export default function Avatar() {
   const [history, setHistory] = useState<ChatTurn[]>(() => loadHistory());
   const [prefs, setPrefs] = useState<CanvasPrefs>(() => loadPrefs());
   const [showSettings, setShowSettings] = useState<boolean>(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUnlockedRef = useRef(false);
-  const audioUrlRef = useRef<string | null>(null);
+  const playbackRef = useRef<PlaybackHandle | null>(null);
   const viewerRef = useRef<Live2DViewerHandle>(null);
   const historyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => savePrefs(prefs), [prefs]);
 
-  /** Stop any audio currently playing and free its blob URL. Called
-   *  before starting a new audio frame OR on unmount. Without this,
-   *  back-to-back chats produce two simultaneous Asuna voices. */
+  /** Stop any in-flight audio. Called before starting a new audio
+   *  frame and on unmount. Without this, back-to-back chats produce
+   *  two overlapping Asuna voices. */
   const stopCurrentAudio = useCallback(() => {
-    if (audioRef.current) {
-      try {
-        audioRef.current.pause();
-        audioRef.current.src = '';
-      } catch { /* ignore */ }
-      audioRef.current = null;
-    }
-    if (audioUrlRef.current) {
-      try { URL.revokeObjectURL(audioUrlRef.current); } catch { /* ignore */ }
-      audioUrlRef.current = null;
+    if (playbackRef.current) {
+      playbackRef.current.stop();
+      playbackRef.current = null;
     }
   }, []);
 
@@ -154,44 +192,55 @@ export default function Avatar() {
       const match = modelActions.motions.find((m) => m.group === group);
       if (match) viewerRef.current?.playMotion(match.group, match.index);
     },
-    onAudio: (audioBase64, format, _sampleRate, lipSync) => {
-      // Critical: stop any in-flight audio before starting a new one.
-      // Otherwise back-to-back chats stack — you'd hear two Asunas
-      // overlapping. Pause the previous element AND revoke its blob
-      // URL so no orphan plays.
+    onAudio: (audioBase64, _format, _sampleRate, lipSync) => {
+      // Stop any in-flight audio before starting a new one.
       stopCurrentAudio();
 
-      const mime = format === 'mp3' ? 'mpeg' : format;
-      const audioBlob = new Blob(
-        [Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0))],
-        { type: `audio/${mime}` }
-      );
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audioRef.current = audio;
-      audioUrlRef.current = audioUrl;
-      audio.onended = () => {
-        setIsPlaying(false);
-        setPendingAudio(null);
-        if (audioUrlRef.current === audioUrl) {
-          URL.revokeObjectURL(audioUrl);
-          audioUrlRef.current = null;
-        }
-      };
-      setIsPlaying(true);
+      // Decode base64 → ArrayBuffer once, hand to Web Audio.
+      const bytes = Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0));
       setLipSyncData(lipSync);
-      audio.play()
-        .then(() => {
+      setIsPlaying(true);
+      decodeAndPlay(bytes.buffer, () => {
+        setIsPlaying(false);
+        playbackRef.current = null;
+      })
+        .then((handle) => {
+          playbackRef.current = handle;
           audioUnlockedRef.current = true;
           setAudioError(null);
+          setPendingAudio(null);
         })
-        .catch((err) => {
-          console.error('audio playback blocked:', err);
+        .catch((err: Error) => {
+          console.error('audio decode/play failed:', err);
           setIsPlaying(false);
-          setAudioError(err.name === 'NotAllowedError'
-            ? 'Browser blocked audio. Click "Play" to enable.'
-            : `Audio error: ${err.message}`);
-          setPendingAudio(audio);
+          // AudioContext suspended (autoplay policy) is the only
+          // recoverable case — surface a "click to play" affordance.
+          if (err.name === 'NotAllowedError' || /suspend/i.test(err.message)) {
+            setAudioError('Browser blocked audio. Click "Play" to enable.');
+            // Stash the bytes so the manual-play button can replay them.
+            const replay = async () => {
+              try {
+                const handle = await decodeAndPlay(bytes.buffer, () => {
+                  setIsPlaying(false);
+                  playbackRef.current = null;
+                });
+                playbackRef.current = handle;
+                audioUnlockedRef.current = true;
+                setAudioError(null);
+                setIsPlaying(true);
+                setPendingAudio(null);
+              } catch (e) {
+                setAudioError(`Still blocked: ${(e as Error).message}`);
+              }
+            };
+            // Synthesize a stub audio element only to drive our
+            // existing "Click to play" UI; clicking it calls replay().
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const stub = { play: replay } as any;
+            setPendingAudio(stub);
+          } else {
+            setAudioError(`Audio error: ${err.message}`);
+          }
         });
     },
     onText: (content) => {
@@ -236,12 +285,19 @@ export default function Avatar() {
     const text = chatInput.trim();
     if (!text || sending) return;
 
-    // Browser autoplay pre-warm via 1-frame silent WAV.
+    // Browser autoplay pre-warm: nudge the shared AudioContext during
+    // this user gesture so the eventual decodeAndPlay (10–20s later)
+    // doesn't get blocked by autoplay policy.
     if (!audioUnlockedRef.current) {
-      const silent = new Audio(
-        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA='
-      );
-      silent.play().then(() => { audioUnlockedRef.current = true; }).catch(() => {});
+      try {
+        const ctx = getAudioContext();
+        if (ctx.state === 'suspended') {
+          // resume() returns a promise; ignore the result, the
+          // context state flip is what matters
+          void ctx.resume();
+        }
+        audioUnlockedRef.current = true;
+      } catch { /* ignore — fall back to manual play button */ }
     }
 
     appendTurn({ role: 'user', text, ts: Date.now() });
@@ -359,15 +415,13 @@ export default function Avatar() {
                 boxShadow: '0 4px 12px rgba(59,130,246,0.4)',
               }}
               onClick={() => {
-                pendingAudio
-                  .play()
-                  .then(() => {
-                    audioUnlockedRef.current = true;
-                    setIsPlaying(true);
-                    setAudioError(null);
-                    setPendingAudio(null);
-                  })
-                  .catch((e) => setAudioError(`Still blocked: ${e.message}`));
+                // pendingAudio.play() now resolves a Web Audio replay
+                // promise (set up in decodeAndPlay's catch above);
+                // either it succeeds and clears the banner, or it
+                // updates audioError with the new failure reason.
+                Promise.resolve(pendingAudio.play()).catch((e) =>
+                  setAudioError(`Still blocked: ${e?.message ?? e}`)
+                );
               }}
             >
               ▶  {audioError ?? 'Click to play audio'}

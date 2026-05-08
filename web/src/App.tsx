@@ -31,13 +31,17 @@ function Nav() {
       style={{
         display: 'flex',
         gap: 16,
-        padding: '12px 24px',
+        // Slightly more vertical padding so the title doesn't touch the
+        // OS title bar in environments where the system extends chrome
+        // into the content rect (Windows 11 Mica, some Tauri setups).
+        padding: '14px 24px',
         borderBottom: '1px solid #1f2227',
         background: '#0e1014',
         alignItems: 'center',
+        flexShrink: 0,
       }}
     >
-      <Link to="/" style={{ color: '#fff', fontWeight: 600, textDecoration: 'none' }}>
+      <Link to="/" style={{ color: '#fff', fontWeight: 600, textDecoration: 'none', fontSize: 14 }}>
         zeroclaw·companion
       </Link>
       <span style={{ flex: 1 }} />

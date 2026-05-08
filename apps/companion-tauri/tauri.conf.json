@@ -14,9 +14,15 @@
         "title": "ZeroClaw Companion",
         "width": 1100,
         "height": 760,
+        "minWidth": 800,
+        "minHeight": 560,
         "resizable": true,
         "fullscreen": false,
         "visible": true,
+        "decorations": true,
+        "transparent": false,
+        "shadow": true,
+        "theme": "Dark",
         "url": "/"
       },
       {

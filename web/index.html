@@ -6,12 +6,20 @@
     <meta name="color-scheme" content="dark" />
     <title>zeroclaw companion</title>
     <style>
-      html, body, #root { height: 100%; margin: 0; }
+      html, body, #root {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+      }
       body {
         background: #0b0d10;
         color: #e6e6e6;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
       }
+      /* Don't let the body scroll the whole document — pages manage their
+         own scroll containers. Prevents the nav from being pushed off-top. */
+      #root { display: flex; flex-direction: column; }
     </style>
   </head>
   <body>
