@@ -32,6 +32,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 anyhow = "1"
+# Native audio playback. WebView2 on Windows classifies its audio
+# stream as "communications" (AGC + acoustic echo cancellation), which
+# audibly degrades TTS playback. rodio uses cpal → WASAPI in the host
+# process directly, which Windows classifies as multimedia and leaves
+# untouched. Frontend invokes us via tauri::command instead of using
+# its <video> element when the host is Tauri.
+rodio = { version = "0.20", default-features = false, features = ["wav", "hound"] }
+base64 = "0.22"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

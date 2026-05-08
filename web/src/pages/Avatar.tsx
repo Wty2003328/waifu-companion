@@ -7,6 +7,7 @@ import {
   type DebugFrame,
 } from '../components/avatar/useAvatarSocket';
 import { HTTP_BASE, WS_BASE } from '../lib/apiBase';
+import { nativeAudioAvailable, playAudioNative, stopAudioNative } from '../lib/nativeAudio';
 
 interface ModelInfo {
   modelUrl: string;
@@ -237,6 +238,14 @@ export default function Avatar() {
       });
   }, []);
 
+  /** Push base64 WAV bytes onto the WebView playback queue. Used as
+   *  a fallback when native audio is unavailable or fails. */
+  const enqueueWebviewAudio = useCallback((audioBase64: string) => {
+    const bytes = Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0));
+    audioQueueRef.current.push(bytes.buffer);
+    drainQueue();
+  }, [drainQueue]);
+
   const wsUrl = `${WS_BASE}/ws/avatar`;
 
   // Auto-scroll history to bottom whenever it grows.
@@ -272,18 +281,15 @@ export default function Avatar() {
       const match = modelActions.motions.find((m) => m.group === group);
       if (match) viewerRef.current?.playMotion(match.group, match.index);
     },
-    onAudio: (audioBase64, _format, _sampleRate, lipSync, turnId, _seq, _last) => {
-      // A new turn (different turn_id) flushes any in-flight chunks
-      // from the previous reply. Same turn_id → keep the queue
-      // intact and append.
+    onAudio: (audioBase64, _format, _sampleRate, lipSync, turnId, _seq, last) => {
+      // New turn → flush both the WebView queue AND the native sink.
       if (turnId && turnId !== currentTurnRef.current) {
         stopCurrentAudio();
+        if (nativeAudioAvailable()) void stopAudioNative();
         currentTurnRef.current = turnId;
       }
 
-      // Empty audio happens when the server signaled `last` for a
-      // failed chunk — nothing to play, but we still need to honor
-      // the queue contract.
+      // Empty audio = server signaled `last` for a failed chunk.
       if (!audioBase64) {
         if (!drainingRef.current && audioQueueRef.current.length === 0) {
           setIsPlaying(false);
@@ -291,11 +297,33 @@ export default function Avatar() {
         return;
       }
 
-      const bytes = Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0));
-      audioQueueRef.current.push(bytes.buffer);
       setLipSyncData(lipSync);
       setIsPlaying(true);
-      drainQueue();
+
+      // Native path (Tauri only): rodio plays through the host
+      // process's WASAPI session, which Windows classifies as
+      // multimedia. Bypasses WebView2's "communications" DSP.
+      if (nativeAudioAvailable()) {
+        void playAudioNative(audioBase64, turnId).then(() => {
+          // rodio's Sink doesn't emit a JS-visible "ended" event; we
+          // optimistically drop "speaking" state when the last chunk
+          // has been queued. The Sink will play through its queue.
+          if (last) {
+            // Give the queue a moment to finish. Cheap heuristic
+            // (we don't have decoded duration here) — frontend "speaking"
+            // state is just visual; the audio plays correctly either way.
+            setTimeout(() => setIsPlaying(false), 500);
+          }
+        }).catch((err) => {
+          console.error('native audio failed, falling back to webview:', err);
+          // Fall through to the <video> path
+          enqueueWebviewAudio(audioBase64);
+        });
+        return;
+      }
+
+      // Browser path: existing <video>/Web Audio queue
+      enqueueWebviewAudio(audioBase64);
     },
     onText: (content) => {
       setSubtitle(content);

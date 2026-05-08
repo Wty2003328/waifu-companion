@@ -17,6 +17,82 @@ use tauri_plugin_shell::{ShellExt, process::CommandChild};
 /// Holds the companion-server sidecar process so we can kill it on exit.
 struct ServerProcess(Mutex<Option<CommandChild>>);
 
+/// Audio playback runs on a dedicated worker thread because rodio's
+/// `OutputStream` (Windows COM handles) is `!Send` and can't sit in
+/// Tauri's `State` directly. The Tauri-managed `AudioState` is just a
+/// command sender — `Send + Sync` — and the worker owns the stream,
+/// sink, and current-turn id.
+enum AudioCmd {
+    Play { wav_bytes: Vec<u8>, turn_id: String },
+    Stop,
+}
+
+struct AudioState {
+    tx: std::sync::mpsc::Sender<AudioCmd>,
+}
+
+impl AudioState {
+    fn spawn() -> anyhow::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<AudioCmd>();
+        std::thread::Builder::new()
+            .name("companion-audio".into())
+            .spawn(move || run_audio_worker(rx))?;
+        Ok(Self { tx })
+    }
+}
+
+fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
+    // Open the default Windows audio output. cpal/WASAPI in this
+    // process — Windows classifies as multimedia (NOT communications),
+    // so no AGC / echo cancellation gets applied to TTS.
+    let (_stream, handle) = match rodio::OutputStream::try_default() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!("companion-audio: failed to open output: {e}");
+            return;
+        }
+    };
+    let mut current_turn: Option<String> = None;
+    let mut sink: Option<rodio::Sink> = None;
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            AudioCmd::Stop => {
+                sink = None;
+                current_turn = None;
+            }
+            AudioCmd::Play { wav_bytes, turn_id } => {
+                if current_turn.as_deref() != Some(&turn_id) {
+                    // New turn — drop the previous sink (and its queue)
+                    // so we don't carry over chunks from a stale reply.
+                    sink = None;
+                    current_turn = Some(turn_id);
+                }
+                if sink.is_none() {
+                    sink = match rodio::Sink::try_new(&handle) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            tracing::error!("companion-audio: sink alloc: {e}");
+                            continue;
+                        }
+                    };
+                }
+                let cursor = std::io::Cursor::new(wav_bytes);
+                match rodio::Decoder::new_wav(cursor) {
+                    Ok(source) => {
+                        if let Some(ref s) = sink {
+                            s.append(source);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("companion-audio: wav decode: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -63,7 +139,23 @@ pub fn run() {
             Ok(())
         })
         .manage(ServerProcess(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![show_avatar_window, hide_avatar_window])
+        .manage(match AudioState::spawn() {
+            Ok(s) => s,
+            Err(e) => {
+                // Don't panic — fall back to a sender that drops
+                // commands. The frontend will fail invoke and revert
+                // to its WebView <video> path.
+                tracing::error!("companion-tauri: audio worker spawn failed: {e}");
+                let (tx, _rx) = std::sync::mpsc::channel::<AudioCmd>();
+                AudioState { tx }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            show_avatar_window,
+            hide_avatar_window,
+            play_audio_native,
+            stop_audio_native,
+        ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) && window.label() == "main" {
                 let app = window.app_handle();
@@ -120,4 +212,38 @@ fn hide_avatar_window(app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "avatar window not found".to_string())?;
     win.hide().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Play a base64-encoded WAV chunk via the native rodio backend.
+///
+/// All chunks of the same `turn_id` queue into the same Sink so they
+/// play back-to-back without gaps. A new `turn_id` interrupts and
+/// drops the previous queue. Bytes go through cpal → WASAPI in the
+/// Tauri host process, NOT the WebView2 audio pipeline — bypasses
+/// the "communications" classification + DSP that processes TTS in
+/// WebView2.
+#[tauri::command]
+fn play_audio_native(
+    state: tauri::State<'_, AudioState>,
+    audio_b64: String,
+    turn_id: String,
+) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&audio_b64)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    state
+        .tx
+        .send(AudioCmd::Play {
+            wav_bytes: bytes,
+            turn_id,
+        })
+        .map_err(|e| format!("audio worker gone: {e}"))
+}
+
+/// Interrupt any in-progress native playback. Called when the frontend
+/// component unmounts or the user clears chat history.
+#[tauri::command]
+fn stop_audio_native(state: tauri::State<'_, AudioState>) {
+    let _ = state.tx.send(AudioCmd::Stop);
 }
