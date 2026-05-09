@@ -85,6 +85,20 @@ interface Live2DViewerProps {
    * the desktop pet wasn't repositionable.
    */
   dragRegion?: boolean;
+  /**
+   * When true, click-and-drag on the avatar in MAIN window mode
+   * translates the model (parent updates prefs.offsetX/offsetY via
+   * onTranslate). Suppressed in overlay mode because the click should
+   * drag the WINDOW there instead. Quick taps that don't exceed
+   * `dragThreshold` pixels are interpreted as clicks (hit-area motion).
+   */
+  dragToTranslate?: boolean;
+  /**
+   * Called with cumulative dx/dy in CSS pixels during a translate
+   * drag. Caller is expected to apply the delta to its own offsetX/Y
+   * state and pass the new offsetX/offsetY back as props on next render.
+   */
+  onTranslate?: (dx: number, dy: number) => void;
 }
 
 const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
@@ -103,6 +117,8 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   eyeTracking = false,
   motionsRef,
   dragRegion = false,
+  dragToTranslate = false,
+  onTranslate,
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const appRef = useRef<PIXI.Application | null>(null);
@@ -342,46 +358,85 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
     return () => { cancelled = true; clearInterval(id); };
   }, [idleMotion, idleMotionIntervalMs, isPlaying, loaded, motionsRef]);
 
-  // Hit-area click → trigger a motion (like a Live2DViewerEX "react
-  // to touch" feature). pixi-live2d-display models expose hit areas
-  // declared in the .moc/.physics — typically named Head / Body / Arm
-  // etc. Clicking inside one of those areas fires `model.motion(group,
-  // index)` for a matching group, falling back to TapBody.
+  // Drag-to-translate the model + hit-area click for motions.
+  //
+  // Both gestures share mousedown, so they're handled in one effect:
+  //   - Press + move > DRAG_THRESHOLD px → translate (calls onTranslate
+  //     with cumulative delta).
+  //   - Press + release without crossing the threshold → hit-area
+  //     click (fires `Tap{HitArea}` motion).
+  // In pet (overlay) mode we suppress both — clicks should fall
+  // through to data-tauri-drag-region so the window moves instead.
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || dragRegion) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const onClick = (e: MouseEvent) => {
+    const DRAG_THRESHOLD = 5; // px — distance before a press becomes a drag
+    let pressing = false;
+    let dragging = false;
+    let startX = 0, startY = 0;
+    let lastX = 0, lastY = 0;
+
+    const onDown = (e: MouseEvent) => {
+      if (e.button !== 0) return; // left button only
+      pressing = true;
+      dragging = false;
+      startX = lastX = e.clientX;
+      startY = lastY = e.clientY;
+    };
+    const onMove = (e: MouseEvent) => {
+      if (!pressing) return;
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      if (!dragging) {
+        if (Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) > DRAG_THRESHOLD) {
+          dragging = true;
+          if (dragToTranslate) canvas.style.cursor = 'grabbing';
+        } else {
+          return;
+        }
+      }
+      if (dragToTranslate && onTranslate) onTranslate(dx, dy);
+      lastX = e.clientX;
+      lastY = e.clientY;
+    };
+    const onUp = () => {
+      const wasDragging = dragging;
+      pressing = false;
+      dragging = false;
+      canvas.style.cursor = '';
+      if (wasDragging) return; // suppress click-as-motion when it was a drag
+      // Treat as a tap → hit-area motion.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const model = modelRef.current as any;
       if (!model) return;
-      // Don't compete with window-drag in pet mode; if dragRegion is
-      // on we let mousedown bubble to the OS.
-      if (dragRegion) return;
       const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
+      const x = lastX - rect.left;
+      const y = lastY - rect.top;
       try {
         const hits: string[] = model.hitTest?.(x, y) ?? [];
         if (hits.length === 0) return;
-        // Pick a motion group whose name matches the hit area; common
-        // conventions: Head → "TapHead", Body → "TapBody". Fall back
-        // to any group that starts with "Tap".
         const motions = motionsRef?.current ?? [];
         const wanted = `Tap${hits[0]}`.toLowerCase();
         const exact = motions.find((m) => m.group.toLowerCase() === wanted);
         const fallback = motions.find((m) => m.group.toLowerCase().startsWith('tap'));
         const pick = exact ?? fallback;
-        if (pick) {
-          model.motion(pick.group, pick.index);
-        }
+        if (pick) model.motion(pick.group, pick.index);
       } catch (err) {
         console.warn('[Live2DViewer] hit-area motion failed:', err);
       }
     };
-    canvas.addEventListener('click', onClick);
-    return () => canvas.removeEventListener('click', onClick);
-  }, [loaded, dragRegion, motionsRef]);
+    canvas.addEventListener('mousedown', onDown);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    if (dragToTranslate) canvas.style.cursor = 'grab';
+    return () => {
+      canvas.removeEventListener('mousedown', onDown);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      canvas.style.cursor = '';
+    };
+  }, [loaded, dragRegion, dragToTranslate, onTranslate, motionsRef]);
 
   // Eye tracking — model gaze follows mouse over the canvas.
   // pixi-live2d-display takes window-coordinate mouse positions; the

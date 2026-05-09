@@ -729,6 +729,14 @@ export default function Avatar() {
               eyeTracking={prefs.eyeTracking}
               motionsRef={modelMotionsRef}
               dragRegion={IS_OVERLAY}
+              dragToTranslate={!IS_OVERLAY}
+              onTranslate={(dx, dy) =>
+                setPrefs((p) => ({
+                  ...p,
+                  offsetX: p.offsetX + dx,
+                  offsetY: p.offsetY + dy,
+                }))
+              }
             />
           ) : (
             <div
