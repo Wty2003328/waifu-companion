@@ -15,7 +15,7 @@ same contract. Configure ZeroClaw with:
     launch_command  = "python tools/avatar/asuna_tts_server.py"
     port            = 9880
     voice           = "asuna"
-    reference_audio = "C:/Users/.../GPT-SoVITS/logs/asuna_combined/0_sliced/0003.wav"
+    reference_audio = "<GPT-SoVITS root>/logs/asuna_combined/0_sliced/0003.wav"
     reference_text  = "ここは私に任せて私を選んでくれる"
     reference_language = "ja"
     language        = "ja"   # default speech language
@@ -61,12 +61,16 @@ import uvicorn
 # Locate the GPT-SoVITS install. TTS_MODEL_PATH points at the repo root.
 # ---------------------------------------------------------------------------
 
-GPT_SOVITS_ROOT = Path(
-    os.environ.get(
-        "TTS_MODEL_PATH",
-        r"C:\Users\user\Desktop\workspace\GPT-SoVITS",
+_TTS_MODEL_PATH = os.environ.get("TTS_MODEL_PATH")
+if not _TTS_MODEL_PATH:
+    raise SystemExit(
+        "TTS_MODEL_PATH env var not set. Point it at your GPT-SoVITS "
+        "checkout root, e.g.\n"
+        "    set TTS_MODEL_PATH=C:\\path\\to\\GPT-SoVITS   (Windows)\n"
+        "    export TTS_MODEL_PATH=/path/to/GPT-SoVITS    (Linux/macOS)\n"
+        "or set it via [avatar.tts] model_path in companion.toml."
     )
-).resolve()
+GPT_SOVITS_ROOT = Path(_TTS_MODEL_PATH).resolve()
 
 if not GPT_SOVITS_ROOT.exists():
     raise SystemExit(f"GPT-SoVITS root not found: {GPT_SOVITS_ROOT}")
@@ -75,9 +79,12 @@ os.chdir(str(GPT_SOVITS_ROOT))
 sys.path.insert(0, str(GPT_SOVITS_ROOT))
 sys.path.insert(0, str(GPT_SOVITS_ROOT / "GPT_SoVITS"))
 
-# ffmpeg from the conda env (matches train scripts).
-ffmpeg_bin = str(Path(r"E:/miniconda/envs/ece598/Scripts"))
-os.environ["PATH"] = ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
+# Optional: prepend a Python env's Scripts/ dir to PATH so a bundled
+# ffmpeg.exe (common in conda envs) is discoverable. Pass the path via
+# TTS_FFMPEG_BIN; ignored if unset.
+_ffmpeg_bin = os.environ.get("TTS_FFMPEG_BIN")
+if _ffmpeg_bin:
+    os.environ["PATH"] = _ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
 os.environ["version"] = "v4"
 
 

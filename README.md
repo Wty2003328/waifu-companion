@@ -143,8 +143,9 @@ next 30s poll.
   (default `http://127.0.0.1:8080`; this repo is configured for
   `42617` — adjust `[zeroclaw] url` in `companion.toml`)
 - **Optional:** GPT-SoVITS + Python (the included Asuna wrapper
-  expects `python` on Windows; edit
-  `[avatar.tts] launch_command` to match your path)
+  reads its model path from the `TTS_MODEL_PATH` env var, which
+  `companion-server` derives from `[avatar.tts] model_path` in
+  `companion.toml` — point that at your GPT-SoVITS checkout root)
 - **Optional:** an OpenAI-compatible LLM key for the subagent
   (only needed when `[avatar] chat_language != [avatar.tts]
   language`)
@@ -229,6 +230,7 @@ auto_start      = true                      # let companion-server own
                                             # the TTS lifecycle (graceful
                                             # shutdown on exit)
 launch_command  = "python tools/avatar/asuna_tts_server.py"
+model_path      = "/path/to/GPT-SoVITS"     # forwarded as TTS_MODEL_PATH
 gpu_device      = 0
 streaming       = true                      # sentence-chunked synthesis
 
@@ -350,7 +352,7 @@ runnable in isolation against a `companion-server` listening on
 
 ```bash
 # Run a single suite
-python scripts/e2e_characters_test.py
+python scripts/e2e_characters_test.py   # any Python with playwright + websocket-client
 
 # Or a full sweep — see scripts/smoke.sh
 ./scripts/smoke.sh
