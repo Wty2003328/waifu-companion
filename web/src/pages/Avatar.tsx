@@ -356,6 +356,23 @@ export default function Avatar() {
       // Browser path: existing <video>/Web Audio queue
       enqueueWebviewAudio(audioBase64);
     },
+    onUserMessage: (content) => {
+      // The server echoes the user's typed message on the broadcast
+      // channel so the main window records it in chat history,
+      // regardless of which window typed it (the overlay can have
+      // its own compact chat input but isn't authoritative for state).
+      if (IS_OVERLAY) return; // overlay never writes history
+      // Dedupe inside setHistory so we use the LATEST state — the
+      // outer-closure `history` would be stale.
+      setHistory((prev) => {
+        const last = prev[prev.length - 1];
+        if (last && last.role === 'user' && last.text === content) {
+          return prev; // optimistic append already landed (main typed)
+        }
+        const turn: ChatTurn = { role: 'user', text: content, ts: Date.now() };
+        return [...prev, turn].slice(-HISTORY_LIMIT);
+      });
+    },
     onText: (content) => {
       setSubtitle(content);
       // WS delivered the assistant turn — clear the pending HTTP
@@ -514,24 +531,39 @@ export default function Avatar() {
     : (prefs.background || '#0a0a0a');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'row', height: '100%', gap: 12, padding: 12 }}>
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'row',
+        height: '100%',
+        gap: IS_OVERLAY ? 0 : 12,
+        padding: IS_OVERLAY ? 0 : 12,
+      }}
+    >
       {/* Left column: avatar + (collapsible) controls */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: IS_OVERLAY ? 0 : 12, minWidth: 0 }}>
         <div
+          // In overlay mode the entire canvas is a drag region so the
+          // user can pick up and move the desktop pet by clicking
+          // anywhere on the avatar. Tauri intercepts this attribute to
+          // start a window drag, and live2d's PIXI canvas (which we
+          // disabled interactivity on earlier for unsafe-eval reasons)
+          // doesn't swallow the mouse event.
+          {...(IS_OVERLAY ? { 'data-tauri-drag-region': '' } : {})}
           style={{
             flex: 1,
             position: 'relative',
-            borderRadius: 12,
+            borderRadius: IS_OVERLAY ? 0 : 12,
             overflow: 'hidden',
-            background: canvasBg,
+            background: IS_OVERLAY ? 'transparent' : canvasBg,
             minHeight: 0,
             // Subtle checker pattern when transparent so the user can
-            // see the canvas extents.
-            backgroundImage: prefs.transparent
+            // see the canvas extents. Suppressed in overlay mode.
+            backgroundImage: !IS_OVERLAY && prefs.transparent
               ? 'linear-gradient(45deg, #1a1a1a 25%, transparent 25%), linear-gradient(-45deg, #1a1a1a 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #1a1a1a 75%), linear-gradient(-45deg, transparent 75%, #1a1a1a 75%)'
               : undefined,
-            backgroundSize: prefs.transparent ? '20px 20px' : undefined,
-            backgroundPosition: prefs.transparent ? '0 0, 0 10px, 10px -10px, -10px 0px' : undefined,
+            backgroundSize: !IS_OVERLAY && prefs.transparent ? '20px 20px' : undefined,
+            backgroundPosition: !IS_OVERLAY && prefs.transparent ? '0 0, 0 10px, 10px -10px, -10px 0px' : undefined,
           }}
         >
           {modelInfo ? (
@@ -793,6 +825,74 @@ export default function Avatar() {
           </div>
         </div>
       </div>
+      )}
+
+      {/* Compact chat bar — only in overlay (desktop pet) mode. The
+          overlay window is transparent + frameless, so this is the
+          ONLY way to talk to Asuna without opening the main window.
+          Anchored to the bottom edge with a translucent backdrop so
+          the avatar above stays the visual focus. Stops drag bubbling
+          to the parent's drag region. */}
+      {IS_OVERLAY && (
+        <form
+          onMouseDown={(e) => e.stopPropagation()}
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSendChat();
+          }}
+          style={{
+            position: 'absolute',
+            left: 12,
+            right: 12,
+            bottom: 12,
+            display: 'flex',
+            gap: 6,
+            background: 'rgba(11, 13, 16, 0.85)',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            padding: 8,
+            borderRadius: 12,
+            border: '1px solid #2a2d33',
+            // The form itself isn't draggable so the user can click
+            // into the input without picking up the window.
+          }}
+          // Explicitly opt this subtree out of the parent's
+          // data-tauri-drag-region so input clicks don't move the window.
+          {...{ 'data-tauri-drag-region': 'false' } as Record<string, string>}
+        >
+          <input
+            type="text"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder={sending ? 'sending…' : 'talk to asuna…'}
+            disabled={sending}
+            style={{
+              flex: 1,
+              background: '#0b0d10',
+              color: '#fff',
+              padding: '8px 10px',
+              borderRadius: 8,
+              border: '1px solid #2a2d33',
+              fontSize: 12,
+              outline: 'none',
+            }}
+          />
+          <button
+            type="submit"
+            disabled={!chatInput.trim() || sending}
+            style={{
+              padding: '6px 12px',
+              background: chatInput.trim() && !sending ? '#3b82f6' : '#1f2937',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 8,
+              fontSize: 12,
+              cursor: chatInput.trim() && !sending ? 'pointer' : 'not-allowed',
+            }}
+          >
+            ➤
+          </button>
+        </form>
       )}
     </div>
   );

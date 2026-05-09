@@ -92,6 +92,15 @@ pub enum AvatarNotification {
         content: String,
     },
 
+    /// User's typed message, echoed to every connected WS client so
+    /// chat history stays consistent across windows. The overlay
+    /// (desktop-pet) window can accept input but isn't authoritative
+    /// for chat history; without this echo, a user message typed in
+    /// the overlay would never reach the main window's chat panel.
+    UserMessage {
+        content: String,
+    },
+
     /// Optional debug frame: what the subagent actually fed to TTS,
     /// alongside metadata about the analysis. Helps users verify the
     /// translation is happening (and is correct) without reading

@@ -532,6 +532,21 @@ async fn handle_chat(
         ));
     }
     tracing::info!("companion: /api/chat → zeroclaw ({}c)", req.message.len());
+
+    // Echo the user's message on the avatar broadcast channel so all
+    // connected windows (main + overlay) record the same user turn in
+    // their chat panel. Without this, a message typed in the overlay
+    // would never reach the main window's history because only the
+    // main window appendTurn user turns (overlay isn't authoritative).
+    if let Some(ref avatar) = state.avatar {
+        let frame = companion_avatar::AvatarEvent::Frame(
+            companion_avatar::AvatarNotification::UserMessage {
+                content: req.message.clone(),
+            },
+        );
+        let _ = avatar.event_tx.send(frame);
+    }
+
     let started = std::time::Instant::now();
     let reply = state
         .zeroclaw

@@ -72,6 +72,9 @@ interface UseAvatarSocketOptions {
     last: boolean,
   ) => void;
   onText?: (content: string) => void;
+  /** A user-typed message echoed back from the server (so every
+   *  connected window records the same user turn). */
+  onUserMessage?: (content: string) => void;
   onDebug?: (frame: DebugFrame) => void;
   onIdle?: () => void;
   onError?: (message: string) => void;
@@ -151,6 +154,11 @@ export function useAvatarSocket(url: string, options: UseAvatarSocketOptions = {
             case 'Text':
               if (msg.content && options.onText) {
                 options.onText(msg.content);
+              }
+              break;
+            case 'UserMessage':
+              if (msg.content && options.onUserMessage) {
+                options.onUserMessage(msg.content);
               }
               break;
             case 'Debug':
