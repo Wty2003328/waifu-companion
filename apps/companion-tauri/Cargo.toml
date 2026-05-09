@@ -40,6 +40,11 @@ anyhow = "1"
 # its <video> element when the host is Tauri.
 rodio = { version = "0.20", default-features = false, features = ["wav", "hound"] }
 base64 = "0.22"
+# Tiny blocking HTTP client used during graceful shutdown — calls
+# companion-server's POST /api/shutdown and polls /health from a std
+# thread (this code path runs after WindowEvent::Destroyed, off the
+# tokio runtime). ureq is the smallest sync HTTP client (~50KB).
+ureq = { version = "2", default-features = false }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

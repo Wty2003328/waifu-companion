@@ -211,11 +211,66 @@ impl AnimeTtsManager {
         Ok(())
     }
 
-    /// Stop the TTS server subprocess.
+    /// Stop the TTS server subprocess gracefully.
+    ///
+    /// Hard-killing a Python TTS process (the previous behavior — bare
+    /// `child.kill()`, which on Windows is `TerminateProcess`) skips
+    /// PyTorch's atexit chain and CUDA context teardown, leaving the
+    /// GPU driver in a fragmented compute-favoring state for ~30–90s.
+    /// User-visible symptom: games stutter for a minute after closing
+    /// the companion. The fix here is two-stage:
+    ///   1. POST `/shutdown` to the TTS server. Our Python wrapper
+    ///      (scripts/tts_launcher.py) catches this and runs
+    ///      torch.cuda.empty_cache() + del model + sys.exit(0) so
+    ///      atexit handlers fire and the CUDA context is released
+    ///      cleanly.
+    ///   2. If the process hasn't exited within `GRACEFUL_TIMEOUT`,
+    ///      fall back to `child.kill()` so we never leak a runaway
+    ///      subprocess on stuck shutdown.
     pub async fn stop_server(&self) -> Result<()> {
+        const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+        // Best-effort graceful HTTP shutdown. Errors are non-fatal —
+        // the wrapper may not implement /shutdown, the server may
+        // already be dying, or the network call may simply race the
+        // process exit. We just want the request to land.
+        let url = format!("{}/shutdown", self.api_url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .ok();
+        if let Some(c) = client {
+            match c.post(&url).send().await {
+                Ok(_) => tracing::info!("avatar: TTS /shutdown requested"),
+                Err(e) => tracing::debug!("avatar: TTS /shutdown not delivered ({e}); falling through"),
+            }
+        }
+
         let mut child_guard = self.child.lock().await;
         if let Some(ref mut child) = *child_guard {
-            child.kill().await.context("Failed to kill TTS server")?;
+            // Wait up to GRACEFUL_TIMEOUT for the process to exit by
+            // itself (i.e., its /shutdown handler ran). On timeout
+            // hard-kill so we don't leak the subprocess.
+            let waited = tokio::time::timeout(GRACEFUL_TIMEOUT, child.wait()).await;
+            match waited {
+                Ok(Ok(status)) => {
+                    tracing::info!(
+                        "avatar: TTS server exited gracefully (status={status})"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("avatar: TTS wait failed ({e}); attempting kill");
+                    let _ = child.kill().await;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "avatar: TTS server did not exit within {}s — \
+                         hard-killing (CUDA cleanup may not have run)",
+                        GRACEFUL_TIMEOUT.as_secs()
+                    );
+                    child.kill().await.context("Failed to kill TTS server")?;
+                }
+            }
             tracing::info!("avatar: stopped TTS server");
         }
         *child_guard = None;

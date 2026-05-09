@@ -1,31 +1,116 @@
 # zeroclaw-companion
 
-Live2D avatar + Pulse dashboard for [zeroclaw](https://github.com/zeroclaw-labs/zeroclaw),
-running as a sidecar.
+A **Live2D anime companion + Pulse dashboard** for the
+[zeroclaw](https://github.com/zeroclaw-labs/zeroclaw) AI agent.
+Runs as an out-of-tree sidecar — zero patches to zeroclaw, talks
+over its public REST + SSE API.
 
-**Why a separate repo?** Embedding these features in a fork of zeroclaw made every
-upstream release a multi-day rebase. The companion talks to vanilla zeroclaw over its
-public REST + SSE API instead — zero patches, no version coupling, much easier to track.
+Ships as either a **Tauri 2 desktop app** (recommended — gets you
+the always-on-top transparent desktop-pet window, native audio,
+hardware-accelerated Live2D rendering) or a **headless server +
+browser** combo.
 
-## What you get
+> **Why a separate repo?** Embedding these features in a fork of
+> zeroclaw made every upstream release a multi-day rebase. The
+> companion talks to vanilla zeroclaw — zero patches, no version
+> coupling.
 
-- **Live2D anime avatar** with TTS + lip sync + expression mapping
-- **Generic TTS port**: any model wrapper that speaks `POST /tts` + `GET /health`
-  works (GPT-SoVITS, Fish-Speech, MeloTTS, XTTS, F5-TTS, edge-tts, …)
-- **Chat / TTS language decoupling**: chat with the agent in English, have the avatar
-  speak Japanese. The avatar subagent translates each reply via a cheap LLM call.
-- **Pulse dashboard**: SQLite-backed feed of items from RSS/Atom feeds and Hacker News
-  with a per-collector "Run now" trigger. Extensible via the `Collector` trait.
+## Features
+
+### Live2D avatar
+
+- Renders Cubism 2 (`.moc` / `model.json`) and Cubism 4 (`.moc3` /
+  `model3.json`) models via [pixi-live2d-display](https://github.com/guansss/pixi-live2d-display)
+- Hi-DPI rendering (`devicePixelRatio` + antialiasing + power-pref:
+  high-performance) for clarity matching native viewers like
+  Live2DViewerEX
+- Per-model parameter sliders (28+ exposed for typical Cubism 2
+  models — drive `PARAM_ANGLE_X`, `PARAM_BREATH`, `PARAM_MOUTH_*`
+  etc. live)
+- Idle motion auto-play, eye/face tracking from cursor or webcam,
+  hit-area click → `Tap{Head,Body}` motion
+
+### Desktop pet mode
+
+- Transparent, frameless, always-on-top window
+- Drag from anywhere on the avatar (works around PIXI's mousedown
+  swallow via an explicit `start_dragging` Tauri command)
+- Snap-to-edge with multi-monitor awareness; position persists
+  across restarts
+- Chromeless until hover — chat bar + corner buttons fade in only
+  when the cursor is over the pet
+- Compact chat bar in the overlay so you can talk to the avatar
+  without opening the main window; main window mirrors history
+
+### TTS port
+
+- Generic wire contract — any model wrapper that speaks
+  `POST /tts {text, language, voice?, speed?}` + `GET /health`
+  works (GPT-SoVITS, Fish-Speech, MeloTTS, XTTS, F5-TTS, edge-tts,
+  …)
+- Reference Asuna v4 GPT-SoVITS wrapper at
+  `tools/avatar/asuna_tts_server.py`
+- Streaming sentence-chunked synthesis: first audio plays ~1s after
+  the agent reply lands instead of waiting for the full reply
+- Native rodio playback in Tauri (cpal → WASAPI multimedia) so the
+  voice doesn't get the WebView2 "communications channel" AGC + echo
+  cancellation treatment
+
+### Subagent (translation + expression detection)
+
+- Cheap LLM call that, per agent reply, returns clean chat-language
+  text + translated TTS-language text + Live2D expression name +
+  intensity
+- Bypassed for short replies (single bulk call); per-paragraph
+  translation for long ones (avoids z.ai-style 60s connection
+  timeouts on big inputs)
+- Two backends: direct OpenAI-compatible (`api_key` /
+  `api_key_env`) for speed, or routed through zeroclaw's webhook to
+  reuse its already-decrypted provider key
+- Strips agent thinking-trace preamble ("Let me check...", "The
+  user said...") before TTS so leaked scratchpad never reaches the
+  user
+
+### Chat / TTS language decoupling
+
+Chat with the agent in English, have the avatar speak Japanese.
+Set `[avatar] chat_language` and `[avatar.tts] language`
+independently in `companion.toml`.
+
+### Character management
+
+Each character bundles `{name, model_id, system_prompt}`.
+Switching the active character:
+
+- Swaps the live2d model on the canvas
+- Prepends the character's `system_prompt` to every user message
+  before companion-server forwards it to zeroclaw — so different
+  personas don't require touching zeroclaw's config
+
+### Pulse dashboard
+
+SQLite-backed feed of items from RSS/Atom feeds and Hacker News
+with a per-collector "Run now" trigger. Extensible via the
+`Collector` trait.
+
+### Settings page
+
+Editable from the UI, persisted to `companion.runtime.json`:
+
+- Subagent backend (direct LLM ↔ zeroclaw webhook), API key,
+  model, base URL
+- Live2D model picker (anything under `web/public/live2d/models/`)
+- Server URL (override for remote companion-server)
 
 ## Architecture
 
 ```
    user ─chat─▶ zeroclaw  ─────SSE /api/events ──▶ companion
                   ▲                                    │
-                  └──────POST /api/chat (proxy)────────┤
+                  └──────POST /api/chat (proxy) ◀──────┤
                                                        ▼
                                           companion subagent
-                                          (translate + emote)
+                                          (clean + translate + emote)
                                                        │
                                                        ▼
                                           TTS port  (POST /tts)
@@ -34,107 +119,317 @@ public REST + SSE API instead — zero patches, no version coupling, much easier
                                        Live2D viewer (WS /ws/avatar)
 ```
 
-The companion never modifies zeroclaw. It runs as its own process on its own port,
-subscribes to zeroclaw's event stream, and drives the avatar pipeline locally.
+In Tauri mode, `companion-tauri` spawns `companion-server` as a
+sidecar and renders the web UI in a native WebView2 window. On
+exit, Tauri sends `POST /api/shutdown` to the sidecar; the sidecar
+runs `tts.stop_server()` (which POSTs `/shutdown` to the Python
+TTS, runs `torch.cuda.empty_cache()` + `synchronize()` then
+`os._exit(0)`) before exiting itself. Only after this graceful
+chain — or after a 12s timeout — does Tauri fall back to
+`TerminateProcess`. This avoids the GPU-driver fragmentation that
+hard-killing CUDA processes leaves behind.
 
-## Quickstart
+`zeroclaw` is **never** spawned or killed by the companion — only
+queried. A red banner appears in the main window when zeroclaw is
+unreachable; you start it yourself and the banner clears on the
+next 30s poll.
 
-### 1. Run zeroclaw (vanilla, no fork required)
+## Prerequisites
 
-```bash
-# install zeroclaw following its own README
-zeroclaw gateway start
-# listens on http://127.0.0.1:8080
-```
+- **Rust 1.88+** (`rustup show`)
+- **Node.js 20+** (`node -v`) for the web bundle build
+- **`cargo install tauri-cli@^2`** if you want the desktop app
+- **zeroclaw** running somewhere reachable
+  (default `http://127.0.0.1:8080`; this repo is configured for
+  `42617` — adjust `[zeroclaw] url` in `companion.toml`)
+- **Optional:** GPT-SoVITS + Python (the included Asuna wrapper
+  expects `python` on Windows; edit
+  `[avatar.tts] launch_command` to match your path)
+- **Optional:** an OpenAI-compatible LLM key for the subagent
+  (only needed when `[avatar] chat_language != [avatar.tts]
+  language`)
 
-### 2. Run companion-server
+Platform deps for Tauri: see <https://tauri.app/start/prerequisites/>.
+On Windows, that's WebView2 (preinstalled on Windows 11 + recent
+Windows 10).
+
+## Quickstart — desktop app
 
 ```bash
 git clone https://github.com/Wty2003328/zeroclaw-companion
 cd zeroclaw-companion
 
-# config
+# Configure
 cp companion.toml.example companion.toml
-$EDITOR companion.toml
+$EDITOR companion.toml   # set zeroclaw URL, TTS engine, etc.
 
-# build the web bundle
+# Drop a Live2D model
+#   web/public/live2d/models/<name>/<name>.model3.json   (Cubism 4)
+#   web/public/live2d/models/<name>/model0.json          (Cubism 2)
+# Sample models: https://www.live2d.com/en/learn/sample/
+# Pick which one is default in companion.toml [avatar.model] model_dir.
+
+# Build the web bundle + the server binary
 cd web && npm install && npm run build && cd ..
+cargo build -p companion-server --release
 
-# Drop a Live2D model under web/public/live2d/models/<name>/.
-# The Cubism SDK sample models (Haru, Hiyori, Mark, …) work out of the box;
-# download from https://www.live2d.com/en/learn/sample/. The default expected
-# path is web/public/live2d/models/haru/Haru.model3.json — change with
-# [avatar.model] model_dir in companion.toml.
-
-# build + run the server
-cargo run --release -p companion-server
-# listens on http://127.0.0.1:9181
+# Build + run the Tauri shell (it bundles the server as a sidecar
+# automatically via build.rs)
+cd apps/companion-tauri
+cargo tauri build --no-bundle      # debug-ish: skip MSI/DMG packaging
+./target/release/companion-tauri.exe   # or .app / equivalent on Linux
 ```
 
-Open http://127.0.0.1:9181/ — you should see the companion home page with a green
-status indicator for upstream zeroclaw.
+Open the **Settings** tab in the running app to:
 
-### 3. Optional: anime voice via GPT-SoVITS v4 (Asuna example)
+1. Swap the active **Live2D model**
+2. Configure the **subagent backend** (paste your LLM key once;
+   stored in `companion.runtime.json` next to `companion.toml`)
+3. Toggle **Pet mode** (🪟 Show pet) for the always-on-top
+   transparent overlay
+
+The **Characters** tab lets you create, switch, and delete personas.
+
+## Quickstart — server only (browser)
+
+If you don't want the desktop shell:
 
 ```bash
-# point launch_command at this script in companion.toml; the companion
-# auto-starts it on boot (or run it yourself)
-python tools/avatar/asuna_tts_server.py
+# Build server + web bundle as above, then run:
+cargo run --release -p companion-server
+# → http://127.0.0.1:9181/
 ```
 
-See `companion.toml.example` for the full Asuna configuration block, and
-`tools/avatar/asuna_tts_server.py` for the v4 LoRA inference pipeline.
+## Configuration
 
-## Layout
+`companion.toml` (sample at `companion.toml.example`):
+
+```toml
+[zeroclaw]
+url           = "http://127.0.0.1:42617"   # vanilla zeroclaw daemon
+timeout_secs  = 300                         # generous — agent loops can run long
+
+[server]
+host          = "127.0.0.1"
+port          = 9181
+
+[avatar]
+enabled       = true
+chat_language = "en"                        # what the user types in
+                                            # If different from tts.language,
+                                            # the subagent translates per-reply.
+
+[avatar.tts]
+engine          = "gpt-sovits-v4"
+api_url         = "http://127.0.0.1:9880"
+port            = 9880
+language        = "ja"                      # what the avatar SPEAKS
+voice           = "asuna"
+auto_start      = true                      # let companion-server own
+                                            # the TTS lifecycle (graceful
+                                            # shutdown on exit)
+launch_command  = "python tools/avatar/asuna_tts_server.py"
+gpu_device      = 0
+streaming       = true                      # sentence-chunked synthesis
+
+[avatar.subagent]
+enabled              = true
+use_zeroclaw_webhook = true                  # or false to call LLM directly
+only_when_translating = true                 # skip subagent when chat = tts language
+
+[avatar.model]
+model_dir          = "/live2d/models/asuna/model0.json"
+default_expression = "F_NOMAL"
+scale              = 0.2
+anchor             = "center"
+```
+
+### Per-machine overrides — `companion.runtime.json`
+
+Created automatically by the Settings UI for things like API keys
+and subagent backend choice:
+
+```json
+{
+  "subagent": {
+    "use_zeroclaw_webhook": false,
+    "api_key": "<your-key>",
+    "model": "glm-4.5-flash",
+    "base_url": "https://api.z.ai/api/coding/paas/v4"
+  }
+}
+```
+
+This is `.gitignore`d. The companion server reads it after
+`companion.toml` and overlays the values.
+
+### Characters — `companion.characters.json`
+
+Created by the Characters page. Sibling of `companion.toml`.
+
+```json
+{
+  "active_id": "asuna",
+  "characters": [
+    {
+      "id": "asuna",
+      "name": "Asuna",
+      "model_id": "asuna",
+      "system_prompt": "You are Yuuki Asuna from SAO. Speak warmly..."
+    }
+  ]
+}
+```
+
+## Project layout
 
 ```
 zeroclaw-companion/
 ├── crates/
 │   ├── companion-core/      shared: zeroclaw client, SSE bridge, LLM client, config
 │   ├── companion-avatar/    Live2D pipeline: TTS port, subagent, lip sync, WS handler
-│   └── companion-pulse/     Pulse dashboard (stub — migration in progress)
+│   └── companion-pulse/     Pulse dashboard (SQLite store + RSS/HN collectors)
 ├── apps/
-│   └── companion-server/    binary: serves the web bundle + WS routes
-├── web/                     Vite + React frontend
+│   ├── companion-server/    binary: serves the web bundle + WS routes + REST API
+│   └── companion-tauri/     Tauri 2 desktop shell (bundles companion-server)
+├── web/
+│   ├── src/
+│   │   ├── pages/           Avatar, Characters, Settings, Pulse, Home
+│   │   ├── components/      Live2DViewer, AvatarControls, useAvatarSocket
+│   │   └── lib/             apiBase, characters, models, petWindow, webcamTracker
+│   └── public/live2d/       Live2D model assets (Cubism 2 + 4 supported)
 ├── tools/avatar/            reference TTS wrappers (Asuna v4 GPT-SoVITS)
-├── docs/                    architecture / migration notes
-└── companion.toml.example
+├── scripts/                 e2e Playwright + websocket tests, smoke probes
+├── docs/                    architecture / migration / E2E smoke notes
+├── companion.toml.example
+└── README.md
 ```
 
 ## Development
 
 ```bash
-# Workspace-level
+# Workspace
 cargo check --workspace
-cargo test --workspace          # 80+ unit + integration tests
+cargo test  --workspace          # 80+ unit + integration tests
 cargo clippy --workspace --all-targets
 
-# Frontend (with hot reload + proxy to companion-server)
-cd web && npm run dev    # http://127.0.0.1:5173
+# Web dev mode (proxies API + WS to companion-server on :9181)
+cd web && npm run dev            # http://127.0.0.1:5173
+
+# Tauri dev mode (hot reloads web changes; sidecar still cargo-rebuilt manually)
+cd apps/companion-tauri && cargo tauri dev
 ```
 
-## Smoke check a running stack
+`apps/companion-tauri/build.rs` automatically copies the freshest
+`target/release/companion-server` into `binaries/` on every Tauri
+build, so a `cargo build -p companion-server --release` followed by
+`cargo tauri build` always ships the latest sidecar.
+
+## Testing
+
+End-to-end Playwright + websocket suites under `scripts/`. Each is
+runnable in isolation against a `companion-server` listening on
+`:9181`:
+
+| Suite | Coverage |
+|---|---|
+| `e2e_canvas_prefs_test` | rotation/mirror/bg-image/idle-motion/eye-tracking pref round-trip |
+| `e2e_pet_chrome_test` | hover-reveal chrome in pet mode |
+| `e2e_overlay_drag_test` | `data-tauri-drag-region` attributes correctly applied |
+| `e2e_drag_to_translate_test` | drag in main moves model; drag in overlay drags window |
+| `e2e_model_swap_test` | `/api/models` + Settings model picker |
+| `e2e_param_sliders_test` | Live2D parameter slider round-trip |
+| `e2e_webcam_tracking_test` | webcam toggle + camera lifecycle |
+| `e2e_characters_test` | character CRUD + activate + page render |
+| `e2e_browser_test` | full chat round-trip (needs zeroclaw + TTS) |
+| `e2e_reload_test` | history persists across reload |
+| `e2e_overlay_chat_test` | overlay-typed chat reaches main window |
+| `e2e_multi_window_test` | main + overlay don't clobber localStorage |
+| `e2e_subagent_test` | subagent translation + chunking pipeline |
+| `e2e_audio_inspect.py` | audio chunk fingerprinting (no duplication) |
 
 ```bash
-./scripts/smoke.sh        # Linux / macOS / git-bash
-.\scripts\smoke.ps1       # Windows PowerShell
+# Run a single suite
+python scripts/e2e_characters_test.py
+
+# Or a full sweep — see scripts/smoke.sh
+./scripts/smoke.sh
 ```
 
-Probes zeroclaw `/health`, companion `/health` + `/api/status`, the TTS
-port `/health` and a real `/tts` round trip, plus Pulse if enabled.
-Tells you exactly which layer is down. Step-by-step manual recipe with
-expected log output and a failure-tree table is in
-`docs/E2E-SMOKE-TEST.md`.
+Rust tests:
 
-## Status
+```bash
+cargo test --workspace                                          # all
+cargo test -p companion-server --release                        # server + characters module
+cargo test -p companion-avatar -- --test-threads=1              # avatar pipeline
+```
+
+## Subsystem status
 
 | Subsystem            | Status                                                  |
 |----------------------|---------------------------------------------------------|
-| companion-core       | working (zeroclaw client, LLM, config)                  |
-| companion-avatar     | working (TTS port, subagent, expression, WS handler)    |
-| companion-pulse      | working (SQLite store, RSS + HN collectors, REST API)   |
-| Asuna v4 TTS wrapper | working (`tools/avatar/asuna_tts_server.py`)            |
-| Tauri desktop shell  | working (`apps/companion-tauri/`, bundles companion-server when packaged) |
+| companion-core       | ✓ zeroclaw client, LLM client, config, runtime overlays |
+| companion-avatar     | ✓ TTS port, subagent (per-paragraph translation), expression mapping, WS handler, parameter API |
+| companion-pulse      | ✓ SQLite store, RSS + HN collectors, REST API           |
+| companion-tauri      | ✓ desktop shell, sidecar lifecycle, native rodio audio, drag/snap pet window |
+| Asuna v4 TTS wrapper | ✓ `tools/avatar/asuna_tts_server.py` with graceful CUDA shutdown |
+| Character management | ✓ JSON persistence + per-character system prompt + model swap |
+
+## Troubleshooting
+
+### Games stutter for 30–90s after closing the companion
+
+Used to be the default behavior — `TerminateProcess` on the Python
+TTS skipped `torch.cuda.empty_cache()` and left the GPU driver
+fragmented. Fixed: companion now does a graceful shutdown chain
+(Tauri → `/api/shutdown` → companion-server → `/shutdown` →
+Python). If it ever regresses, check that:
+
+1. `[avatar.tts] auto_start = true` and `launch_command` points at
+   the wrapper (so companion owns the TTS lifecycle)
+2. The Python wrapper has the `shutdown_cleanup()` helper at the
+   bottom (look for the `@app.post("/shutdown")` handler)
+3. `PYTORCH_NO_CUDA_MEMORY_CACHING=1` is set in the wrapper's env
+
+### Chat fails with "zeroclaw unreachable"
+
+Companion never starts zeroclaw — start it yourself
+(`zeroclaw gateway start` or however your install is set up). The
+red banner across the top of the app re-checks every 30s.
+
+### Subagent times out on long replies
+
+z.ai's coding-paas endpoint has a 60s connection budget per call.
+Companion automatically falls back to per-paragraph translation
+for inputs > 500c. If your provider is consistently slow, switch
+to a different one in **Settings → Subagent backend**.
+
+### Pet window doesn't drag
+
+Click directly on the avatar (the rendered Asuna pixels). Empty
+transparent areas of the canvas don't capture the mousedown.
+If clicks still don't drag, ensure `data-tauri-drag-region` is
+on the canvas — `scripts/e2e_overlay_drag_test.py` verifies this
+and is a regression test for the fix.
+
+## Contributing
+
+PRs welcome. Useful entry points:
+
+- New TTS engine? Write a Python (or anything) wrapper that speaks
+  the wire contract in `crates/companion-avatar/src/tts_server.rs`'s
+  module docstring. Point `[avatar.tts] launch_command` at it.
+- New Live2D model? Drop the directory under
+  `web/public/live2d/models/` and it'll appear in the model picker.
+- New collector for Pulse? Implement `Collector` in
+  `crates/companion-pulse/src/collectors.rs`.
+
+Run the test sweep before opening a PR:
+
+```bash
+cargo test --workspace
+./scripts/smoke.sh
+```
 
 ## License
 

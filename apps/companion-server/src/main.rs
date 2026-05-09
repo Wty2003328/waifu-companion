@@ -32,6 +32,7 @@ use companion_avatar::{
 use companion_core::{AgentEvent, CompanionConfig, ZeroclawClient};
 use companion_pulse::{PulseConfig, PulseSubsystem};
 
+mod characters;
 mod pulse_api;
 mod state;
 use state::AppState;
@@ -76,6 +77,11 @@ async fn main() -> Result<()> {
         config_path: config_path.clone(),
     };
 
+    // Shutdown channel: GET /api/shutdown sends () through this so
+    // the main loop knows to wind down (graceful TTS stop, then exit).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
+
     let mut router = Router::new()
         .route("/health", get(handle_health))
         .route("/api/status", get(handle_status))
@@ -85,7 +91,32 @@ async fn main() -> Result<()> {
             "/api/config/subagent",
             axum::routing::post(handle_post_subagent_override),
         )
-        .route("/api/models", get(handle_list_models));
+        .route("/api/models", get(handle_list_models))
+        .route(
+            "/api/characters",
+            get(handle_list_characters).post(handle_upsert_character),
+        )
+        .route(
+            "/api/characters/active",
+            axum::routing::post(handle_set_active_character),
+        )
+        .route(
+            "/api/characters/{id}",
+            axum::routing::delete(handle_delete_character),
+        )
+        .route(
+            "/api/shutdown",
+            axum::routing::post({
+                let shutdown_tx = shutdown_tx.clone();
+                move || async move {
+                    tracing::info!("companion: /api/shutdown requested");
+                    if let Some(tx) = shutdown_tx.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    axum::http::StatusCode::ACCEPTED
+                }
+            }),
+        );
 
     if app_state.avatar.is_some() {
         let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
@@ -129,6 +160,11 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Clone the avatar handle for the shutdown path BEFORE moving
+    // app_state into the router — the router takes ownership of
+    // app_state via .with_state.
+    let avatar_for_shutdown = app_state.avatar.clone();
+
     let app = router
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -144,7 +180,35 @@ async fn main() -> Result<()> {
     tracing::info!("            • WS avatar:  ws://{addr}/ws/avatar");
     tracing::info!("            • health:     http://{addr}/health");
 
-    axum::serve(listener, app).await?;
+    let server = axum::serve(listener, app);
+    tokio::select! {
+        // The HTTP server itself exits — shouldn't happen under normal
+        // operation, but if it does we still want to stop TTS.
+        result = server => {
+            tracing::info!("companion: HTTP server exited: {:?}", result.as_ref().map(|_| "ok"));
+        }
+        // Tauri (or external user) hit POST /api/shutdown — graceful
+        // shutdown path. We've moved the tx out, so this completes.
+        _ = shutdown_rx => {
+            tracing::info!("companion: shutdown signal received via /api/shutdown");
+        }
+        // Ctrl+C in a console run.
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("companion: Ctrl+C received");
+        }
+    }
+
+    // Graceful TTS shutdown: POST /shutdown to the Python wrapper, wait
+    // up to 8s for clean exit (which runs torch.cuda.empty_cache() +
+    // sync), fall back to kill. Without this, leaving the model running
+    // leaks fragmented VRAM into whatever graphics workload runs next.
+    if let Some(avatar) = avatar_for_shutdown {
+        tracing::info!("companion: stopping TTS server before exit");
+        if let Err(e) = avatar.tts.stop_server().await {
+            tracing::warn!("companion: TTS stop_server returned {e}");
+        }
+    }
+    tracing::info!("companion: bye");
     Ok(())
 }
 
@@ -485,6 +549,81 @@ async fn handle_list_models(
     axum::Json(serde_json::json!({ "models": out }))
 }
 
+// ── Character management ────────────────────────────────────────
+
+async fn handle_list_characters(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::response::Result<axum::Json<characters::CharactersFile>, (axum::http::StatusCode, String)> {
+    let path = characters::characters_path(&state.config_path);
+    characters::load(&path)
+        .map(axum::Json)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn handle_upsert_character(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<characters::Character>,
+) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if req.id.trim().is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "id required".into()));
+    }
+    let path = characters::characters_path(&state.config_path);
+    let mut file = characters::load(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(existing) = file.characters.iter_mut().find(|c| c.id == req.id) {
+        *existing = req;
+    } else {
+        file.characters.push(req);
+    }
+    characters::save(&path, &file)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::http::StatusCode::OK)
+}
+
+#[derive(serde::Deserialize)]
+struct ActivateCharacterReq {
+    id: String,
+}
+
+async fn handle_set_active_character(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<ActivateCharacterReq>,
+) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    let path = characters::characters_path(&state.config_path);
+    let mut file = characters::load(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Empty id allowed — clears active.
+    if !req.id.is_empty() && !file.characters.iter().any(|c| c.id == req.id) {
+        return Err((axum::http::StatusCode::NOT_FOUND, format!("no character with id {}", req.id)));
+    }
+    file.active_id = req.id;
+    characters::save(&path, &file)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::http::StatusCode::OK)
+}
+
+async fn handle_delete_character(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    let path = characters::characters_path(&state.config_path);
+    let mut file = characters::load(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let before = file.characters.len();
+    file.characters.retain(|c| c.id != id);
+    if file.characters.len() == before {
+        return Err((axum::http::StatusCode::NOT_FOUND, format!("no character with id {id}")));
+    }
+    if file.active_id == id {
+        file.active_id.clear();
+    }
+    characters::save(&path, &file)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::http::StatusCode::OK)
+}
+
+// ─────────────────────────────────────────────────────────────────
+
 #[derive(serde::Deserialize)]
 struct SubagentOverrideRequest {
     /// `true` → route through zeroclaw's webhook (slow, no key needed).
@@ -610,10 +749,37 @@ async fn handle_chat(
         let _ = avatar.event_tx.send(frame);
     }
 
+    // Prepend the active character's system prompt (if any) before
+    // sending to zeroclaw. This is the load-bearing way to switch
+    // personas without modifying zeroclaw's config — we just frame
+    // each user message with "[Character] ... User: <msg>". Failure
+    // to load the characters file is non-fatal: we just send the raw
+    // message.
+    let outbound = match characters::load(&characters::characters_path(&state.config_path)) {
+        Ok(file) => match characters::active(&file) {
+            Some(c) if !c.system_prompt.trim().is_empty() => {
+                tracing::info!(
+                    "companion: prepending system prompt for character '{}' ({} chars)",
+                    c.name,
+                    c.system_prompt.len()
+                );
+                format!(
+                    "{}\n\nUser message: {}",
+                    c.system_prompt, req.message
+                )
+            }
+            _ => req.message.clone(),
+        },
+        Err(e) => {
+            tracing::warn!("companion: characters load failed (continuing): {e}");
+            req.message.clone()
+        }
+    };
+
     let started = std::time::Instant::now();
     let reply = state
         .zeroclaw
-        .send_chat(&req.message)
+        .send_chat(&outbound)
         .await
         .map_err(|e| {
             let elapsed = started.elapsed().as_secs();

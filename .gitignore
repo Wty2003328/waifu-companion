@@ -18,9 +18,10 @@ Cargo.lock.bak
 /web/public/live2d/
 /web/public/live2dcubismcore.min.js
 
-# Local config
+# Local config (per-machine, may contain secrets / character roster)
 companion.toml
 companion.runtime.json
+companion.characters.json
 .env
 .env.*
 

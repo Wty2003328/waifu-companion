@@ -49,6 +49,23 @@ export async function setPetPosition(x: number, y: number): Promise<void> {
   }
 }
 
+/**
+ * Begin OS-level drag of the avatar window. Necessary because
+ * pixi-live2d-display's interaction system swallows mousedown on the
+ * canvas before Tauri's `data-tauri-drag-region` runtime listener
+ * sees it; we manually invoke the drag from a DOM mousedown handler
+ * to work around that.
+ */
+export async function startDraggingPet(): Promise<void> {
+  const inv = tauriInvoke();
+  if (!inv) return;
+  try {
+    await inv('start_dragging_avatar_window');
+  } catch (e) {
+    console.warn('petWindow: start_dragging failed', e);
+  }
+}
+
 export async function getPetMonitor(): Promise<MonitorBounds | null> {
   const inv = tauriInvoke();
   if (!inv) return null;

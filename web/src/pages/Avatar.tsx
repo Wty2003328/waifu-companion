@@ -15,12 +15,14 @@ import {
   loadPetPosition,
   savePetPosition,
   computeSnap,
+  startDraggingPet,
 } from '../lib/petWindow';
 import {
   fetchInstalledModels,
   getUserModelChoice,
   type InstalledModel,
 } from '../lib/models';
+import { fetchCharacters } from '../lib/characters';
 import { startWebcamTracking, stopWebcamTracking } from '../lib/webcamTracker';
 
 interface ModelInfo {
@@ -261,19 +263,34 @@ export default function Avatar() {
   // to react in real time + on the same window via custom events.
   const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
   const [userModelId, setUserModelId] = useState<string | null>(() => getUserModelChoice());
+  // Active character's model_id (from /api/characters). Takes
+  // priority over the Settings-page manual model choice.
+  const [activeCharacterModelId, setActiveCharacterModelId] = useState<string | null>(null);
   useEffect(() => {
     void fetchInstalledModels().then(setInstalledModels);
+    const refreshActiveCharacter = () => {
+      fetchCharacters()
+        .then((file) => {
+          const active = file.characters.find((c) => c.id === file.active_id);
+          setActiveCharacterModelId(active?.model_id || null);
+        })
+        .catch(() => setActiveCharacterModelId(null));
+    };
+    refreshActiveCharacter();
     const onStorage = (e: StorageEvent) => {
       if (e.key === 'companion.userModel.v1') {
         setUserModelId(getUserModelChoice());
       }
     };
     const onCustom = () => setUserModelId(getUserModelChoice());
+    const onCharChange = () => refreshActiveCharacter();
     window.addEventListener('storage', onStorage);
     window.addEventListener('companion:userModel', onCustom);
+    window.addEventListener('companion:characters', onCharChange);
     return () => {
       window.removeEventListener('storage', onStorage);
       window.removeEventListener('companion:userModel', onCustom);
+      window.removeEventListener('companion:characters', onCharChange);
     };
   }, []);
   // Live2D parameter overrides, keyed by parameter id (e.g.
@@ -295,9 +312,11 @@ export default function Avatar() {
     }, 600);
     return () => clearTimeout(id);
   }, [modelActions]);
-  // Storage: per-model so overrides don't leak across model swaps.
+  // Storage: per-effective-model so overrides don't leak across
+  // model swaps OR character changes. Character's model_id takes
+  // priority — same precedence as effectiveModelInfo above.
   const paramStorageKey = (() => {
-    const mid = userModelId ?? 'server-default';
+    const mid = activeCharacterModelId ?? userModelId ?? 'server-default';
     return `companion.params.${mid}.v1`;
   })();
   // Hydrate overrides on model swap.
@@ -320,12 +339,15 @@ export default function Avatar() {
     } catch { /* non-fatal */ }
   }, [paramOverrides, paramStorageKey]);
 
-  // Effective model: user's pick from installedModels (if found),
-  // otherwise the server's default that arrives via WS ModelInfo.
+  // Effective model precedence (highest wins):
+  //   1. Active character's model_id (from /api/characters).
+  //   2. User's manual pick in Settings (companion.userModel.v1).
+  //   3. Server's default that arrives via WS ModelInfo.
   const effectiveModelInfo: ModelInfo | null = (() => {
     if (!modelInfo) return null;
-    if (!userModelId) return modelInfo;
-    const picked = installedModels.find((m) => m.id === userModelId);
+    const candidateId = activeCharacterModelId ?? userModelId;
+    if (!candidateId) return modelInfo;
+    const picked = installedModels.find((m) => m.id === candidateId);
     if (!picked) return modelInfo;
     return { ...modelInfo, modelUrl: picked.modelUrl };
   })();
@@ -361,6 +383,40 @@ export default function Avatar() {
     });
     return () => { cancelled = true; stopWebcamTracking(); };
   }, [prefs.webcamTracking]);
+
+  // Pet window drag — explicit JS-level handler.
+  //
+  // `data-tauri-drag-region` SHOULD be enough on its own, but
+  // pixi-live2d-display's PIXI canvas captures mousedown via its
+  // interaction system before Tauri's runtime listener sees it.
+  // Symptom: the user reports "I cannot drag it to another position"
+  // even though the attribute is in the DOM (verified by
+  // e2e_overlay_drag_test). Workaround: register our own mousedown
+  // listener on the canvas wrapper, ignore events that target an
+  // element opting out of the drag region (chat bar, settings
+  // popover, corner buttons), and call Tauri's start_dragging
+  // command directly.
+  useEffect(() => {
+    if (!IS_OVERLAY) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      // Walk up from the click target; if any ancestor opts OUT
+      // (data-tauri-drag-region="false"), skip the drag.
+      let node: HTMLElement | null = e.target as HTMLElement;
+      while (node) {
+        const attr = node.getAttribute?.('data-tauri-drag-region');
+        if (attr === 'false') return;
+        if (attr === '') break; // hit a drag-region; commit to drag
+        node = node.parentElement;
+      }
+      // Don't preventDefault — we still want focus / click-through to
+      // happen on the chat input under hover. start_dragging takes
+      // over from here at the OS level.
+      void startDraggingPet();
+    };
+    window.addEventListener('mousedown', onMouseDown);
+    return () => window.removeEventListener('mousedown', onMouseDown);
+  }, []);
 
   // Pet window placement: restore on mount + persist + snap-to-edge.
   //

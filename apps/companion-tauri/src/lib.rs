@@ -188,16 +188,50 @@ pub fn run() {
             get_avatar_window_geometry,
             set_avatar_window_position,
             get_avatar_monitor,
+            start_dragging_avatar_window,
+            check_zeroclaw_health,
         ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) && window.label() == "main" {
                 let app = window.app_handle();
-                if let Some(state) = app.try_state::<ServerProcess>() {
-                    if let Some(child) = state.0.lock().ok().and_then(|mut g| g.take()) {
-                        let _ = child.kill();
-                        tracing::info!("companion-tauri: killed sidecar on exit");
+                let app_handle = app.clone();
+                // Graceful shutdown: POST /api/shutdown so companion-
+                // server runs its TTS stop_server() (which POSTs
+                // /shutdown to the Python TTS, runs CUDA cleanup, then
+                // exits). Without this, killing the sidecar via
+                // TerminateProcess orphans the Python TTS, leaving the
+                // CUDA driver in a fragmented state for ~30–90s and
+                // causing user-reported "games stutter after closing
+                // companion." We wait up to 10s for the graceful path
+                // to complete, then fall back to child.kill().
+                std::thread::spawn(move || {
+                    let _ = ureq::post("http://127.0.0.1:9181/api/shutdown")
+                        .timeout(std::time::Duration::from_secs(2))
+                        .call();
+                    // Give companion-server room to stop TTS
+                    // (its own stop_server has an 8s graceful budget).
+                    let mut waited = 0;
+                    while waited < 12 {
+                        if ureq::get("http://127.0.0.1:9181/health")
+                            .timeout(std::time::Duration::from_millis(500))
+                            .call()
+                            .is_err()
+                        {
+                            break; // server is gone — clean exit
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        waited += 1;
                     }
-                }
+                    // Fall back to TerminateProcess if it didn't exit.
+                    if let Some(state) = app_handle.try_state::<ServerProcess>() {
+                        if let Some(child) = state.0.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = child.kill();
+                            tracing::info!(
+                                "companion-tauri: hard-killed sidecar after {waited}s"
+                            );
+                        }
+                    }
+                });
             }
         })
         .run(tauri::generate_context!())
@@ -341,6 +375,36 @@ fn set_avatar_window_position(app: AppHandle, x: i32, y: i32) -> Result<(), Stri
         .ok_or_else(|| "avatar window not found".to_string())?;
     win.set_position(tauri::PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())
+}
+
+/// Begin dragging the avatar window. Used by the JS-level drag
+/// handler in overlay mode — `data-tauri-drag-region` would normally
+/// be enough, but pixi-live2d-display's interaction system swallows
+/// mousedown on the canvas before Tauri's runtime sees it. We work
+/// around this by listening for mousedown ourselves and explicitly
+/// invoking the OS-level window drag.
+#[tauri::command]
+fn start_dragging_avatar_window(app: AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("avatar")
+        .ok_or_else(|| "avatar window not found".to_string())?;
+    win.start_dragging().map_err(|e| e.to_string())
+}
+
+/// Probe whether upstream zeroclaw is running at the configured URL.
+/// We never start or stop zeroclaw from this app — it's a separate
+/// long-lived daemon the user manages. We only check.
+#[tauri::command]
+fn check_zeroclaw_health(url: String) -> Result<bool, String> {
+    // Simple sync GET; runs off-thread under Tauri's invoke executor.
+    let target = if url.is_empty() { "http://127.0.0.1:42617".to_string() } else { url };
+    let result = ureq::get(&format!("{}/health", target.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(2))
+        .call();
+    match result {
+        Ok(resp) => Ok(resp.status() == 200),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Return the work area of the monitor containing the avatar window

@@ -31,12 +31,23 @@ Run standalone for testing:
     python tools/avatar/asuna_tts_server.py
 """
 
+import atexit
 import io
 import os
+import signal
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
+
+# Disable PyTorch's CUDA caching allocator BEFORE torch is imported.
+# When set, every tensor `del` returns memory to the driver immediately
+# instead of into PyTorch's per-process pool. Slightly slower per-call
+# but a clean, hard kill won't leak fragmented VRAM into the next
+# graphics workload (the user reported "games stutter for a minute
+# after closing the companion" — that lag traced back to this).
+os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
 
 import numpy as np
 import torch
@@ -443,7 +454,101 @@ async def tts(req: TtsRequest):
     )
 
 
+# ---------------------------------------------------------------------------
+# Graceful shutdown: companion-server hits POST /shutdown when the user
+# closes the desktop app. Without this, killing this process via
+# TerminateProcess (the previous behavior) skips PyTorch's atexit
+# handlers and the CUDA driver keeps the per-process compute state
+# warmed up for ~30–90s, manifesting as game stutter for the user.
+#
+# We do three things on shutdown:
+#   1. Drop references to model tensors so PyTorch can release them.
+#   2. Call torch.cuda.empty_cache() + synchronize() to flush DMA.
+#   3. Exit. We use os._exit(0) because uvicorn catches SystemExit
+#      and would otherwise hold the process alive for a graceful
+#      TCP close — which delays the GPU release we just did.
+# ---------------------------------------------------------------------------
+
+_cleanup_done = False
+
+
+def shutdown_cleanup() -> None:
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+    try:
+        # Drop model references so PyTorch can release VRAM.
+        for var_name in (
+            "t2s_model",
+            "vits_model",
+            "ssl_model",
+            "bert_model",
+            "tokenizer",
+        ):
+            try:
+                globals().pop(var_name, None)
+            except Exception:
+                pass
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # Best-effort: reset the device so the CUDA context is
+            # fully torn down. Some PyTorch builds fail this — don't
+            # propagate the error.
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        print("[asuna-tts] CUDA cleanup done; exiting cleanly")
+    except Exception as e:
+        print(f"[asuna-tts] cleanup error (continuing): {e}")
+
+
+atexit.register(shutdown_cleanup)
+
+
+def _on_signal(sig, _frame):
+    print(f"[asuna-tts] received signal {sig}; cleaning up")
+    shutdown_cleanup()
+    # _exit avoids the uvicorn-graceful-tcp-close stall.
+    os._exit(0)
+
+
+# Register signal handlers BEFORE uvicorn.run so they catch Ctrl+C
+# (SIGINT) and Ctrl+Break (SIGBREAK on Windows). On Windows
+# `python.exe foo.py` interprets Ctrl+C as SIGINT only when the
+# console is the foreground; for headless launches via Tauri the
+# /shutdown endpoint is the primary path.
+signal.signal(signal.SIGINT, _on_signal)
+signal.signal(signal.SIGTERM, _on_signal)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _on_signal)
+
+
+@app.post("/shutdown")
+async def shutdown():
+    """Graceful shutdown — used by companion-server's stop_server when
+    the user closes the desktop app. Returns 202 immediately; the
+    actual exit happens on a daemon thread after a short delay so
+    this response can flush."""
+    def _exit_soon():
+        time.sleep(0.2)
+        shutdown_cleanup()
+        os._exit(0)
+
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return {"status": "shutting_down"}
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("TTS_PORT", "9880"))
     print(f"[asuna-tts] serving on http://127.0.0.1:{port}")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    print("[asuna-tts] PYTORCH_NO_CUDA_MEMORY_CACHING="
+          + os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", ""))
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    finally:
+        # Defense in depth: if uvicorn returns normally without going
+        # through /shutdown or a signal, still run cleanup.
+        shutdown_cleanup()
