@@ -70,10 +70,13 @@ impl PulseDatabase {
                     content TEXT,
                     metadata TEXT NOT NULL DEFAULT '{}',
                     published_at TEXT,
-                    collected_at TEXT NOT NULL
+                    collected_at TEXT NOT NULL,
+                    read_at TEXT,
+                    summary TEXT
                  );
                  CREATE INDEX IF NOT EXISTS idx_items_collected_at ON items(collected_at);
                  CREATE INDEX IF NOT EXISTS idx_items_source ON items(source);
+                 CREATE INDEX IF NOT EXISTS idx_items_read_at ON items(read_at);
                  CREATE TABLE IF NOT EXISTS collector_runs (
                     id TEXT PRIMARY KEY,
                     collector_id TEXT NOT NULL,
@@ -98,6 +101,15 @@ impl PulseDatabase {
                     value TEXT
                  );",
             )?;
+            // Idempotent column adds for users upgrading from pre-read-tracking
+            // schema. SQLite errors if the column exists; we swallow that
+            // specific error so re-runs are no-ops.
+            let _ = c.execute("ALTER TABLE items ADD COLUMN read_at TEXT", []);
+            let _ = c.execute("CREATE INDEX IF NOT EXISTS idx_items_read_at ON items(read_at)", []);
+            // summary column added in the agent-summarize iteration. Same
+            // idempotent pattern: ignore "duplicate column" errors so old
+            // databases pick it up on next start.
+            let _ = c.execute("ALTER TABLE items ADD COLUMN summary TEXT", []);
             Ok(())
         })
         .await??;
@@ -146,51 +158,162 @@ impl PulseDatabase {
         .await?
     }
 
-    /// Most-recent items, optionally filtered by source.
+    /// Most-recent items, optionally filtered by source / search /
+    /// unread state. All filters compose as AND. Search matches a
+    /// case-insensitive substring against title OR content (SQLite
+    /// LIKE — fine for the typical Pulse working set of <100k items).
     pub async fn get_feed(
         &self,
         limit: u32,
         offset: u32,
         source: Option<&str>,
+        search: Option<&str>,
+        unread_only: bool,
     ) -> Result<Vec<FeedItem>> {
         let path = self.path.clone();
         let source = source.map(|s| s.to_string());
+        let search = search
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", s.to_lowercase()));
         tokio::task::spawn_blocking(move || -> Result<Vec<FeedItem>> {
             let c = Connection::open(path.as_str())?;
-            let (sql, has_source) = if source.is_some() {
-                (
-                    "SELECT id, source, collector_id, title, url, content, metadata, published_at, collected_at
-                     FROM items
-                     WHERE source = ?1 OR source LIKE ?1 || ':%' OR collector_id = ?1
-                     ORDER BY collected_at DESC
-                     LIMIT ?2 OFFSET ?3",
-                    true,
-                )
+
+            // Build WHERE clauses + ordered param values dynamically.
+            // rusqlite's `params!` only takes a fixed-arity tuple, so
+            // we collect into a Vec<Box<dyn ToSql>> and feed it in.
+            use rusqlite::ToSql;
+            let mut where_clauses: Vec<&'static str> = Vec::new();
+            let mut bound: Vec<Box<dyn ToSql>> = Vec::new();
+
+            if let Some(ref s) = source {
+                where_clauses.push("(source = ? OR source LIKE ? || ':%' OR collector_id = ?)");
+                bound.push(Box::new(s.clone()));
+                bound.push(Box::new(s.clone()));
+                bound.push(Box::new(s.clone()));
+            }
+            if let Some(ref q) = search {
+                where_clauses.push("(LOWER(title) LIKE ? OR LOWER(IFNULL(content, '')) LIKE ?)");
+                bound.push(Box::new(q.clone()));
+                bound.push(Box::new(q.clone()));
+            }
+            if unread_only {
+                where_clauses.push("read_at IS NULL");
+            }
+            let where_sql = if where_clauses.is_empty() {
+                String::new()
             } else {
-                (
-                    "SELECT id, source, collector_id, title, url, content, metadata, published_at, collected_at
-                     FROM items
-                     ORDER BY collected_at DESC
-                     LIMIT ?1 OFFSET ?2",
-                    false,
-                )
+                format!("WHERE {}", where_clauses.join(" AND "))
             };
-            let mut stmt = c.prepare(sql)?;
-            let items = if has_source {
-                stmt.query_map(
-                    params![source.as_deref().unwrap_or(""), limit as i64, offset as i64],
-                    row_to_feed_item,
-                )?
+            let sql = format!(
+                "SELECT id, source, collector_id, title, url, content, metadata, published_at, collected_at, read_at, summary
+                 FROM items
+                 {where_sql}
+                 ORDER BY collected_at DESC
+                 LIMIT ? OFFSET ?",
+            );
+            bound.push(Box::new(limit as i64));
+            bound.push(Box::new(offset as i64));
+            let bound_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+
+            let mut stmt = c.prepare(&sql)?;
+            let items: Vec<FeedItem> = stmt
+                .query_map(bound_refs.as_slice(), row_to_feed_item)?
                 .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map(params![limit as i64, offset as i64], row_to_feed_item)?
-                    .filter_map(|r| r.ok())
-                    .collect()
-            };
+                .collect();
             Ok(items)
         })
         .await?
+    }
+
+    pub async fn mark_item_read(&self, id: &str, read: bool) -> Result<bool> {
+        let path = self.path.clone();
+        let item_id = id.to_string();
+        let now = Utc::now().to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let c = Connection::open(path.as_str())?;
+            let n = if read {
+                c.execute(
+                    "UPDATE items SET read_at = ?1 WHERE id = ?2 AND read_at IS NULL",
+                    params![now, item_id],
+                )?
+            } else {
+                c.execute(
+                    "UPDATE items SET read_at = NULL WHERE id = ?1",
+                    params![item_id],
+                )?
+            };
+            Ok(n)
+        })
+        .await??;
+        Ok(n > 0)
+    }
+
+    /// Mark every currently-stored item as read in one shot. Useful
+    /// for "clear inbox" UX without iterating IDs from the client.
+    pub async fn mark_all_read(&self) -> Result<u64> {
+        let path = self.path.clone();
+        let now = Utc::now().to_rfc3339();
+        let n = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let c = Connection::open(path.as_str())?;
+            let n = c.execute(
+                "UPDATE items SET read_at = ?1 WHERE read_at IS NULL",
+                params![now],
+            )?;
+            Ok(n as u64)
+        })
+        .await??;
+        Ok(n)
+    }
+
+    /// Fetch a single feed item by id. Used by the summarize endpoint
+    /// (needs title + content + url + cached summary in one round-trip).
+    pub async fn get_item(&self, id: &str) -> Result<Option<FeedItem>> {
+        let path = self.path.clone();
+        let item_id = id.to_string();
+        let item = tokio::task::spawn_blocking(move || -> Result<Option<FeedItem>> {
+            let c = Connection::open(path.as_str())?;
+            let mut stmt = c.prepare(
+                "SELECT id, source, collector_id, title, url, content, metadata, published_at, collected_at, read_at, summary
+                 FROM items WHERE id = ?1",
+            )?;
+            let row = stmt.query_row([item_id], row_to_feed_item).optional()?;
+            Ok(row)
+        })
+        .await??;
+        Ok(item)
+    }
+
+    /// Persist a generated summary so we don't re-call the LLM on every
+    /// drawer-open. Pass `None` to clear.
+    pub async fn set_item_summary(&self, id: &str, summary: Option<&str>) -> Result<()> {
+        let path = self.path.clone();
+        let item_id = id.to_string();
+        let summary = summary.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let c = Connection::open(path.as_str())?;
+            c.execute(
+                "UPDATE items SET summary = ?1 WHERE id = ?2",
+                params![summary, item_id],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub async fn unread_count(&self) -> Result<u64> {
+        let path = self.path.clone();
+        let n = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let c = Connection::open(path.as_str())?;
+            let n: i64 =
+                c.query_row("SELECT COUNT(*) FROM items WHERE read_at IS NULL", [], |r| {
+                    r.get(0)
+                })?;
+            Ok(n as u64)
+        })
+        .await??;
+        Ok(n)
     }
 
     pub async fn start_collector_run(&self, collector_id: &str) -> Result<String> {
@@ -453,6 +576,15 @@ fn row_to_feed_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<FeedItem> {
             .ok()
             .and_then(parse_dt)
             .unwrap_or_else(Utc::now),
+        // read_at column is the 10th SELECT field; older databases
+        // upgraded via the `ALTER TABLE` migration return None until
+        // the user marks things read.
+        read_at: r
+            .get::<_, Option<String>>(9)
+            .ok()
+            .flatten()
+            .and_then(parse_dt),
+        summary: r.get::<_, Option<String>>(10).ok().flatten(),
     })
 }
 
@@ -486,8 +618,35 @@ mod tests {
         let (_d, db) = fresh_db().await;
         let _ = db.insert_item(&raw_item(Some("https://a.example/1"))).await.unwrap();
         let _ = db.insert_item(&raw_item(Some("https://a.example/2"))).await.unwrap();
-        let feed = db.get_feed(10, 0, None).await.unwrap();
+        let feed = db.get_feed(10, 0, None, None, false).await.unwrap();
         assert_eq!(feed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn item_summary_round_trip() {
+        let (_d, db) = fresh_db().await;
+        let id = db.insert_item(&raw_item(Some("https://a.example/sum"))).await.unwrap();
+
+        // Fresh items have no summary.
+        let item = db.get_item(&id).await.unwrap().expect("item should exist");
+        assert!(item.summary.is_none());
+
+        // Round-trip a summary.
+        db.set_item_summary(&id, Some("- bullet one\n- bullet two")).await.unwrap();
+        let item = db.get_item(&id).await.unwrap().unwrap();
+        assert_eq!(item.summary.as_deref(), Some("- bullet one\n- bullet two"));
+
+        // Feed query also surfaces the summary, not just get_item.
+        let feed = db.get_feed(10, 0, None, None, false).await.unwrap();
+        assert_eq!(feed[0].summary.as_deref(), Some("- bullet one\n- bullet two"));
+
+        // Clearing wipes the cache.
+        db.set_item_summary(&id, None).await.unwrap();
+        let item = db.get_item(&id).await.unwrap().unwrap();
+        assert!(item.summary.is_none());
+
+        // Missing id is None, not an error.
+        assert!(db.get_item("no-such-id").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -547,15 +706,97 @@ mod tests {
             r.collector_id = "rss".into();
             db.insert_item(&r).await.unwrap();
         }
-        let only_hn = db.get_feed(10, 0, Some("hackernews")).await.unwrap();
+        let only_hn = db.get_feed(10, 0, Some("hackernews"), None, false).await.unwrap();
         assert_eq!(only_hn.len(), 5);
-        let only_rss = db.get_feed(10, 0, Some("rss")).await.unwrap();
+        let only_rss = db.get_feed(10, 0, Some("rss"), None, false).await.unwrap();
         assert_eq!(only_rss.len(), 3);
-        let page1 = db.get_feed(2, 0, None).await.unwrap();
-        let page2 = db.get_feed(2, 2, None).await.unwrap();
+        let page1 = db.get_feed(2, 0, None, None, false).await.unwrap();
+        let page2 = db.get_feed(2, 2, None, None, false).await.unwrap();
         assert_eq!(page1.len(), 2);
         assert_eq!(page2.len(), 2);
         assert_ne!(page1[0].id, page2[0].id);
+    }
+
+    #[tokio::test]
+    async fn feed_filters_by_search_substring() {
+        let (_d, db) = fresh_db().await;
+        for (title, content) in [
+            ("Rust 1.89 release", "Compiler diagnostics"),
+            ("Tauri 2.5 ships", "WebView2 patches"),
+            ("Python 3.13 GA", "free-threaded mode"),
+        ] {
+            let mut r = raw_item(Some(&format!("https://x/{title}")));
+            r.title = title.into();
+            r.content = Some(content.into());
+            db.insert_item(&r).await.unwrap();
+        }
+        // matches title
+        let rust = db.get_feed(10, 0, None, Some("rust"), false).await.unwrap();
+        assert_eq!(rust.len(), 1);
+        assert!(rust[0].title.contains("Rust"));
+        // matches content (case-insensitive)
+        let webview = db.get_feed(10, 0, None, Some("WEBVIEW"), false).await.unwrap();
+        assert_eq!(webview.len(), 1);
+        assert!(webview[0].title.contains("Tauri"));
+        // empty search string is treated as no filter
+        let all = db.get_feed(10, 0, None, Some("   "), false).await.unwrap();
+        assert_eq!(all.len(), 3);
+        // no matches
+        let none = db.get_feed(10, 0, None, Some("nodejs"), false).await.unwrap();
+        assert_eq!(none.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_state_round_trip_and_unread_filter() {
+        let (_d, db) = fresh_db().await;
+        let id_a = db.insert_item(&raw_item(Some("https://x/a"))).await.unwrap();
+        let id_b = db.insert_item(&raw_item(Some("https://x/b"))).await.unwrap();
+        // both unread initially
+        assert_eq!(db.unread_count().await.unwrap(), 2);
+        // mark a as read
+        let changed = db.mark_item_read(&id_a, true).await.unwrap();
+        assert!(changed);
+        assert_eq!(db.unread_count().await.unwrap(), 1);
+        // marking already-read item again returns false (no-op)
+        let changed2 = db.mark_item_read(&id_a, true).await.unwrap();
+        assert!(!changed2);
+        // unread filter excludes a
+        let only_unread = db.get_feed(10, 0, None, None, true).await.unwrap();
+        assert_eq!(only_unread.len(), 1);
+        assert_eq!(only_unread[0].id, id_b);
+        // unmark a
+        db.mark_item_read(&id_a, false).await.unwrap();
+        assert_eq!(db.unread_count().await.unwrap(), 2);
+        // mark all read
+        db.mark_all_read().await.unwrap();
+        assert_eq!(db.unread_count().await.unwrap(), 0);
+        let unread = db.get_feed(10, 0, None, None, true).await.unwrap();
+        assert!(unread.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_filter_combines_with_unread() {
+        let (_d, db) = fresh_db().await;
+        let id_a = db
+            .insert_item(&{
+                let mut r = raw_item(Some("https://x/a"));
+                r.title = "Rust 1.89".into();
+                r
+            })
+            .await
+            .unwrap();
+        db.insert_item(&{
+            let mut r = raw_item(Some("https://x/b"));
+            r.title = "Rust 1.88".into();
+            r
+        })
+        .await
+        .unwrap();
+        db.mark_item_read(&id_a, true).await.unwrap();
+        // both match "rust" but only b is unread
+        let r = db.get_feed(10, 0, None, Some("rust"), true).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].title, "Rust 1.88");
     }
 
     #[tokio::test]
@@ -566,7 +807,7 @@ mod tests {
         let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         let n = db.purge_older_than(&future).await.unwrap();
         assert_eq!(n, 1);
-        let feed = db.get_feed(10, 0, None).await.unwrap();
+        let feed = db.get_feed(10, 0, None, None, false).await.unwrap();
         assert!(feed.is_empty());
     }
 }

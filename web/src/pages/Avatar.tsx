@@ -1,4 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import Live2DViewer, { type Live2DViewerHandle, type ModelActions, type ModelParameter } from '../components/avatar/Live2DViewer';
 import AvatarControls from '../components/avatar/AvatarControls';
 import {
@@ -8,6 +10,7 @@ import {
 } from '../components/avatar/useAvatarSocket';
 import { HTTP_BASE, WS_BASE } from '../lib/apiBase';
 import { nativeAudioAvailable, playAudioNative, stopAudioNative } from '../lib/nativeAudio';
+import { openExternal } from '../lib/tauriShell';
 import {
   getPetGeometry,
   setPetPosition,
@@ -287,10 +290,23 @@ export default function Avatar() {
     window.addEventListener('storage', onStorage);
     window.addEventListener('companion:userModel', onCustom);
     window.addEventListener('companion:characters', onCharChange);
+    // Cross-window: the overlay avatar runs in a separate Tauri window
+    // so the in-window 'companion:characters' event from the main window
+    // can never reach it. BroadcastChannel does cross same-origin
+    // contexts, so a character switch in the main window now triggers
+    // a Live2D swap here too.
+    let bc: BroadcastChannel | null = null;
+    try {
+      bc = new BroadcastChannel('companion');
+      bc.onmessage = (e) => {
+        if (e.data?.kind === 'characters') refreshActiveCharacter();
+      };
+    } catch { /* unsupported in some legacy contexts */ }
     return () => {
       window.removeEventListener('storage', onStorage);
       window.removeEventListener('companion:userModel', onCustom);
       window.removeEventListener('companion:characters', onCharChange);
+      if (bc) bc.close();
     };
   }, []);
   // Live2D parameter overrides, keyed by parameter id (e.g.
@@ -384,38 +400,38 @@ export default function Avatar() {
     return () => { cancelled = true; stopWebcamTracking(); };
   }, [prefs.webcamTracking]);
 
-  // Pet window drag — explicit JS-level handler.
+  // Pet window drag — fire Tauri's native OS-level drag from pointerdown.
   //
-  // `data-tauri-drag-region` SHOULD be enough on its own, but
-  // pixi-live2d-display's PIXI canvas captures mousedown via its
-  // interaction system before Tauri's runtime listener sees it.
-  // Symptom: the user reports "I cannot drag it to another position"
-  // even though the attribute is in the DOM (verified by
-  // e2e_overlay_drag_test). Workaround: register our own mousedown
-  // listener on the canvas wrapper, ignore events that target an
-  // element opting out of the drag region (chat bar, settings
-  // popover, corner buttons), and call Tauri's start_dragging
-  // command directly.
+  // The OS-native drag is way smoother than per-frame set_position
+  // (no IPC hops between move events; the OS handles the move loop).
+  // The earlier failure mode was the `data-tauri-drag-region=""` attr
+  // on the canvas wrapper triggering Tauri's runtime drag at the same
+  // time as our JS handler — race condition. With that attr removed,
+  // we can call start_dragging directly here without conflict.
+  //
+  // We listen at document with capture:true so pixi-live2d-display's
+  // interaction layer can't swallow the pointerdown before we fire.
   useEffect(() => {
     if (!IS_OVERLAY) return;
-    const onMouseDown = (e: MouseEvent) => {
-      if (e.button !== 0) return;
-      // Walk up from the click target; if any ancestor opts OUT
-      // (data-tauri-drag-region="false"), skip the drag.
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0 || e.pointerType === 'touch') return;
+      // Walk up from the target; if any ancestor opts OUT
+      // (data-tauri-drag-region="false"), skip the drag — needed for
+      // the chat input, settings popover, corner buttons, etc.
       let node: HTMLElement | null = e.target as HTMLElement;
       while (node) {
         const attr = node.getAttribute?.('data-tauri-drag-region');
         if (attr === 'false') return;
-        if (attr === '') break; // hit a drag-region; commit to drag
         node = node.parentElement;
       }
-      // Don't preventDefault — we still want focus / click-through to
-      // happen on the chat input under hover. start_dragging takes
-      // over from here at the OS level.
+      // Don't await — start_dragging must happen synchronously inside
+      // the native mouse event for Windows to honor the drag.
       void startDraggingPet();
     };
-    window.addEventListener('mousedown', onMouseDown);
-    return () => window.removeEventListener('mousedown', onMouseDown);
+    document.addEventListener('pointerdown', onPointerDown, { capture: true });
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, { capture: true });
+    };
   }, []);
 
   // Pet window placement: restore on mount + persist + snap-to-edge.
@@ -625,7 +641,11 @@ export default function Avatar() {
       // process's WASAPI session, which Windows classifies as
       // multimedia. Bypasses WebView2's "communications" DSP.
       if (nativeAudioAvailable()) {
+        // eslint-disable-next-line no-console
+        console.log('[audio] → rodio (native)', { turnId, seq, last, bytes: audioBase64.length });
         void playAudioNative(audioBase64, turnId, seq).then(() => {
+          // eslint-disable-next-line no-console
+          console.log('[audio] rodio invoke OK', { turnId, seq });
           // rodio's Sink doesn't emit a JS-visible "ended" event; we
           // optimistically drop "speaking" state when the last chunk
           // has been queued. The Sink will play through its queue.
@@ -636,7 +656,7 @@ export default function Avatar() {
             setTimeout(() => setIsPlaying(false), 500);
           }
         }).catch((err) => {
-          console.error('native audio failed, falling back to webview:', err);
+          console.error('[audio] rodio FAILED, falling back to webview:', err);
           // Fall through to the <video> path
           enqueueWebviewAudio(audioBase64);
         });
@@ -644,6 +664,8 @@ export default function Avatar() {
       }
 
       // Browser path: existing <video>/Web Audio queue
+      // eslint-disable-next-line no-console
+      console.log('[audio] → webview <video> path (no Tauri)', { turnId, seq, last });
       enqueueWebviewAudio(audioBase64);
     },
     onUserMessage: (content) => {
@@ -833,13 +855,12 @@ export default function Avatar() {
       {/* Left column: avatar + (collapsible) controls */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: IS_OVERLAY ? 0 : 12, minWidth: 0 }}>
         <div
-          // In overlay mode the entire canvas is a drag region so the
-          // user can pick up and move the desktop pet by clicking
-          // anywhere on the avatar. Tauri intercepts this attribute to
-          // start a window drag, and live2d's PIXI canvas (which we
-          // disabled interactivity on earlier for unsafe-eval reasons)
-          // doesn't swallow the mouse event.
-          {...(IS_OVERLAY ? { 'data-tauri-drag-region': '' } : {})}
+          // Drag is handled by the JS-level pointer-capture handler in
+          // useEffect above (see "Pet window drag"). We deliberately
+          // don't set `data-tauri-drag-region=""` here — it would cause
+          // Tauri's runtime to start its own OS-level drag on the same
+          // mousedown, which fails on transparent WebView2 windows and
+          // races with our manual set_position calls.
           onMouseEnter={IS_OVERLAY ? () => setOverlayHover(true) : undefined}
           onMouseLeave={IS_OVERLAY ? () => setOverlayHover(false) : undefined}
           style={{
@@ -1021,13 +1042,19 @@ export default function Avatar() {
             >
               ⚙
             </CanvasButton>
-            <CanvasButton
-              title={prefs.showControls ? 'Hide expressions / motions' : 'Show expressions / motions'}
-              onClick={() => setPrefs((p) => ({ ...p, showControls: !p.showControls }))}
-              active={prefs.showControls}
-            >
-              {prefs.showControls ? '✕' : '☰'}
-            </CanvasButton>
+            {/* Expression / motion controls hidden in pet (overlay)
+                mode — they stack visually with the chat box at the
+                bottom and the user has to click them anyway. Pet mode
+                stays minimal: avatar + chat + close. */}
+            {!IS_OVERLAY && (
+              <CanvasButton
+                title={prefs.showControls ? 'Hide expressions / motions' : 'Show expressions / motions'}
+                onClick={() => setPrefs((p) => ({ ...p, showControls: !p.showControls }))}
+                active={prefs.showControls}
+              >
+                {prefs.showControls ? '✕' : '☰'}
+              </CanvasButton>
+            )}
             {IS_OVERLAY && (
               <CanvasButton
                 title="Hide desktop pet"
@@ -1071,7 +1098,7 @@ export default function Avatar() {
           )}
         </div>
 
-        {prefs.showControls && (
+        {prefs.showControls && !IS_OVERLAY && (
           <div
             style={{
               background: '#16181c',
@@ -1230,7 +1257,6 @@ export default function Avatar() {
       {IS_OVERLAY && (
         <form
           onMouseDown={(e) => e.stopPropagation()}
-          onMouseEnter={() => setOverlayHover(true)}
           onSubmit={(e) => {
             e.preventDefault();
             handleSendChat();
@@ -1242,49 +1268,63 @@ export default function Avatar() {
             bottom: 12,
             display: 'flex',
             gap: 6,
-            background: 'rgba(11, 13, 16, 0.85)',
-            backdropFilter: 'blur(8px)',
-            WebkitBackdropFilter: 'blur(8px)',
+            background: 'rgba(11, 13, 16, 0.78)',
+            backdropFilter: 'blur(10px)',
+            WebkitBackdropFilter: 'blur(10px)',
             padding: 8,
             borderRadius: 12,
-            border: '1px solid #2a2d33',
-            opacity: overlayHover || sending || chatInput.length > 0 ? 1 : 0,
-            transition: 'opacity 200ms ease',
-            pointerEvents:
-              overlayHover || sending || chatInput.length > 0 ? 'auto' : 'none',
+            border: '1px solid rgba(58, 61, 67, 0.6)',
+            // Keep the box visible at low opacity when idle so the user
+            // can always find + click it. Brightens fully when the user
+            // hovers anywhere on the avatar, types, or a reply is in-
+            // flight. The `pointerEvents: auto` is unconditional —
+            // previously the box was completely click-through when
+            // hidden, which made it impossible to start a chat from a
+            // cold state without first hovering the canvas.
+            opacity: overlayHover || sending || chatInput.length > 0 ? 1 : 0.45,
+            transition: 'opacity 180ms ease',
+            pointerEvents: 'auto',
+            // Soft drop shadow so the box stays legible against any
+            // desktop background once the overlay is fully transparent.
+            boxShadow: '0 4px 16px rgba(0, 0, 0, 0.35)',
           }}
-          // Explicitly opt this subtree out of the parent's
-          // data-tauri-drag-region so input clicks don't move the window.
+          // Explicitly opt this subtree out of the parent's drag — clicks
+          // on the input must focus, not start a window move.
           {...{ 'data-tauri-drag-region': 'false' } as Record<string, string>}
         >
           <input
             type="text"
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
-            placeholder={sending ? 'sending…' : 'talk to asuna…'}
+            placeholder={sending ? 'sending…' : 'Talk to your character…'}
             disabled={sending}
+            // Stop pointerdown so the document-capture drag handler
+            // doesn't fire `start_dragging` from focus clicks.
+            onPointerDown={(e) => e.stopPropagation()}
             style={{
               flex: 1,
-              background: '#0b0d10',
+              background: 'rgba(11, 13, 16, 0.92)',
               color: '#fff',
-              padding: '8px 10px',
+              padding: '8px 12px',
               borderRadius: 8,
               border: '1px solid #2a2d33',
-              fontSize: 12,
+              fontSize: 13,
               outline: 'none',
             }}
           />
           <button
             type="submit"
             disabled={!chatInput.trim() || sending}
+            onPointerDown={(e) => e.stopPropagation()}
             style={{
               padding: '6px 12px',
               background: chatInput.trim() && !sending ? '#3b82f6' : '#1f2937',
               color: '#fff',
               border: 'none',
               borderRadius: 8,
-              fontSize: 12,
+              fontSize: 13,
               cursor: chatInput.trim() && !sending ? 'pointer' : 'not-allowed',
+              minWidth: 36,
             }}
           >
             ➤
@@ -1339,11 +1379,93 @@ function ChatBubble({ turn }: { turn: ChatTurn }) {
           color: '#fff',
           fontSize: 13,
           lineHeight: 1.45,
-          whiteSpace: 'pre-wrap',
           wordBreak: 'break-word',
         }}
       >
-        {turn.text}
+        {/* User messages stay plain text — they typed it, no markdown
+            interpretation needed. Assistant messages render through
+            react-markdown so zeroclaw's bold / lists / code / headings
+            display properly instead of `**bold**` showing literal
+            asterisks. GFM extension covers tables and strikethrough. */}
+        {isUser ? (
+          <span style={{ whiteSpace: 'pre-wrap' }}>{turn.text}</span>
+        ) : (
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            // Inline-styled element renderers so the bubble's dark
+            // background + small font are preserved. Without these,
+            // react-markdown emits raw <p>, <ul>, <code> etc. with
+            // browser defaults (white code backgrounds, big margins,
+            // huge headings) that don't fit a 13px chat bubble.
+            components={{
+              p: ({ children }) => (
+                <p style={{ margin: '0 0 6px 0', whiteSpace: 'pre-wrap' }}>{children}</p>
+              ),
+              ul: ({ children }) => (
+                <ul style={{ margin: '4px 0', paddingLeft: 18 }}>{children}</ul>
+              ),
+              ol: ({ children }) => (
+                <ol style={{ margin: '4px 0', paddingLeft: 18 }}>{children}</ol>
+              ),
+              li: ({ children }) => (
+                <li style={{ margin: '2px 0' }}>{children}</li>
+              ),
+              h1: ({ children }) => (
+                <div style={{ fontSize: 14, fontWeight: 600, margin: '6px 0 4px' }}>{children}</div>
+              ),
+              h2: ({ children }) => (
+                <div style={{ fontSize: 13, fontWeight: 600, margin: '6px 0 4px' }}>{children}</div>
+              ),
+              h3: ({ children }) => (
+                <div style={{ fontSize: 13, fontWeight: 600, margin: '4px 0 2px' }}>{children}</div>
+              ),
+              code: ({ children }) => (
+                <code style={{
+                  background: '#0d0e12',
+                  padding: '1px 4px',
+                  borderRadius: 3,
+                  fontSize: 12,
+                  fontFamily: 'ui-monospace, monospace',
+                }}>{children}</code>
+              ),
+              pre: ({ children }) => (
+                <pre style={{
+                  background: '#0d0e12',
+                  padding: 8,
+                  borderRadius: 6,
+                  fontSize: 11,
+                  overflow: 'auto',
+                  margin: '4px 0',
+                }}>{children}</pre>
+              ),
+              a: ({ href, children }) => (
+                <a
+                  href={href}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (href) void openExternal(href);
+                  }}
+                  style={{ color: '#7aa9ff', textDecoration: 'underline', cursor: 'pointer' }}
+                >{children}</a>
+              ),
+              strong: ({ children }) => (
+                <strong style={{ fontWeight: 600 }}>{children}</strong>
+              ),
+              em: ({ children }) => (
+                <em style={{ fontStyle: 'italic' }}>{children}</em>
+              ),
+              blockquote: ({ children }) => (
+                <blockquote style={{
+                  margin: '4px 0', paddingLeft: 8,
+                  borderLeft: '2px solid #3b82f6', color: '#aaa',
+                }}>{children}</blockquote>
+              ),
+              hr: () => <hr style={{ border: 'none', borderTop: '1px solid #2a2d33', margin: '6px 0' }} />,
+            }}
+          >
+            {turn.text}
+          </ReactMarkdown>
+        )}
       </div>
       {hasDetails && showDetails && turn.debug && (
         <div

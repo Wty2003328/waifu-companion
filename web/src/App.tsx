@@ -1,5 +1,23 @@
-import { Suspense, lazy, useEffect, useState } from 'react';
-import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { flushSync } from 'react-dom';
+import {
+  BrowserRouter, Link, Navigate, Route, Routes,
+  useNavigate, useLocation,
+} from 'react-router-dom';
+import { HTTP_BASE } from './lib/apiBase';
+import { prewarm } from './lib/fetchCache';
+
+// Eagerly import all routes. Used to be `lazy()` + Suspense, but that
+// caused a per-route chunk-fetch + parse on first navigation, which
+// felt like a tab-switch jitter (50–100ms even over loopback). For a
+// desktop app shipped as a single bundle there's no upside to lazy
+// loading — the whole bundle is on disk anyway, and merging Avatar
+// (the largest chunk because of pixi-live2d-display) with the rest
+// makes route changes synchronous.
+import Home from './pages/Home';
+import Avatar from './pages/Avatar';
+import Pulse from './pages/Pulse';
+import Settings from './pages/Settings';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
@@ -18,32 +36,107 @@ const IS_OVERLAY_WINDOW =
   typeof window !== 'undefined' &&
   new URLSearchParams(window.location.search).has('overlay');
 
-const Home = lazy(() => import('./pages/Home'));
-const Avatar = lazy(() => import('./pages/Avatar'));
-const Pulse = lazy(() => import('./pages/Pulse'));
-const Settings = lazy(() => import('./pages/Settings'));
-const Characters = lazy(() => import('./pages/Characters'));
-
 export default function App() {
   return (
     <BrowserRouter>
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <ViewTransitionStyles />
+      {IS_OVERLAY_WINDOW && <OverlayTransparencyStyles />}
+      {!IS_OVERLAY_WINDOW && <BootPrewarm />}
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
         {!IS_OVERLAY_WINDOW && <Nav />}
         {!IS_OVERLAY_WINDOW && <ZeroclawHealthBanner />}
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <Suspense fallback={<Loader />}>
-            <Routes>
-              <Route path="/" element={<Home />} />
-              <Route path="/avatar" element={<Avatar />} />
-              <Route path="/characters" element={<Characters />} />
-              <Route path="/pulse" element={<Pulse />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </Suspense>
+        {/* Pages set their own scroll container. The wrapper here uses
+            `flex: 1 1 0` + `minHeight: 0` so the child can compute its
+            `height: 100%` against a definite cross-size — without
+            `minHeight: 0`, the flex item's default min-content height
+            grows to fit the page content and the inner overflow-auto
+            never engages, which is what cuts the Save/Restart buttons
+            off the bottom of Settings on shorter viewports. */}
+        <div style={{ flex: '1 1 0', minHeight: 0, position: 'relative', display: 'flex', flexDirection: 'column' }}>
+          <Routes>
+            <Route path="/" element={<Home />} />
+            <Route path="/avatar" element={<Avatar />} />
+            {/* /characters folded into Home; keep redirect for any deep-links. */}
+            <Route path="/characters" element={<Navigate to="/" replace />} />
+            <Route path="/pulse" element={<Pulse />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
         </div>
       </div>
     </BrowserRouter>
+  );
+}
+
+/** Fire common GETs in parallel on app boot so the cache is warm
+ *  before the user clicks any nav link. By the time they navigate
+ *  to /pulse, /api/pulse/feed?limit=50 is already cached and the
+ *  page renders instantly from cache while a background revalidate
+ *  picks up any new items. */
+function BootPrewarm() {
+  useEffect(() => {
+    prewarm([
+      `${HTTP_BASE}/api/status`,
+      `${HTTP_BASE}/api/characters`,
+      `${HTTP_BASE}/api/config`,
+      `${HTTP_BASE}/api/pulse/status`,
+      `${HTTP_BASE}/api/pulse/feed?limit=50`,
+      `${HTTP_BASE}/api/pulse/unread_count`,
+    ]);
+  }, []);
+  return null;
+}
+
+/** Override the dark body/html background that's set globally in
+ *  index.html so the overlay (pet) window is genuinely transparent.
+ *  Without this, Tauri's `transparent: true` is wasted — the WebView2
+ *  paints the body's `#0b0d10` over the entire window and the pet
+ *  looks like it lives in a dark rectangle instead of floating on
+ *  the desktop. We only inject this in the overlay window so the
+ *  main window keeps its dark theme intact. */
+function OverlayTransparencyStyles() {
+  // Set inline styles directly on the elements we need transparent.
+  // WebView2 wouldn't honor a <style>-tag !important override against
+  // the index.html stylesheet (the new tag's `sheet` property stayed
+  // false in CDP — never parsed as a stylesheet). Inline styles win
+  // because they have higher specificity than any external rule and
+  // bypass the parsing path entirely.
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    const root = document.getElementById('root');
+    const prevHtml = html.style.backgroundColor;
+    const prevBody = body.style.backgroundColor;
+    const prevRoot = root?.style.backgroundColor ?? '';
+    html.style.backgroundColor = 'transparent';
+    body.style.backgroundColor = 'transparent';
+    if (root) root.style.backgroundColor = 'transparent';
+    return () => {
+      html.style.backgroundColor = prevHtml;
+      body.style.backgroundColor = prevBody;
+      if (root) root.style.backgroundColor = prevRoot;
+    };
+  }, []);
+  return null;
+}
+
+/** Inject view-transition CSS once at app root. Browsers that don't
+ *  support startViewTransition just ignore it. Kept very short
+ *  (70ms) — the transition pauses paints for its duration so anything
+ *  longer feels like nav lag. 70ms is enough for the eye to register
+ *  a soft transition without feeling sluggish. */
+function ViewTransitionStyles() {
+  return (
+    <style>{`
+      @keyframes companion-fade-in { from { opacity: 0; } to { opacity: 1; } }
+      @keyframes companion-fade-out { from { opacity: 1; } to { opacity: 0; } }
+      ::view-transition-old(root) {
+        animation: companion-fade-out 70ms ease-out both;
+      }
+      ::view-transition-new(root) {
+        animation: companion-fade-in 70ms ease-out both;
+      }
+    `}</style>
   );
 }
 
@@ -103,9 +196,9 @@ function ZeroclawHealthBanner() {
     >
       <span>⚠️</span>
       <span style={{ flex: 1 }}>
-        <strong>zeroclaw is not running.</strong> Chat will fail until you
-        start it. The companion app does not start zeroclaw automatically —
-        it's a separate daemon you manage. Re-checking every 30s.
+        <strong>The main agent isn't running.</strong> Chat won't work until
+        you start it. This app stays separate from the agent on purpose —
+        you manage the agent yourself. We'll re-check every 30 seconds.
       </span>
       <button
         type="button"
@@ -127,31 +220,60 @@ function ZeroclawHealthBanner() {
 }
 
 function Nav() {
+  // Stored preference is just a hint for the boot path (so a new Tauri
+  // launch can auto-restore the pet to its last visible state). The
+  // ACTUAL state below comes from Tauri's `is_avatar_window_visible`,
+  // polled on mount + every 2s + after each toggle. Without this, the
+  // button drifted out of sync whenever the avatar window was closed
+  // by some path other than the toggle (Alt+F4, a stuck show command,
+  // or a Tauri restart that didn't honor the stored preference).
   const [petVisible, setPetVisible] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(PET_VISIBLE_KEY) === '1';
-    } catch {
-      return false;
-    }
+    try { return localStorage.getItem(PET_VISIBLE_KEY) === '1'; }
+    catch { return false; }
   });
 
-  // Re-sync the overlay window's actual state when this component mounts
-  // and any time the user flips the toggle. We don't trust the stored
-  // bit alone — a Tauri restart with showPet=true should re-show.
+  // Sync from Tauri on mount + every 2s. The UI button reflects what
+  // Tauri reports, not localStorage.
   useEffect(() => {
     const inv = tauriInvoke();
     if (!inv) return;
-    void inv(petVisible ? 'show_avatar_window' : 'hide_avatar_window').catch(
-      (e) => console.error('pet toggle invoke failed:', e),
-    );
-  }, [petVisible]);
+    let cancelled = false;
+    const sync = async () => {
+      try {
+        const visible = await inv('is_avatar_window_visible');
+        if (!cancelled) setPetVisible(!!visible);
+      } catch { /* avatar window may not exist mid-restart */ }
+    };
+    // Initial sync — also restore from localStorage if Tauri starts
+    // hidden but the user had pet ON last session.
+    void (async () => {
+      try {
+        const visible = await inv('is_avatar_window_visible');
+        const want = localStorage.getItem(PET_VISIBLE_KEY) === '1';
+        if (!visible && want) {
+          await inv('show_avatar_window').catch(() => {});
+        }
+        await sync();
+      } catch { /* non-fatal */ }
+    })();
+    // 5s is plenty — the Pet ON/OFF state only diverges from the
+    // toggle when something exotic happens (Alt+F4 the overlay,
+    // Tauri restart). 2s was wasted Nav re-renders.
+    const id = setInterval(sync, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   const togglePet = () => {
+    const inv = tauriInvoke();
     setPetVisible((v) => {
       const next = !v;
-      try {
-        localStorage.setItem(PET_VISIBLE_KEY, next ? '1' : '0');
-      } catch { /* non-fatal */ }
+      try { localStorage.setItem(PET_VISIBLE_KEY, next ? '1' : '0'); }
+      catch { /* non-fatal */ }
+      if (inv) {
+        void inv(next ? 'show_avatar_window' : 'hide_avatar_window').catch(
+          (e) => console.error('pet toggle invoke failed:', e),
+        );
+      }
       return next;
     });
   };
@@ -177,7 +299,6 @@ function Nav() {
       <span style={{ flex: 1 }} />
       <NavLink to="/" label="Home" />
       <NavLink to="/avatar" label="Avatar" />
-      <NavLink to="/characters" label="Characters" />
       <NavLink to="/pulse" label="Pulse" />
       <NavLink to="/settings" label="Settings" />
       <button
@@ -201,28 +322,48 @@ function Nav() {
   );
 }
 
+/** Custom NavLink that wraps `navigate(to)` in
+ *  `document.startViewTransition` so route changes cross-fade for
+ *  ~140ms instead of hard-cutting. Falls back to a normal navigate
+ *  in browsers without the API (Safari < 18, Firefox < recent).
+ *  The `flushSync` is required: startViewTransition snapshots the
+ *  DOM synchronously inside its callback, so the React update must
+ *  flush before it returns.
+ *
+ *  We use a plain `<a>` instead of react-router-dom's `<Link>`
+ *  because Link's internal click handler races our preventDefault
+ *  in some configurations and ends up doing its own navigate
+ *  before our startViewTransition callback runs — bypassing the
+ *  cross-fade entirely. */
 function NavLink({ to, label }: { to: string; label: string }) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const isActive = location.pathname === to;
+  const onClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // honor browser defaults
+    e.preventDefault();
+    if (location.pathname === to) return; // no-op
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const startVT: ((cb: () => void) => unknown) | undefined = (document as any).startViewTransition?.bind(document);
+    if (startVT) {
+      startVT(() => { flushSync(() => navigate(to)); });
+    } else {
+      navigate(to);
+    }
+  };
   return (
-    <Link to={to} style={{ color: '#aaa', textDecoration: 'none', fontSize: 14 }}>
+    <a
+      href={to}
+      onClick={onClick}
+      style={{
+        color: isActive ? '#fff' : '#aaa',
+        textDecoration: 'none',
+        fontSize: 14,
+        fontWeight: isActive ? 600 : 400,
+        transition: 'color 120ms ease',
+      }}
+    >
       {label}
-    </Link>
-  );
-}
-
-function Loader() {
-  return (
-    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div
-        style={{
-          width: 32,
-          height: 32,
-          border: '2px solid #2a2d33',
-          borderTopColor: '#3b82f6',
-          borderRadius: '50%',
-          animation: 'spin 0.8s linear infinite',
-        }}
-      />
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-    </div>
+    </a>
   );
 }

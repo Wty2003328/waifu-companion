@@ -67,7 +67,11 @@ async fn main() -> Result<()> {
     }
 
     // ── 4. Build the Pulse subsystem (if enabled) ────────────────
-    let pulse_state = build_pulse(&cfg).await?;
+    // Pulse summarize reuses whichever backend the user already
+    // configured for the avatar subagent — direct LLM call or via
+    // zeroclaw's webhook — so they don't have to set up two paths.
+    let pulse_summarizer = build_pulse_summarizer(&cfg, zc.clone());
+    let pulse_state = build_pulse(&cfg, pulse_summarizer).await?;
 
     // ── 5. Build the axum app ─────────────────────────────────────
     let app_state = AppState {
@@ -91,6 +95,10 @@ async fn main() -> Result<()> {
             "/api/config/subagent",
             axum::routing::post(handle_post_subagent_override),
         )
+        .route(
+            "/api/config/avatar",
+            axum::routing::post(handle_post_avatar_override),
+        )
         .route("/api/models", get(handle_list_models))
         .route(
             "/api/characters",
@@ -103,6 +111,16 @@ async fn main() -> Result<()> {
         .route(
             "/api/characters/{id}",
             axum::routing::delete(handle_delete_character),
+        )
+        .route(
+            "/api/characters/{id}/attachments",
+            get(handle_list_character_attachments),
+        )
+        .route(
+            "/api/characters/{id}/attachments/{file}",
+            get(handle_get_character_attachment)
+                .put(handle_put_character_attachment)
+                .delete(handle_delete_character_attachment),
         )
         .route(
             "/api/shutdown",
@@ -334,16 +352,59 @@ async fn build_avatar(
     })))
 }
 
-async fn build_pulse(cfg: &CompanionConfig) -> Result<Option<Arc<PulseSubsystem>>> {
+async fn build_pulse(
+    cfg: &CompanionConfig,
+    summarizer: Option<Arc<companion_pulse::Summarizer>>,
+) -> Result<Option<Arc<PulseSubsystem>>> {
     let pulse_cfg: PulseConfig = serde_json::from_value(cfg.pulse.clone()).unwrap_or_default();
     if !pulse_cfg.enabled {
         tracing::info!("companion: pulse disabled in config");
         return Ok(None);
     }
-    let subsystem = PulseSubsystem::start(&pulse_cfg)
+    let subsystem = PulseSubsystem::start(&pulse_cfg, summarizer)
         .await
         .context("companion: pulse init failed")?;
     Ok(Some(Arc::new(subsystem)))
+}
+
+/// Build the Summarizer used by Pulse's `POST /items/{id}/summarize`.
+///
+/// We mirror the avatar subagent's backend choice so the user only
+/// configures one path:
+///
+/// * `subagent.use_zeroclaw_webhook = true` → tunnel through zeroclaw's
+///   `/webhook` (no API key needed on this machine).
+/// * otherwise → direct OpenAI-compatible call using
+///   `[avatar.subagent.llm]`.
+///
+/// Returns `None` if the avatar config can't be deserialized or the
+/// chosen backend fails to construct. In that case `/items/{id}/summarize`
+/// reports 503; the rest of Pulse keeps working.
+fn build_pulse_summarizer(
+    cfg: &CompanionConfig,
+    zc: companion_core::zeroclaw::ZeroclawClient,
+) -> Option<Arc<companion_pulse::Summarizer>> {
+    let avatar_cfg: AvatarConfig = serde_json::from_value(cfg.avatar.clone()).ok()?;
+    if avatar_cfg.subagent.use_zeroclaw_webhook {
+        tracing::info!("companion: pulse summarize ready (backend=zeroclaw-webhook)");
+        Some(Arc::new(companion_pulse::Summarizer::Zeroclaw(zc)))
+    } else {
+        match companion_core::llm::LlmClient::new(&avatar_cfg.subagent.llm) {
+            Ok(c) => {
+                tracing::info!(
+                    "companion: pulse summarize ready (backend=openai-compatible, model={})",
+                    avatar_cfg.subagent.llm.model,
+                );
+                Some(Arc::new(companion_pulse::Summarizer::Llm(c)))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "companion: pulse summarize unavailable (LLM init failed: {e})"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Subscribe to zeroclaw's SSE event stream for OBSERVABILITY only.
@@ -466,6 +527,7 @@ async fn handle_get_config(
                 "enabled": cfg.subagent.enabled,
                 "only_when_translating": cfg.subagent.only_when_translating,
                 "use_zeroclaw_webhook": cfg.subagent.use_zeroclaw_webhook,
+                "streaming": cfg.subagent.streaming,
                 "llm_model": cfg.subagent.llm.model,
                 "llm_base_url": cfg.subagent.llm.base_url,
                 "timeout_secs": cfg.subagent.timeout_secs,
@@ -622,6 +684,118 @@ async fn handle_delete_character(
     Ok(axum::http::StatusCode::OK)
 }
 
+// ── Character attachments ────────────────────────────────────────
+//
+// On-disk markdown bundle per character. Lives at
+// `<config-dir>/characters/<id>/*.md` and is loaded on every chat
+// turn. The user can edit either through the Characters page UI
+// (these endpoints) or directly with their own editor — both produce
+// the same file on disk so changes round-trip cleanly.
+
+async fn handle_list_character_attachments(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // We don't validate `id` against the roster — listing a non-existent
+    // character's dir is harmless (returns []), and lets the UI render
+    // the section before save.
+    let attachments = characters::read_attachments(&state.config_path, &id);
+    let shaped: Vec<_> = attachments
+        .into_iter()
+        .map(|(name, body)| {
+            serde_json::json!({
+                "name": name,
+                "size": body.len(),
+            })
+        })
+        .collect();
+    Ok(axum::Json(serde_json::json!({ "attachments": shaped })))
+}
+
+async fn handle_get_character_attachment(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path((id, file)): axum::extract::Path<(String, String)>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    if !attachment_filename_ok(&file) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "attachment name must be a single .md filename, no slashes / dots".into(),
+        ));
+    }
+    let path = characters::character_dir(&state.config_path, &id).join(&file);
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| (axum::http::StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(axum::Json(
+        serde_json::json!({ "name": file, "body": body }),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct PutAttachmentReq {
+    body: String,
+}
+
+async fn handle_put_character_attachment(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path((id, file)): axum::extract::Path<(String, String)>,
+    axum::Json(req): axum::Json<PutAttachmentReq>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if !attachment_filename_ok(&file) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "attachment name must be a single .md filename, no slashes / dots".into(),
+        ));
+    }
+    let dir = characters::character_dir(&state.config_path, &id);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create dir: {e}"),
+        )
+    })?;
+    let path = dir.join(&file);
+    std::fs::write(&path, req.body).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+    Ok(axum::http::StatusCode::OK)
+}
+
+async fn handle_delete_character_attachment(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path((id, file)): axum::extract::Path<(String, String)>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if !attachment_filename_ok(&file) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "attachment name must be a single .md filename, no slashes / dots".into(),
+        ));
+    }
+    let path = characters::character_dir(&state.config_path, &id).join(&file);
+    match std::fs::remove_file(&path) {
+        Ok(_) => Ok(axum::http::StatusCode::OK),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(axum::http::StatusCode::OK)
+        }
+        Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// Reject anything that isn't a single safe `*.md` filename. We refuse
+/// path separators and `..` so a malicious file name can't escape the
+/// per-character directory.
+fn attachment_filename_ok(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+    name.to_ascii_lowercase().ends_with(".md")
+}
+
 // ─────────────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -706,6 +880,92 @@ async fn handle_post_subagent_override(
 }
 
 #[derive(serde::Deserialize)]
+struct AvatarOverrideRequest {
+    /// Master toggle for the avatar subsystem.
+    enabled: Option<bool>,
+    /// Chat language code (e.g. "en", "ja").
+    chat_language: Option<String>,
+    /// TTS speech language code.
+    tts_language: Option<String>,
+    /// TTS speed multiplier.
+    tts_speed: Option<f64>,
+    /// TTS engine identifier (e.g. "gpt-sovits-v4", "edge-tts").
+    tts_engine: Option<String>,
+    /// Subagent enabled toggle.
+    subagent_enabled: Option<bool>,
+    /// Skip subagent when chat_lang == tts_lang.
+    subagent_only_when_translating: Option<bool>,
+    /// Stream the translation token-by-token (TTS per sentence).
+    subagent_streaming: Option<bool>,
+}
+
+/// Persist user-flippable avatar settings to companion.runtime.json.
+/// Same restart-required semantics as the subagent endpoint — the
+/// avatar config is built once at startup and we don't currently
+/// support hot-swapping (TTS launches a child process keyed off a
+/// snapshot of the config). Settings UI shows a "Restart" button.
+async fn handle_post_avatar_override(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<AvatarOverrideRequest>,
+) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    use companion_core::{RuntimeOverride, runtime_override_path};
+
+    let path = runtime_override_path(&state.config_path);
+
+    let mut over = if path.exists() {
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok())
+        {
+            Some(v) => v,
+            None => RuntimeOverride::default(),
+        }
+    } else {
+        RuntimeOverride::default()
+    };
+
+    let mut av = over.avatar.unwrap_or_default();
+    if let Some(v) = req.enabled { av.enabled = Some(v); }
+    if let Some(v) = req.chat_language {
+        av.chat_language = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_language {
+        av.tts_language = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_speed {
+        // Clamp into a sane band so a typo can't ship `speed = 99` to TTS.
+        let clamped = v.clamp(0.25, 3.0);
+        av.tts_speed = Some(clamped);
+    }
+    if let Some(v) = req.tts_engine {
+        av.tts_engine = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.subagent_enabled { av.subagent_enabled = Some(v); }
+    if let Some(v) = req.subagent_only_when_translating { av.subagent_only_when_translating = Some(v); }
+    if let Some(v) = req.subagent_streaming { av.subagent_streaming = Some(v); }
+
+    over.avatar = Some(av);
+
+    let body = serde_json::to_string_pretty(&over).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize override: {e}"),
+        )
+    })?;
+    std::fs::write(&path, body).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+    tracing::info!(
+        "companion: wrote avatar override to {} (restart required to apply)",
+        path.display()
+    );
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+#[derive(serde::Deserialize)]
 struct ChatRequest {
     message: String,
 }
@@ -757,16 +1017,18 @@ async fn handle_chat(
     // message.
     let outbound = match characters::load(&characters::characters_path(&state.config_path)) {
         Ok(file) => match characters::active(&file) {
-            Some(c) if !c.system_prompt.trim().is_empty() => {
-                tracing::info!(
-                    "companion: prepending system prompt for character '{}' ({} chars)",
-                    c.name,
-                    c.system_prompt.len()
-                );
-                format!(
-                    "{}\n\nUser message: {}",
-                    c.system_prompt, req.message
-                )
+            Some(c) => {
+                let prefix = characters::compose_persona_prefix(&state.config_path, c);
+                if prefix.is_empty() {
+                    req.message.clone()
+                } else {
+                    tracing::info!(
+                        "companion: persona prefix for '{}' ({} chars, prompt + notes + on-disk md)",
+                        c.name,
+                        prefix.len(),
+                    );
+                    format!("{}\n\nUser message: {}", prefix, req.message)
+                }
             }
             _ => req.message.clone(),
         },

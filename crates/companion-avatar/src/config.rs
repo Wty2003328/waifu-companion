@@ -110,6 +110,64 @@ mod tests_split {
         let v = split_sentences("just a phrase no period", 4);
         assert_eq!(v, vec!["just a phrase no period"]);
     }
+
+    /// Realistic Japanese reply with mixed terminators + leading
+    /// short sentence. We expect short fragments to merge with the
+    /// next, so chunk 1 has clean prosody for TTS.
+    #[test]
+    fn japanese_reply_merges_short_lead() {
+        let text = "こんにちは！アスナです。明日に向けてサポートするね！";
+        let v = split_sentences(text, 24);
+        // The first 6-char "こんにちは！" should merge with the next
+        // sentence rather than being shipped to TTS on its own.
+        assert!(v[0].chars().count() >= 24, "first chunk too short: {:?}", v[0]);
+    }
+
+    /// Numeric like "1." should not trigger a split when the
+    /// preceding text would be too short.
+    #[test]
+    fn numeric_periods_dont_split() {
+        let text = "Try this. 1. First tip. 2. Second tip.";
+        let v = split_sentences(text, 16);
+        // We don't want chunks like "1." or "2." escaping on their own.
+        for chunk in &v {
+            assert!(
+                chunk.trim().chars().count() >= 4,
+                "chunk too short to be a real sentence: {:?}",
+                chunk
+            );
+        }
+    }
+
+    /// Diagnostic: print what real Japanese translations chunk into
+    /// so we can sanity-check the chunk sizes are TTS-friendly.
+    /// Run: `cargo test -p companion-avatar dump_japanese_chunks --release -- --nocapture`
+    #[test]
+    fn dump_japanese_chunks() {
+        let cases: &[(&str, &str)] = &[
+            ("short", "こんにちは！アスナです。"),
+            ("medium", "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？"),
+            ("long",
+             "こんにちは！アスナです！ゲームでレベルを上げる時でも、実際の試験に備える時でも、本当に役立つ勉強のコツを3つご紹介します。1つ目はポモドーロテクニック。25分集中して5分休憩を繰り返します。2つ目はアクティブリコール。3つ目は十分な睡眠です。"),
+        ];
+        for (name, text) in cases {
+            let v = split_sentences(text, 24);
+            eprintln!("\n--- {name} (len={}c, {} chunks) ---", text.chars().count(), v.len());
+            for (i, c) in v.iter().enumerate() {
+                eprintln!("  [{}] {}c: {}", i, c.chars().count(), c);
+            }
+        }
+    }
+
+    /// Order is preserved verbatim — chunks reassembled (with spaces)
+    /// must equal the original (modulo trim).
+    #[test]
+    fn order_preserved() {
+        let text = "First. Second. Third.";
+        let v = split_sentences(text, 4);
+        let rejoined: String = v.iter().map(|s| s.trim()).collect::<Vec<_>>().join(" ");
+        assert_eq!(rejoined.replace("  ", " "), "First. Second. Third.");
+    }
 }
 
 /// TTS port configuration.
@@ -166,7 +224,15 @@ pub struct AvatarTtsConfig {
 }
 
 fn default_streaming_min_chars() -> usize {
-    8
+    // Was 8 — too low for Japanese TTS (GPT-SoVITS prosody is poor
+    // on <10-char inputs; we shipped one-word chunks like "Hi!" or
+    // "アスナです" and they sounded clipped). 24 corresponds to
+    // ~3-4 seconds of speech: long enough for clean prosody, short
+    // enough that first-audio still arrives ~3-5s after the subagent
+    // returns. Override in companion.toml `[avatar.tts]
+    // streaming_min_chars = 12` for snappier first audio at the cost
+    // of choppier early sentences.
+    24
 }
 
 fn default_tts_engine() -> String {
@@ -352,6 +418,15 @@ pub struct AvatarSubagentConfig {
     /// Reuses zeroclaw's keys; no plaintext key needed below.
     #[serde(default)]
     pub use_zeroclaw_webhook: bool,
+    /// When `true`, stream the translation token-by-token: TTS starts
+    /// on the first complete sentence ~3s after the LLM begins,
+    /// instead of waiting ~15-25s for a bulk JSON analyze() to finish.
+    /// Trade-off: skips LLM-driven expression in favor of keyword
+    /// matching (fast and good enough for most replies). Only meaningful
+    /// when `use_zeroclaw_webhook = false` — webhook backend has no
+    /// streaming surface.
+    #[serde(default)]
+    pub streaming: bool,
     /// LLM endpoint + model. Use any OpenAI-compatible provider
     /// (OpenAI, OpenRouter, Together, Groq, Ollama, vLLM, …). Ignored
     /// when `use_zeroclaw_webhook = true`.
@@ -376,6 +451,7 @@ impl Default for AvatarSubagentConfig {
             enabled: false,
             only_when_translating: true,
             use_zeroclaw_webhook: false,
+            streaming: false,
             llm: LlmConfig::default(),
             system_prompt: None,
             timeout_secs: default_subagent_timeout(),

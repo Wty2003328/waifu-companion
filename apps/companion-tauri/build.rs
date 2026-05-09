@@ -39,6 +39,14 @@ fn sync_sidecar_binary() {
     let dst_dir = manifest.join("binaries");
     let dst = dst_dir.join(format!("companion-server-{target}{exe}"));
 
+    // Tell cargo to re-run this script when the upstream binary changes.
+    // Without this, cargo skips build.rs when nothing in companion-tauri
+    // changed — which means rebuilding companion-server alone won't
+    // refresh the sidecar copy. We also re-run when binaries/ changes
+    // in case a developer manually swaps a build in.
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", dst_dir.display());
+
     if !src.exists() {
         println!(
             "cargo:warning=companion-server not built yet at {} — Tauri sidecar will use whatever is already in binaries/. Run `cargo build -p companion-server --release` first.",

@@ -83,9 +83,55 @@ pub fn runtime_override_path(toml_path: &Path) -> std::path::PathBuf {
 /// field here is something the user can flip without editing TOML.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeOverride {
+    /// Optional override for `[avatar]` top-level knobs (enabled,
+    /// chat_language, tts.language, tts.speed). Saved by Settings → Avatar.
+    #[serde(default)]
+    pub avatar: Option<AvatarOverride>,
     /// Optional override for `[avatar.subagent]` knobs.
     #[serde(default)]
     pub subagent: Option<SubagentOverride>,
+}
+
+/// Avatar/TTS knobs the user flips frequently. Anything `Some` replaces
+/// the value parsed from companion.toml; `None` leaves the TOML value
+/// in place. We intentionally keep this set small — settings that need
+/// a process restart (TTS engine change, launch_command, model_path)
+/// stay in companion.toml so they don't appear flippable in the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AvatarOverride {
+    /// Master toggle for the avatar subsystem.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Language code the user types in (e.g. "en", "ja"). Drives the
+    /// translation subagent.
+    #[serde(default)]
+    pub chat_language: Option<String>,
+    /// Subagent toggle (kept under avatar to mirror the TOML hierarchy).
+    #[serde(default)]
+    pub subagent_enabled: Option<bool>,
+    /// If true, skip the subagent when chat_language matches tts_language.
+    #[serde(default)]
+    pub subagent_only_when_translating: Option<bool>,
+    /// Stream the translation token-by-token. When true, TTS starts on
+    /// the first complete sentence ~3s after the LLM begins, instead
+    /// of waiting ~15-25s for the bulk JSON analyze call to finish.
+    /// Trades the LLM-driven expression pick for a faster keyword fallback.
+    #[serde(default)]
+    pub subagent_streaming: Option<bool>,
+    /// TTS speech language code.
+    #[serde(default)]
+    pub tts_language: Option<String>,
+    /// TTS playback speed multiplier (1.0 = normal).
+    #[serde(default)]
+    pub tts_speed: Option<f64>,
+    /// TTS engine identifier (e.g. "gpt-sovits-v4", "edge-tts").
+    /// Note: changing this from the UI without also updating
+    /// avatar.tts.launch_command / reference_audio / model_path in
+    /// companion.toml will leave the system in an inconsistent state.
+    /// We surface a warning in the Settings UI that other knobs may
+    /// also need adjustment.
+    #[serde(default)]
+    pub tts_engine: Option<String>,
 }
 
 /// Subagent backend + LLM connection overrides. Anything `Some` replaces
@@ -114,14 +160,60 @@ pub struct SubagentOverride {
 
 impl RuntimeOverride {
     /// Merge this override into a loaded config. We patch the
-    /// `avatar.subagent` and `avatar.subagent.llm` JSON subtrees
-    /// directly because companion-core stores `avatar` as a Value.
+    /// `avatar.*` JSON subtrees directly because companion-core stores
+    /// `avatar` as a Value (so it can tolerate schema drift on
+    /// nested tables like TTS engine-specific knobs).
     pub fn apply(&self, cfg: &mut CompanionConfig) {
-        if let Some(ref s) = self.subagent {
-            // Ensure avatar is an object we can mutate.
-            if !cfg.avatar.is_object() {
-                cfg.avatar = serde_json::json!({});
+        // Ensure avatar is an object we can mutate; both override
+        // branches need this.
+        if (self.avatar.is_some() || self.subagent.is_some()) && !cfg.avatar.is_object() {
+            cfg.avatar = serde_json::json!({});
+        }
+        if let Some(ref a) = self.avatar {
+            let avatar_obj = cfg.avatar.as_object_mut().unwrap();
+            if let Some(v) = a.enabled {
+                avatar_obj.insert("enabled".into(), serde_json::Value::Bool(v));
             }
+            if let Some(ref v) = a.chat_language {
+                avatar_obj.insert("chat_language".into(), serde_json::Value::String(v.clone()));
+            }
+            // TTS nested table (avatar.tts.{language,speed,engine}).
+            if a.tts_language.is_some() || a.tts_speed.is_some() || a.tts_engine.is_some() {
+                let tts = avatar_obj.entry("tts").or_insert_with(|| serde_json::json!({}));
+                if !tts.is_object() { *tts = serde_json::json!({}); }
+                let tts_obj = tts.as_object_mut().unwrap();
+                if let Some(ref v) = a.tts_language {
+                    tts_obj.insert("language".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = a.tts_speed {
+                    if let Some(n) = serde_json::Number::from_f64(v) {
+                        tts_obj.insert("speed".into(), serde_json::Value::Number(n));
+                    }
+                }
+                if let Some(ref v) = a.tts_engine {
+                    tts_obj.insert("engine".into(), serde_json::Value::String(v.clone()));
+                }
+            }
+            // Subagent toggles (avatar.subagent.{enabled,only_when_translating}).
+            if a.subagent_enabled.is_some()
+                || a.subagent_only_when_translating.is_some()
+                || a.subagent_streaming.is_some()
+            {
+                let sub = avatar_obj.entry("subagent").or_insert_with(|| serde_json::json!({}));
+                if !sub.is_object() { *sub = serde_json::json!({}); }
+                let sub_obj = sub.as_object_mut().unwrap();
+                if let Some(v) = a.subagent_enabled {
+                    sub_obj.insert("enabled".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = a.subagent_only_when_translating {
+                    sub_obj.insert("only_when_translating".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = a.subagent_streaming {
+                    sub_obj.insert("streaming".into(), serde_json::Value::Bool(v));
+                }
+            }
+        }
+        if let Some(ref s) = self.subagent {
             let avatar_obj = cfg.avatar.as_object_mut().unwrap();
             let subagent = avatar_obj
                 .entry("subagent")

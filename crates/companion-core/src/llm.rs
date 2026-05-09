@@ -119,11 +119,20 @@ impl LlmClient {
     /// Send a chat completion. Returns the assistant's text content.
     pub async fn chat(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
+        // `thinking: { type: disabled }` is z.ai's switch to skip the
+        // reasoning_content step on GLM-4.5 family models. Without it,
+        // glm-4.5-flash sits in chain-of-thought for 15–25 seconds
+        // before producing the actual JSON the subagent needs (verified
+        // direct: 22s with thinking on vs ~1s with it off). Other
+        // OpenAI-compatible endpoints either ignore unknown fields
+        // (OpenAI / Groq / DeepSeek) or accept it as a no-op, so we
+        // send it unconditionally — saves the user a config knob.
         let body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "thinking": { "type": "disabled" },
         });
         let mut req = self.http.post(&url).json(&body);
         if let Some(ref key) = self.api_key {
@@ -145,6 +154,127 @@ impl LlmClient {
             .ok_or_else(|| anyhow::anyhow!("LLM response missing choices[0].message.content"))?;
         Ok(content.to_string())
     }
+
+    /// Stream a chat completion. Calls `on_chunk(delta_text)` once per
+    /// token chunk as the SSE stream arrives. Returns the full text
+    /// when the stream finishes.
+    ///
+    /// Wire format: OpenAI-style SSE — `data: {...json...}\n\n` lines,
+    /// terminated by `data: [DONE]\n\n`. Each json has
+    /// `choices[0].delta.content` carrying the new text fragment. We
+    /// concat as we go and surface to the caller incrementally.
+    ///
+    /// Designed for the avatar subagent: as soon as a sentence
+    /// terminator lands in the buffer, the caller can dispatch a TTS
+    /// call without waiting for the full reply. Drops time-to-first-
+    /// audio dramatically on long replies (~20s+ → ~3s).
+    pub async fn chat_stream<F>(
+        &self,
+        messages: &[ChatMessage],
+        mut on_chunk: F,
+    ) -> anyhow::Result<String>
+    where
+        F: FnMut(&str),
+    {
+        use futures_util::StreamExt;
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": true,
+            "thinking": { "type": "disabled" },
+        });
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(ref key) = self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LLM {url} returned {status}: {txt}");
+        }
+        // Some providers reject SSE upgrade and return a regular JSON
+        // body (typical when `stream` isn't supported on the model).
+        // Detect by content-type and degrade to one-shot.
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        if !ct.contains("event-stream") {
+            // Fallback: treat as full chat completion.
+            let payload: serde_json::Value = resp.json().await?;
+            let content = payload
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !content.is_empty() {
+                on_chunk(&content);
+            }
+            return Ok(content);
+        }
+
+        let mut full = String::new();
+        let mut buf = Vec::<u8>::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(item) = stream.next().await {
+            let bytes = item?;
+            buf.extend_from_slice(&bytes);
+            // SSE events are separated by \n\n. Process every complete
+            // event in the buffer and keep the trailing partial.
+            while let Some(pos) = find_double_newline(&buf) {
+                let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+                let event_str = match std::str::from_utf8(&event) {
+                    Ok(s) => s,
+                    Err(_) => continue, // skip malformed UTF-8 fragment
+                };
+                // An event has one or more `field: value` lines. We
+                // only care about `data:` lines.
+                for line in event_str.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" {
+                        return Ok(full);
+                    }
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let val: serde_json::Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue, // tolerate keep-alive heartbeats
+                    };
+                    if let Some(delta) = val
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("content"))
+                        .and_then(|t| t.as_str())
+                    {
+                        if !delta.is_empty() {
+                            full.push_str(delta);
+                            on_chunk(delta);
+                        }
+                    }
+                }
+            }
+        }
+        // Stream ended without [DONE] — return what we have.
+        Ok(full)
+    }
+}
+
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
 }
 
 fn resolve_api_key(cfg: &LlmConfig) -> Option<String> {

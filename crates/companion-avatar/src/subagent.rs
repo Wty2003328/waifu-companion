@@ -169,8 +169,16 @@ pub struct SubagentMotion {
 }
 
 /// The avatar subagent. Holds whichever backend the config selected.
+///
+/// When the backend is a direct `LlmClient`, we ALSO keep an
+/// `Arc<LlmClient>` handle so we can call `chat_stream` for the
+/// streaming-translation path. The webhook backend has no equivalent
+/// (zeroclaw's `/webhook` is single-shot), so streaming requests fall
+/// back to the bulk path silently.
 pub struct AvatarSubagent {
     backend: Arc<dyn SubagentBackend>,
+    /// Some(client) iff backend is direct LlmClient (streaming-capable).
+    stream_client: Option<Arc<LlmClient>>,
     timeout: Duration,
     system_prompt_template: String,
 }
@@ -184,21 +192,25 @@ impl AvatarSubagent {
         config: &AvatarSubagentConfig,
         zeroclaw_client: Option<ZeroclawClient>,
     ) -> Result<Self> {
-        let backend: Arc<dyn SubagentBackend> = if config.use_zeroclaw_webhook {
-            let client = zeroclaw_client
-                .ok_or_else(|| anyhow::anyhow!(
-                    "subagent.use_zeroclaw_webhook = true but no ZeroclawClient was supplied"
-                ))?;
-            Arc::new(ZeroclawWebhookBackend::new(client))
-        } else {
-            Arc::new(LlmClient::new(&config.llm)?)
-        };
+        let (backend, stream_client): (Arc<dyn SubagentBackend>, Option<Arc<LlmClient>>) =
+            if config.use_zeroclaw_webhook {
+                let client = zeroclaw_client.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "subagent.use_zeroclaw_webhook = true but no ZeroclawClient was supplied"
+                    )
+                })?;
+                (Arc::new(ZeroclawWebhookBackend::new(client)), None)
+            } else {
+                let llm = Arc::new(LlmClient::new(&config.llm)?);
+                (llm.clone(), Some(llm))
+            };
         let system_prompt_template = config
             .system_prompt
             .clone()
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
         Ok(Self {
             backend,
+            stream_client,
             timeout: Duration::from_secs(config.timeout_secs),
             system_prompt_template,
         })
@@ -216,8 +228,88 @@ impl AvatarSubagent {
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
         Self {
             backend,
+            stream_client: None, // injected backend is opaque to the streaming path
             timeout: Duration::from_secs(config.timeout_secs),
             system_prompt_template,
+        }
+    }
+
+    /// Whether streaming is supported by this subagent's backend.
+    /// True only for the direct LLM path; false for the webhook path
+    /// (zeroclaw's `/webhook` is one-shot).
+    pub fn supports_streaming(&self) -> bool {
+        self.stream_client.is_some()
+    }
+
+    /// Stream a translation. The callback `on_chunk` fires for every
+    /// incremental token batch as it arrives from the LLM. Returns
+    /// the full assembled translation (after stripping code fences /
+    /// trimming whitespace) when the stream finishes.
+    ///
+    /// Falls back to a one-shot `translate_chunk` if the backend
+    /// doesn't support streaming.
+    pub async fn translate_stream<F>(
+        &self,
+        text: &str,
+        target_language: &str,
+        mut on_chunk: F,
+    ) -> Option<String>
+    where
+        F: FnMut(&str),
+    {
+        let prompt = format!(
+            "Translate the following text into {target_language}. \
+             Output ONLY the translation — no preamble, no quotation marks, \
+             no markdown decoration, no explanation. Preserve sentence \
+             count. If the text is already in {target_language}, return it \
+             unchanged.\n\nText:\n{text}",
+        );
+        let Some(ref client) = self.stream_client else {
+            // No streaming surface — degrade. Caller still gets a usable
+            // result, just without the per-token callback firing.
+            tracing::debug!("avatar subagent.translate_stream: backend has no streaming; falling back to translate_chunk");
+            let one_shot = self.translate_chunk(text, target_language).await;
+            if let Some(ref t) = one_shot {
+                on_chunk(t);
+            }
+            return one_shot;
+        };
+        let messages = vec![
+            ChatMessage { role: Role::System, content: String::new() },
+            ChatMessage { role: Role::User, content: prompt },
+        ];
+        tracing::info!(
+            "avatar subagent.translate_stream: → {} chars → {target_language}: {:?}",
+            text.chars().count(),
+            safe_prefix(text, 100),
+        );
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::cmp::min(self.timeout, Duration::from_secs(60)),
+            client.chat_stream(&messages, |delta| on_chunk(delta)),
+        )
+        .await;
+        match result {
+            Ok(Ok(full)) => {
+                let cleaned = strip_code_fence(full.trim()).trim().to_string();
+                tracing::info!(
+                    "avatar subagent.translate_stream: ← {} chars in {}ms",
+                    cleaned.chars().count(),
+                    started.elapsed().as_millis(),
+                );
+                if cleaned.is_empty() { None } else { Some(cleaned) }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("avatar subagent.translate_stream: LLM failed: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "avatar subagent.translate_stream: timeout after {}s",
+                    self.timeout.as_secs()
+                );
+                None
+            }
         }
     }
 

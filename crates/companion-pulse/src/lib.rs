@@ -20,6 +20,7 @@ pub mod config;
 pub mod models;
 pub mod scheduler;
 pub mod storage;
+pub mod summarizer;
 
 pub use config::{PulseConfig, RssConfig, FeedEntry, HackerNewsConfig, VideosConfig};
 pub use collectors::github::GithubReleasesConfig;
@@ -27,6 +28,7 @@ pub use models::{CollectorRun, FeedItem, RawItem};
 pub use scheduler::{Scheduler, trigger_collector};
 pub use storage::PulseDatabase;
 pub use collectors::{Collector, parse_interval};
+pub use summarizer::Summarizer;
 
 use std::sync::Arc;
 
@@ -36,11 +38,20 @@ use std::sync::Arc;
 pub struct PulseSubsystem {
     pub db: PulseDatabase,
     pub collectors: Vec<Arc<dyn Collector>>,
+    /// Optional summarizer used by the `/items/{id}/summarize` endpoint.
+    /// `None` ⇒ summarize returns 503. Two backends are supported (direct
+    /// OpenAI-compatible LLM, or zeroclaw's `/webhook`) — see [`Summarizer`].
+    pub summarizer: Option<Arc<Summarizer>>,
 }
 
 impl PulseSubsystem {
     /// Build the subsystem and start the scheduler in the background.
-    pub async fn start(cfg: &PulseConfig) -> anyhow::Result<Self> {
+    /// Pass `None` for `summarizer` to disable the summarize endpoint
+    /// while keeping the rest of Pulse working.
+    pub async fn start(
+        cfg: &PulseConfig,
+        summarizer: Option<Arc<Summarizer>>,
+    ) -> anyhow::Result<Self> {
         // Resolve DB path. Default ./data/pulse.db relative to CWD.
         let db_path = cfg.database.path.clone();
         let db = PulseDatabase::new(&db_path).await?;
@@ -85,6 +96,7 @@ impl PulseSubsystem {
         Ok(Self {
             db,
             collectors: list,
+            summarizer,
         })
     }
 }

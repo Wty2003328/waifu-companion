@@ -10,7 +10,8 @@ pub mod llm;
 pub mod zeroclaw;
 
 pub use config::{
-    CompanionConfig, RuntimeOverride, SubagentOverride, ZeroclawConfig, runtime_override_path,
+    AvatarOverride, CompanionConfig, RuntimeOverride, SubagentOverride, ZeroclawConfig,
+    runtime_override_path,
 };
 pub use llm::{ChatMessage, LlmClient, LlmConfig, Role};
 pub use zeroclaw::{AgentEvent, ZeroclawClient};

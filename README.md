@@ -217,6 +217,102 @@ cargo run --release -p companion-server
 # → http://127.0.0.1:9181/
 ```
 
+## TTS server setup
+
+The companion uses an external HTTP-port TTS process — the server in
+this repo only **launches** it (per `[avatar.tts]` in `companion.toml`)
+and POSTs `/tts` requests. Any engine that speaks the small contract
+below works; we ship a reference wrapper for **GPT-SoVITS** because
+that's what gives the Asuna voice in our screenshots.
+
+**The contract:**
+
+```
+POST {api_url}/tts   {"text": "...", "language": "ja", "voice": "...", "speed": 1.0}
+                     → audio bytes (with X-Sample-Rate / X-Channels / X-Format headers)
+GET  {api_url}/health → 200 OK once the model is loaded
+```
+
+### Option A — GPT-SoVITS (high-quality voice cloning, ~1.5–2× real-time on a 3060)
+
+```bash
+# 1. Get GPT-SoVITS itself (the inference engine)
+git clone https://github.com/RVC-Boss/GPT-SoVITS
+# Follow its README to install the conda env + download base weights
+# (HuBERT, BERT, vocoder). On Windows we use:
+#   conda env create -f GPT-SoVITS/environment.yaml -n gpt-sovits
+#   conda activate gpt-sovits
+
+# 2. Train OR drop in your fine-tuned voice. For training your own
+#    (recommended for character voices), follow this companion guide:
+#    https://github.com/Wty2003328/gpt-sovits-voice-cloning-guide
+#    (scripts for vocal isolation via Demucs, audio prep, dataset
+#     formatting, GPT + SoVITS fine-tuning, voice quality eval)
+
+# 3. Place the wrapper in your conda env's reach
+cp tools/avatar/asuna_tts_server.py <your-path>/
+# Or just point companion.toml's launch_command at it directly.
+
+# 4. Wire it into companion.toml
+[avatar.tts]
+engine             = "gpt-sovits-v4"
+api_url            = "http://127.0.0.1:9880"
+launch_command     = "<conda-env>/python.exe tools/avatar/asuna_tts_server.py"
+auto_start         = true
+language           = "ja"     # or "en", "zh", etc.
+voice              = "asuna"
+reference_audio    = "<GPT-SoVITS root>/logs/<your-voice>/0_sliced/0001.wav"
+reference_text     = "ここは私に任せて私を選んでくれる"   # transcript of the ref clip
+reference_language = "ja"
+model_path         = "<GPT-SoVITS root>"
+gpu_device         = 0
+```
+
+Reference clip = a 3–10s sample of the voice you want, plus a
+transcript. The wrapper feeds these into GPT-SoVITS' zero-shot path
+on every synthesis call.
+
+**Performance notes:**
+- Models load in **fp16** (`.half()`) — already optimal precision.
+- Default uses PyTorch's CUDA caching allocator (~2× faster than
+  the leak-resistant mode). Set `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
+  in your env if you observe game stutter for ~30–90s after closing
+  the companion (graphics workloads inherit the fragmented VRAM
+  pool).
+- We enable `cudnn.benchmark + TF32` automatically; first synthesis
+  is ~1s slower (warmup), each call after is faster.
+- Typical latency on RTX 3060 12GB: ~1.5× real-time per chunk,
+  ~9s wall for a 5s utterance.
+
+### Option B — edge-tts (free, no GPU, lower quality)
+
+Microsoft's edge-tts works zero-config but sounds robotic. Useful
+for a quick demo or non-pet use cases:
+
+```bash
+pip install edge-tts
+# Use your own tiny FastAPI wrapper, or any port that implements the
+# /tts + /health contract above. We don't ship one — the GPT-SoVITS
+# wrapper is the reference.
+```
+
+```toml
+[avatar.tts]
+engine    = "edge-tts"
+voice     = "ja-JP-NanamiNeural"
+language  = "ja"
+api_url   = "http://127.0.0.1:9880"
+# launch_command = "..."  # whatever launches your wrapper
+```
+
+### Option C — bring your own engine
+
+Anything that speaks the `/tts` + `/health` contract works:
+fish-speech, melotts, xtts, F5-TTS, etc. Set `engine` in
+`companion.toml` to a string that identifies your binary (we use
+it as a label in logs); set `launch_command` to whatever spawns
+your server; ensure it listens on the configured `api_url`.
+
 ## Configuration
 
 `companion.toml` (sample at `companion.toml.example`):

@@ -41,17 +41,61 @@ import time
 import wave
 from pathlib import Path
 
-# Disable PyTorch's CUDA caching allocator BEFORE torch is imported.
-# When set, every tensor `del` returns memory to the driver immediately
-# instead of into PyTorch's per-process pool. Slightly slower per-call
-# but a clean, hard kill won't leak fragmented VRAM into the next
-# graphics workload (the user reported "games stutter for a minute
-# after closing the companion" — that lag traced back to this).
-os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
+# Whether to disable PyTorch's CUDA caching allocator. When enabled,
+# every tensor `del` returns memory to the driver immediately instead
+# of into PyTorch's per-process pool — preventing VRAM fragmentation
+# leaking into the next graphics workload (we observed "games stutter
+# for ~30-90s after closing the companion" with caching ON).
+#
+# DOWNSIDE: 2-3x slower per inference call. PyTorch's cache was
+# designed exactly to skip the per-allocation driver round-trip, and
+# disabling it bottlenecks GPU utilization in the loop.
+#
+# Off by default now; the explicit `/shutdown` cleanup we already do
+# in companion-server (CUDA empty_cache + process exit) handles the
+# bulk of fragmentation at the right time. Users who still observe
+# game stutter can re-enable by setting the env var explicitly.
+if os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING") == "1":
+    print("[asuna-tts] CUDA caching DISABLED (slower; explicit env var)")
+else:
+    print("[asuna-tts] CUDA caching ON (default — ~2x faster inference)")
+
+# When companion-server spawns this script via Tauri's sidecar, the
+# parent's PATH does NOT include the conda env's Scripts/ dir, so
+# subprocesses (notably ffmpeg, called by GPT-SoVITS' load_audio for
+# reference clip decoding) fail with "WinError 2: cannot find the file
+# specified". Activating conda's hooks at runtime is fragile; we just
+# prepend the env's Scripts + Library/bin (where conda installs
+# Windows binaries) to PATH unconditionally — harmless if they're
+# already there.
+_env_root = os.path.dirname(sys.executable)
+for _bindir in (
+    os.path.join(_env_root, "Scripts"),
+    os.path.join(_env_root, "Library", "bin"),
+    os.path.join(_env_root, "Library", "mingw-w64", "bin"),
+    os.path.join(_env_root, "Library", "usr", "bin"),
+):
+    if os.path.isdir(_bindir):
+        os.environ["PATH"] = _bindir + os.pathsep + os.environ.get("PATH", "")
 
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
+
+# Performance knobs — applied immediately after torch import so all
+# downstream model/tensor work picks them up.
+#
+# - cudnn.benchmark=True lets cuDNN auto-tune kernels for the input
+#   shapes we actually use. First call is slightly slower (warmup),
+#   every call after is faster. Worth it for an always-on TTS loop.
+# - allow_tf32 lets the matmul + cuDNN pipelines use TF32 on Ampere+.
+#   We're already in fp16 for the heavy paths, but a few helper ops
+#   stay in fp32 and benefit.
+# - inference_mode is the strict no-grad context (faster than
+#   no_grad). We swap it in below for the synthesis hot path.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn

@@ -34,6 +34,10 @@ companion.characters.json
 # E2E test artifacts (saved audio, captured frames)
 /e2e_audio.wav
 /e2e_*.wav
+# Local CDP screenshots / scratch files saved during debugging.
+# Underscore prefix is the convention we use for "test scratch" so
+# they're trivial to ignore without touching this file each round.
+scripts/_*
 
 # Editor / OS
 .idea/

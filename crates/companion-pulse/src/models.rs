@@ -42,6 +42,15 @@ pub struct FeedItem {
     pub metadata: serde_json::Value,
     pub published_at: Option<DateTime<Utc>>,
     pub collected_at: DateTime<Utc>,
+    /// When this item was marked as read by the user. None == unread.
+    /// Frontend uses this to dim already-read entries and to filter
+    /// down to "Unread only" via the feed query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
+    /// LLM-generated summary, populated lazily by `POST /items/{id}/summarize`.
+    /// Cached in SQLite so re-opening the drawer doesn't re-bill the LLM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Record of a collector run for monitoring.

@@ -106,11 +106,16 @@ fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
                         }
                     };
                 }
+                let bytes_len = wav_bytes.len();
                 let cursor = std::io::Cursor::new(wav_bytes);
                 match rodio::Decoder::new_wav(cursor) {
                     Ok(source) => {
                         if let Some(ref s) = sink {
                             s.append(source);
+                            tracing::info!(
+                                "companion-audio: queued chunk turn={turn_id} seq={seq} bytes={bytes_len} sink_len={}",
+                                s.len(),
+                            );
                         }
                     }
                     Err(e) => {
@@ -190,8 +195,24 @@ pub fn run() {
             get_avatar_monitor,
             start_dragging_avatar_window,
             check_zeroclaw_health,
+            open_external_url,
+            is_avatar_window_visible,
+            open_models_folder,
         ])
         .on_window_event(|window, event| {
+            // Intercept avatar (overlay) window close: don't destroy
+            // the window — just hide it so it remains toggleable via
+            // the Nav's "Show pet" button. Without this, Alt+F4 on
+            // the overlay leaves Tauri with a dropped window handle
+            // and subsequent `show_avatar_window` invokes hit "avatar
+            // window not found".
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "avatar" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                    return;
+                }
+            }
             if matches!(event, WindowEvent::Destroyed) && window.label() == "main" {
                 let app = window.app_handle();
                 let app_handle = app.clone();
@@ -389,6 +410,72 @@ fn start_dragging_avatar_window(app: AppHandle) -> Result<(), String> {
         .get_webview_window("avatar")
         .ok_or_else(|| "avatar window not found".to_string())?;
     win.start_dragging().map_err(|e| e.to_string())
+}
+
+/// Open the Live2D models directory in the OS file explorer.
+/// Used by the character editor's "Open models folder" button so
+/// users can drop in new model folders without going through a UI
+/// uploader. Resolves the path the same way `handle_list_models` does:
+/// `<cwd>/web/dist/live2d/models/`. We create the directory first so
+/// the open call doesn't fail on a clean install.
+#[tauri::command]
+fn open_models_folder() -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let dir = cwd.join("web").join("dist").join("live2d").join("models");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir_str = dir.to_string_lossy().to_string();
+    // Use a separate process so we don't block on the UI thread.
+    // Windows-only for now; other platforms get the same behavior via
+    // tauri-plugin-shell's open if the user runs in dev there.
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir_str)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir_str)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir_str)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(dir_str)
+}
+
+/// Read the avatar (overlay) window's current visibility. The Nav's
+/// "Show pet" toggle uses this as the source of truth — without it,
+/// the button drifts out of sync if the window state changes without
+/// going through `show_avatar_window` / `hide_avatar_window` (e.g.
+/// the user Alt+F4'd the overlay, or a previous run started with
+/// `visible: false` while localStorage still had `petVisible = 1`).
+#[tauri::command]
+fn is_avatar_window_visible(app: AppHandle) -> Result<bool, String> {
+    let win = app
+        .get_webview_window("avatar")
+        .ok_or_else(|| "avatar window not found".to_string())?;
+    win.is_visible().map_err(|e| e.to_string())
+}
+
+/// Open an http(s) URL in the user's default browser. Tauri's WebView2
+/// silently drops `<a target="_blank">` and same-window `window.open`
+/// can only navigate inside the IPC origin — so the Pulse drawer's
+/// "Open ↗" button (and any other external link in the UI) routes
+/// through here. Validation is enforced by tauri-plugin-shell's
+/// default open scope regex (`^((mailto:\w+)|(tel:\w+)|(https?://\w+)).+`),
+/// which rejects schemes like `file://` or `javascript:`.
+#[tauri::command]
+#[allow(deprecated)] // shell.open is fine for a small in-app helper; we don't need the new opener plugin's extra surface area.
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    app.shell().open(url, None).map_err(|e| e.to_string())
 }
 
 /// Probe whether upstream zeroclaw is running at the configured URL.

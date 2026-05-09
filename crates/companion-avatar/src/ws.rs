@@ -34,6 +34,53 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Strip emoji + markdown decorations from a TTS-bound string.
+///
+/// Even with a strong "remove emoji" instruction in the subagent
+/// system prompt, glm-4.5-flash (and similar small models) frequently
+/// preserves them or replaces them with full-width "？？" — both of
+/// which the TTS reads aloud as gibberish. This is the deterministic
+/// safety net: post-process the model's output before handing it to
+/// the TTS engine.
+///
+/// What we drop:
+///   - Emoji (the entire pictograph block at U+1F300+, plus the
+///     compatibility set in the BMP at U+2600–27BF, U+2700–27BF, etc.),
+///     ZWJ glue, variation selectors, regional indicators.
+///   - Markdown decorations: `*` `_` `~` `\`` `#` `>` when used as
+///     surrounding punctuation. We deliberately keep them when
+///     embedded inside a word (rare in TTS text).
+///   - Run of full-width punctuation `？！。、` are preserved (they
+///     belong in CJK speech).
+fn strip_emoji_and_markdown_for_tts(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        let cp = c as u32;
+        let is_emoji = matches!(cp,
+            0x1F300..=0x1FAFF      // pictographs, supplemental, etc.
+            | 0x1F1E6..=0x1F1FF    // regional indicators (flags)
+            | 0x2600..=0x27BF      // misc symbols + dingbats
+            | 0xFE0F | 0xFE0E      // variation selectors (text/emoji)
+            | 0x200D                // zero-width joiner
+            | 0x20E3                // combining enclosing keycap
+        );
+        if is_emoji {
+            continue;
+        }
+        // Common markdown decorators when on their own (not embedded
+        // in CJK / words). Replace with a space so adjacent words
+        // don't fuse, then collapse runs below.
+        if matches!(c, '*' | '_' | '~' | '`' | '#' | '>' | '|' | '\\') {
+            out.push(' ');
+            continue;
+        }
+        out.push(c);
+    }
+    // Collapse runs of whitespace introduced by stripping.
+    let collapsed: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.trim().to_string()
+}
+
 /// Split a long agent reply into translation-sized chunks.
 ///
 /// Used by process_speak when the bulk subagent.analyze() call didn't
@@ -221,15 +268,38 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let should_run_subagent = state.subagent.is_some()
         && (need_translation || !state.config.subagent.only_when_translating);
 
-    // Skip the bulk subagent.analyze call when the input is large —
-    // those are exactly the cases where z.ai times out / 429s on the
-    // single big request. Per-paragraph translation handles them
-    // reliably below. We still want analyze() for SHORT replies
-    // because it picks the expression and translates in one call.
-    const BULK_ANALYZE_MAX_CHARS: usize = 500;
-    let bulk_eligible = text.chars().count() <= BULK_ANALYZE_MAX_CHARS;
+    // Streaming branch: when enabled + the backend supports it, take
+    // a different path that fires TTS per sentence as the LLM streams
+    // tokens. Skips the bulk JSON analyze() (saves 15-25s on long
+    // replies); uses keyword-based expression detection.
+    let streaming_eligible = should_run_subagent
+        && state.config.subagent.streaming
+        && need_translation
+        && state.subagent.as_ref().map(|s| s.supports_streaming()).unwrap_or(false);
+    if streaming_eligible {
+        return run_streaming_speak(
+            state,
+            text,
+            &chat_lang,
+            &tts_lang,
+            &expression_mapper,
+            keyword_expr,
+        )
+        .await;
+    }
 
-    let (expression, tts_text_opt, clean_chat_opt) = if should_run_subagent && bulk_eligible {
+    // Always go through the bulk subagent.analyze() — one call for
+    // the whole reply. Reasons for the 2026-05 architecture change:
+    //   - Per-paragraph fallback fired N LLM calls + 800ms sleep
+    //     between them; long replies took ~25s vs ~5s for one bulk
+    //     call.
+    //   - With thinking-disabled + max_tokens raised to 8000, glm-4.5-
+    //     flash handles 2KB+ inputs in one call without truncation
+    //     (verified empirically; see zai_thinking_disable memory).
+    //   - TTS still streams sentence-by-sentence (chunker below)
+    //     so the user starts hearing audio before the whole bulk
+    //     translation finishes generating downstream chunks.
+    let (expression, tts_text_opt, clean_chat_opt) = if should_run_subagent {
         let subagent = state.subagent.as_ref().unwrap();
         match subagent.analyze(text, &chat_lang, &tts_lang).await {
             Some(analysis) => {
@@ -248,17 +318,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             None => (keyword_expr, None, None),
         }
     } else {
-        if state.subagent.is_some() && should_run_subagent && !bulk_eligible {
-            tracing::info!(
-                "avatar: bulk subagent skipped — input {}c exceeds {} threshold; \
-                 routing to per-paragraph translation directly",
-                text.chars().count(), BULK_ANALYZE_MAX_CHARS
-            );
-            // Mark subagent as in-use so the Debug frame reflects that
-            // translation was attempted, even though the bulk path was
-            // bypassed for sizing reasons.
-            subagent_used = true;
-        } else if state.subagent.is_some() && !need_translation {
+        if state.subagent.is_some() && !need_translation {
             tracing::debug!(
                 "avatar: subagent skipped (same language; only_when_translating=true)"
             );
@@ -275,82 +335,54 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         Some(t) if !t.trim().is_empty() => expression_mapper.strip_tags(&t),
         _ => raw_subtitle.clone(),
     };
-    // Build the per-paragraph TTS chunk list.
+    // Decide what text the TTS will speak.
     //
-    // - same-language: chunk the subtitle by sentence (existing path).
-    // - cross-language: ALWAYS try translating each paragraph in its own
-    //   subagent call. The single-call subagent.analyze() already gave
-    //   us a translated_text candidate; we use it for short replies,
-    //   but for long replies it tends to time out / rate-limit at z.ai
-    //   (1KB+ inputs blow past the 60s connection budget). Per-paragraph
-    //   translation keeps each LLM call small and reliable, so the user
-    //   actually hears audio for long answers like "5 tips for sleep."
-    let tts_chunks: Vec<String> = if chat_lang == tts_lang {
-        // No translation needed — the streaming-TTS chunker handles
-        // the rest below.
-        vec![subtitle_text.clone()]
+    // - same-language: speak the subtitle (no translation needed).
+    // - cross-language: speak the bulk subagent translation. We
+    //   always do exactly one subagent.analyze() call (above) — the
+    //   per-paragraph fallback was removed in 2026-05 because each
+    //   extra LLM round-trip added 5–10s, and the bulk path is
+    //   reliable now that we send `thinking: disabled` + max_tokens
+    //   = 8000.
+    //
+    // Whatever we end up with here is sentence-chunked downstream
+    // for streaming, so even a long bulk translation starts speaking
+    // the first sentence quickly.
+    let tts_text: String = if chat_lang == tts_lang {
+        subtitle_text.clone()
     } else {
-        // Reuse the bulk-call translation IF it looks complete. We've
-        // observed z.ai returning translations truncated mid-codepoint
-        // when the JSON wrapper exceeds max_tokens — those parse as
-        // valid strings but only cover ~half the reply. Heuristic:
-        // accept the bulk translation only if it's at least 35% as long
-        // as the cleaned chat text. Otherwise fall through to
-        // per-paragraph translation so the user hears the full answer.
-        let bulk_translated = tts_text_opt
+        let bulk = tts_text_opt
             .as_deref()
             .map(|t| expression_mapper.strip_tags(t))
-            .filter(|t| !t.trim().is_empty());
-        let bulk_complete = bulk_translated.as_ref().map(|t| {
-            let translated_chars = t.chars().count();
-            let source_chars = subtitle_text.chars().count().max(1);
-            // Japanese typically packs more meaning per char than
-            // English (factor ~0.5), so 0.35 is a generous floor.
-            (translated_chars as f32) / (source_chars as f32) >= 0.35
-        }).unwrap_or(false);
-        if bulk_complete {
-            let t = bulk_translated.unwrap();
-            tracing::info!(
-                "avatar: using bulk subagent translation ({} chars)",
-                t.chars().count()
-            );
-            vec![t]
-        } else if let Some(ref subagent) = state.subagent {
-            // Fall back to per-paragraph translation. Sequential to
-            // avoid bursting z.ai's per-key rate limit.
-            let paragraphs = split_for_translation(&subtitle_text);
-            tracing::info!(
-                "avatar: bulk translation missing; per-paragraph translating {} chunks",
-                paragraphs.len()
-            );
-            let mut out = Vec::with_capacity(paragraphs.len());
-            for (i, para) in paragraphs.iter().enumerate() {
-                if i > 0 {
-                    // Stay under z.ai's per-minute rate limit. 800ms
-                    // between calls + the call itself keeps us under
-                    // ~1 RPS, which the coding-paas endpoint tolerates.
-                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                }
-                if let Some(t) = subagent.translate_chunk(para, &tts_lang).await {
-                    let cleaned = expression_mapper.strip_tags(&t);
-                    if !cleaned.trim().is_empty() {
-                        out.push(cleaned);
-                    }
-                } else {
-                    tracing::warn!(
-                        "avatar: per-paragraph translate failed for chunk {}/{}",
-                        i + 1, paragraphs.len()
-                    );
-                }
-            }
-            out
-        } else {
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_default();
+        if bulk.is_empty() {
             tracing::warn!(
-                "avatar: no subagent configured for cross-language; SKIPPING TTS"
+                "avatar: bulk translation empty; SKIPPING TTS for this turn"
             );
-            Vec::new()
+        } else {
+            tracing::info!(
+                "avatar: bulk translation accepted ({} chars)",
+                bulk.chars().count()
+            );
         }
+        bulk
     };
+    let tts_chunks: Vec<String> = if tts_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![tts_text]
+    };
+    // Strip emoji + markdown from each chunk before TTS sees it. The
+    // subagent's prompt asks for this but small models (glm-4.5-flash,
+    // groq llama-3-8b, etc.) commonly leak emoji or full-width "？？"
+    // that the TTS reads aloud — kills the immersion. Doing it here
+    // is deterministic and provider-agnostic.
+    let tts_chunks: Vec<String> = tts_chunks
+        .into_iter()
+        .map(|c| strip_emoji_and_markdown_for_tts(&c))
+        .filter(|c| !c.trim().is_empty())
+        .collect();
     let tts_text = tts_chunks.join("\n");
 
     tracing::info!(
@@ -550,4 +582,191 @@ async fn send_notification(
     let json = serde_json::to_string(notification)?;
     socket.send(Message::Text(json.into())).await?;
     Ok(())
+}
+
+/// Pop the first complete sentence from `buf` if one ends with a
+/// terminator AND the trimmed length meets `min_len`. Returns the
+/// drained sentence text on success.
+fn pop_first_sentence(buf: &mut String, min_len: usize) -> Option<String> {
+    // Walk char boundaries to find the next terminator with enough
+    // text behind it.
+    let mut byte_end: Option<usize> = None;
+    let mut so_far: usize = 0;
+    for (idx, ch) in buf.char_indices() {
+        so_far += 1;
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n') {
+            if so_far >= min_len {
+                byte_end = Some(idx + ch.len_utf8());
+                break;
+            }
+        }
+    }
+    let end = byte_end?;
+    let sentence = buf[..end].to_string();
+    let rest = buf[end..].to_string();
+    *buf = rest;
+    Some(sentence.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Streaming pipeline. Bcasts initial Expression/Text/Debug, then
+/// runs `subagent.translate_stream` while a sidecar task drains
+/// completed sentences and dispatches them to TTS in order. Final
+/// chunk gets `last=true`; Idle bcasts when the dispatcher exits.
+///
+/// Order is preserved because (a) the dispatcher consumes from the
+/// channel sequentially and (b) `synthesize_with` is awaited inline
+/// before the next sentence is taken — so each Audio frame's `seq`
+/// is broadcast in monotonic order.
+async fn run_streaming_speak(
+    state: &Arc<AvatarWsState>,
+    text: &str,
+    chat_lang: &str,
+    tts_lang: &str,
+    expression_mapper: &ExpressionMapper,
+    keyword_expr: crate::expression::Live2DExpression,
+) -> Result<String> {
+    let raw_subtitle = expression_mapper.strip_tags(text);
+    let subtitle_text = raw_subtitle.clone();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let min_len = state.config.tts.streaming_min_chars;
+
+    // Send initial frames: expression + subtitle text + debug. The
+    // chat bubble shows immediately; audio follows as TTS produces it.
+    let bcast = |frame: AvatarNotification| {
+        let _ = state.event_tx.send(AvatarEvent::Frame(frame));
+    };
+    bcast(AvatarNotification::Expression {
+        name: keyword_expr.name.clone(),
+        intensity: keyword_expr.intensity,
+        duration_ms: None,
+    });
+    bcast(AvatarNotification::Text { content: subtitle_text.clone() });
+    bcast(AvatarNotification::Debug {
+        chat_text: subtitle_text.clone(),
+        spoken_text: String::new(),
+        expression: keyword_expr.name.clone(),
+        subagent_used: true,
+    });
+
+    // Channel: (sentence_text, is_final). is_final marks the last
+    // sentence so the dispatcher knows to stamp the Audio frame's
+    // last=true. A None sentence with is_final=true is allowed for
+    // the empty-trailer case.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Option<String>, bool)>();
+    let dispatcher_state = state.clone();
+    let dispatcher_lang = tts_lang.to_string();
+    let dispatcher_turn = turn_id.clone();
+    let dispatcher = tokio::spawn(async move {
+        let mut seq: u32 = 0;
+        while let Some((sentence_opt, is_final)) = rx.recv().await {
+            let cleaned: String = match sentence_opt {
+                Some(s) => strip_emoji_and_markdown_for_tts(&s),
+                None => String::new(),
+            };
+            if cleaned.trim().is_empty() {
+                if is_final {
+                    // Empty-tail terminator so the frontend can
+                    // clear "speaking" state without an audio chunk.
+                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                        AvatarNotification::Audio {
+                            audio: String::new(),
+                            format: "wav".into(),
+                            sample_rate: 0,
+                            lip_sync: crate::protocol::LipSyncDataProto {
+                                frames: Vec::new(),
+                                frame_duration_ms: 30,
+                            },
+                            turn_id: dispatcher_turn.clone(),
+                            seq,
+                            last: true,
+                        },
+                    ));
+                    break;
+                } else {
+                    continue;
+                }
+            }
+            tracing::info!(
+                "avatar: TTS streaming chunk seq={seq} ({}c, last={is_final}): {:?}",
+                cleaned.chars().count(),
+                safe_prefix(&cleaned, 100),
+            );
+            match dispatcher_state.tts.synthesize_with(&cleaned, &dispatcher_lang).await {
+                Ok(audio) => {
+                    use base64::Engine;
+                    let audio_b64 = base64::engine::general_purpose::STANDARD
+                        .encode(&audio.audio_bytes);
+                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                        AvatarNotification::Audio {
+                            audio: audio_b64,
+                            format: audio.format,
+                            sample_rate: audio.sample_rate,
+                            lip_sync: crate::protocol::LipSyncDataProto {
+                                frames: Vec::new(),
+                                frame_duration_ms: 30,
+                            },
+                            turn_id: dispatcher_turn.clone(),
+                            seq,
+                            last: is_final,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "avatar: streaming TTS failed for chunk seq={seq}: {e}"
+                    );
+                    if is_final {
+                        let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                            AvatarNotification::Audio {
+                                audio: String::new(),
+                                format: "wav".into(),
+                                sample_rate: 0,
+                                lip_sync: crate::protocol::LipSyncDataProto {
+                                    frames: Vec::new(),
+                                    frame_duration_ms: 30,
+                                },
+                                turn_id: dispatcher_turn.clone(),
+                                seq,
+                                last: true,
+                            },
+                        ));
+                    }
+                }
+            }
+            seq += 1;
+            if is_final {
+                break;
+            }
+        }
+    });
+
+    // Drive the streaming translation. Each delta append triggers a
+    // sentence-pop loop; complete sentences flow to the dispatcher.
+    let subagent = state.subagent.as_ref().unwrap();
+    let translation_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let buf_clone = translation_buf.clone();
+    let tx_clone = tx.clone();
+    let _full = subagent
+        .translate_stream(&subtitle_text, tts_lang, move |delta| {
+            let mut buf = buf_clone.lock().unwrap();
+            buf.push_str(delta);
+            while let Some(sentence) = pop_first_sentence(&mut buf, min_len) {
+                let _ = tx_clone.send((Some(sentence), false));
+            }
+        })
+        .await;
+
+    // Send any remaining buffer as the final chunk.
+    let leftover = translation_buf.lock().unwrap().trim().to_string();
+    if !leftover.is_empty() {
+        let _ = tx.send((Some(leftover), true));
+    } else {
+        // Empty leftover: signal completion via empty terminator.
+        let _ = tx.send((None, true));
+    }
+    drop(tx);
+    let _ = dispatcher.await;
+
+    bcast(AvatarNotification::Idle);
+    Ok(subtitle_text)
 }

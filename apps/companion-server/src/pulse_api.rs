@@ -1,17 +1,28 @@
 //! Pulse REST API.
 //!
 //! Mounted at `/api/pulse/*` only when `[pulse] enabled = true`. Routes:
-//! - `GET  /api/pulse/feed`               — recent items (?limit=, ?offset=, ?source=)
+//! - `GET  /api/pulse/feed`               — recent items
+//!     ?limit=     max rows (clamped to 500, default 50)
+//!     ?offset=    page offset
+//!     ?source=    filter by source/collector_id
+//!     ?search=    case-insensitive substring on title + content
+//!     ?unread=1   only items not yet marked read
+//! - `GET  /api/pulse/unread_count`       — number of unread items
+//! - `POST /api/pulse/items/{id}/read`    — mark one item read
+//! - `DELETE /api/pulse/items/{id}/read`  — mark one item unread
+//! - `POST /api/pulse/items/read_all`     — mark every stored item read
+//! - `POST /api/pulse/items/{id}/summarize` — LLM summary (cached)
+//!     ?force=1   re-summarize even if a cached summary exists
 //! - `GET  /api/pulse/status`             — collector run history
 //! - `POST /api/pulse/trigger/{id}`       — manually run a collector by id
 //! - `GET  /api/pulse/feeds`              — user-managed RSS feeds
 //! - `POST /api/pulse/feeds`              — add a feed
 //! - `DELETE /api/pulse/feeds`            — remove by url
 //! - `GET  /api/pulse/videos`             — subscribed video channels
-//! - `POST /api/pulse/videos`             — subscribe (platform + channel_id + display_name)
-//! - `DELETE /api/pulse/videos`           — unsubscribe (?platform=&channel_id=)
-//! - `GET  /api/pulse/settings/{key}`     — read a Pulse setting (e.g. rsshub_url)
-//! - `PUT  /api/pulse/settings/{key}`     — set a setting (body: {"value": "..."})
+//! - `POST /api/pulse/videos`             — subscribe
+//! - `DELETE /api/pulse/videos`           — unsubscribe
+//! - `GET  /api/pulse/settings/{key}`     — read a Pulse setting
+//! - `PUT  /api/pulse/settings/{key}`     — set a setting
 
 use std::sync::Arc;
 
@@ -33,6 +44,12 @@ pub struct FeedQuery {
     offset: u32,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+    /// Frontend sends "1" or "true". Anything truthy enables the
+    /// unread-only filter; missing or empty = no filter.
+    #[serde(default)]
+    unread: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -67,6 +84,14 @@ pub struct RemoveVideoQuery {
     channel_id: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct SummarizeQuery {
+    /// If set to "1" / "true", regenerate even when a cached summary
+    /// exists. Default: return the cache (cheap path).
+    #[serde(default)]
+    force: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SettingValue {
     /// Empty string clears the setting (DELETE-by-PUT pattern keeps
@@ -77,6 +102,13 @@ pub struct SettingValue {
 pub fn routes() -> Router<Arc<PulseSubsystem>> {
     Router::new()
         .route("/feed", get(handle_feed))
+        .route("/unread_count", get(handle_unread_count))
+        .route(
+            "/items/{id}/read",
+            post(handle_mark_read).delete(handle_mark_unread),
+        )
+        .route("/items/read_all", post(handle_mark_all_read))
+        .route("/items/{id}/summarize", post(handle_summarize))
         .route("/status", get(handle_status))
         .route("/trigger/{id}", post(handle_trigger))
         .route("/feeds", get(handle_list_feeds).post(handle_add_feed).delete(handle_remove_feed))
@@ -95,12 +127,122 @@ async fn handle_feed(
     Query(q): Query<FeedQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let limit = q.limit.min(500);
+    // Treat anything truthy as "yes, unread only". Frontends commonly
+    // send "1" / "true"; we accept both and silently ignore garbage.
+    let unread_only = matches!(
+        q.unread.as_deref().map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
     let items = state
         .db
-        .get_feed(limit, q.offset, q.source.as_deref())
+        .get_feed(
+            limit,
+            q.offset,
+            q.source.as_deref(),
+            q.search.as_deref(),
+            unread_only,
+        )
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({ "items": items })))
+}
+
+async fn handle_unread_count(
+    State(state): State<Arc<PulseSubsystem>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let n = state.db.unread_count().await.map_err(internal)?;
+    Ok(Json(serde_json::json!({ "unread": n })))
+}
+
+async fn handle_mark_read(
+    State(state): State<Arc<PulseSubsystem>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let changed = state.db.mark_item_read(&id, true).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "changed": changed })))
+}
+
+async fn handle_mark_unread(
+    State(state): State<Arc<PulseSubsystem>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state.db.mark_item_read(&id, false).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn handle_mark_all_read(
+    State(state): State<Arc<PulseSubsystem>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let n = state.db.mark_all_read().await.map_err(internal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "marked": n })))
+}
+
+async fn handle_summarize(
+    State(state): State<Arc<PulseSubsystem>>,
+    Path(id): Path<String>,
+    Query(q): Query<SummarizeQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let force = matches!(
+        q.force.as_deref().map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+
+    let item = state
+        .db
+        .get_item(&id)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, format!("item {id} not found")))?;
+
+    if !force {
+        if let Some(ref cached) = item.summary {
+            return Ok(Json(serde_json::json!({
+                "ok": true, "summary": cached, "cached": true,
+            })));
+        }
+    }
+
+    let summarizer = state.summarizer.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "summarize disabled: no summarization backend configured \
+         (set [avatar.subagent] enabled = true)"
+            .to_string(),
+    ))?;
+
+    // Compose the prompt. We feed title + url + truncated content; long
+    // articles get clipped at 6k chars so we don't blow the context
+    // window or burn tokens on boilerplate. The system prompt is owned
+    // by the Summarizer impl — both backends speak the same shape.
+    let mut body = String::new();
+    body.push_str("Title: ");
+    body.push_str(&item.title);
+    if let Some(ref url) = item.url {
+        body.push_str("\nURL: ");
+        body.push_str(url);
+    }
+    if let Some(ref content) = item.content {
+        body.push_str("\n\nContent:\n");
+        let trimmed: String = content.chars().take(6000).collect();
+        body.push_str(&trimmed);
+        if content.chars().count() > 6000 {
+            body.push_str("\n…[truncated]");
+        }
+    }
+
+    let summary = summarizer
+        .summarize(&body)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("summarize failed: {e}")))?;
+
+    state
+        .db
+        .set_item_summary(&id, Some(&summary))
+        .await
+        .map_err(internal)?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true, "summary": summary, "cached": false,
+    })))
 }
 
 async fn handle_status(

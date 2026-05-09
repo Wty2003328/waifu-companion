@@ -33,6 +33,7 @@
         "height": 540,
         "transparent": true,
         "decorations": false,
+        "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "visible": false,
@@ -40,7 +41,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data:; media-src 'self' blob: http://127.0.0.1:*"
+      "csp": "default-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://ipc.localhost; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://ipc.localhost; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data: https:; media-src 'self' blob: http://127.0.0.1:*"
     }
   },
   "bundle": {
