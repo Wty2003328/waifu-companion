@@ -8,6 +8,14 @@ import {
 } from '../components/avatar/useAvatarSocket';
 import { HTTP_BASE, WS_BASE } from '../lib/apiBase';
 import { nativeAudioAvailable, playAudioNative, stopAudioNative } from '../lib/nativeAudio';
+import {
+  getPetGeometry,
+  setPetPosition,
+  getPetMonitor,
+  loadPetPosition,
+  savePetPosition,
+  computeSnap,
+} from '../lib/petWindow';
 
 interface ModelInfo {
   modelUrl: string;
@@ -196,6 +204,7 @@ const IS_OVERLAY =
   typeof window !== 'undefined' &&
   new URLSearchParams(window.location.search).has('overlay');
 
+
 export default function Avatar() {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [subtitle, setSubtitle] = useState<string>('');
@@ -231,6 +240,74 @@ export default function Avatar() {
   // corner buttons — the avatar floats chromeless on the desktop and
   // the controls fade in only on demand. No effect in main window.
   const [overlayHover, setOverlayHover] = useState(false);
+
+  // Pet window placement: restore on mount + persist + snap-to-edge.
+  //
+  // Tauri's data-tauri-drag-region implements the drag at OS level,
+  // so we don't get JS dragstart/dragend events. Instead, poll the
+  // window's outer position; when it stops changing for `SETTLE_MS`
+  // we treat the drag as finished, save the position, and snap to a
+  // monitor edge if close enough. Polling is cheap (single Tauri
+  // invoke every 250ms while the overlay is open) and avoids needing
+  // platform-specific drag-event listeners.
+  useEffect(() => {
+    if (!IS_OVERLAY) return;
+    let cancelled = false;
+    let lastX = -Infinity;
+    let lastY = -Infinity;
+    let stableSince = 0;
+    // Encoded "last position we already snapped/saved" — null means
+    // no save has happened yet for this stable streak.
+    let savedAtKey: string | null = null;
+    const POLL_MS = 250;
+    const SETTLE_MS = 700;
+    const SNAP_THRESHOLD = 30;
+
+    const restore = async () => {
+      const saved = loadPetPosition();
+      if (!saved) return;
+      await setPetPosition(saved.x, saved.y);
+    };
+    void restore();
+
+    const tick = async () => {
+      if (cancelled) return;
+      const geom = await getPetGeometry();
+      if (!geom) return;
+      const now = Date.now();
+      if (geom.x !== lastX || geom.y !== lastY) {
+        // Window is moving — reset settle timer + snap memo.
+        lastX = geom.x;
+        lastY = geom.y;
+        stableSince = now;
+        savedAtKey = null;
+        return;
+      }
+      const key = `${geom.x},${geom.y}`;
+      if (now - stableSince < SETTLE_MS || savedAtKey === key) return;
+      // Position is stable AND we haven't yet handled this stop.
+      const monitor = await getPetMonitor();
+      if (!monitor) {
+        savePetPosition(geom.x, geom.y);
+        savedAtKey = key;
+        return;
+      }
+      const snap = computeSnap(geom, monitor, SNAP_THRESHOLD);
+      if (snap.snapped && (snap.x !== geom.x || snap.y !== geom.y)) {
+        await setPetPosition(snap.x, snap.y);
+        savePetPosition(snap.x, snap.y);
+        savedAtKey = `${snap.x},${snap.y}`;
+        lastX = snap.x;
+        lastY = snap.y;
+        stableSince = Date.now();
+      } else {
+        savePetPosition(geom.x, geom.y);
+        savedAtKey = key;
+      }
+    };
+    const id = setInterval(tick, POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
   // Sentence-chunked playback queue. The companion server can send
   // several Audio frames per turn (one per sentence). Buffer them
   // here and drain sequentially via `drainQueue` so back-to-back

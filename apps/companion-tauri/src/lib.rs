@@ -185,6 +185,9 @@ pub fn run() {
             play_audio_native,
             stop_audio_native,
             restart_app,
+            get_avatar_window_geometry,
+            set_avatar_window_position,
+            get_avatar_monitor,
         ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) && window.label() == "main" {
@@ -289,4 +292,75 @@ fn stop_audio_native(state: tauri::State<'_, AudioState>) {
 #[tauri::command]
 fn restart_app(app: AppHandle) {
     app.restart();
+}
+
+#[derive(serde::Serialize)]
+struct WindowGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(serde::Serialize)]
+struct MonitorBounds {
+    /// Monitor's top-left corner in physical screen coordinates.
+    x: i32,
+    y: i32,
+    /// Monitor size in physical pixels.
+    width: u32,
+    height: u32,
+}
+
+/// Read the avatar (overlay) window's current outer position + size.
+/// JS uses this to (a) save the desktop pet's last position to
+/// localStorage on a debounced move event and (b) feed snap-to-edge
+/// math without a separate roundtrip per pixel.
+#[tauri::command]
+fn get_avatar_window_geometry(app: AppHandle) -> Result<WindowGeometry, String> {
+    let win = app
+        .get_webview_window("avatar")
+        .ok_or_else(|| "avatar window not found".to_string())?;
+    let pos = win.outer_position().map_err(|e| e.to_string())?;
+    let size = win.outer_size().map_err(|e| e.to_string())?;
+    Ok(WindowGeometry {
+        x: pos.x,
+        y: pos.y,
+        width: size.width,
+        height: size.height,
+    })
+}
+
+/// Move the avatar (overlay) window. Called on overlay-window mount
+/// to restore the user's last saved position, and by the snap-to-edge
+/// helper after each drag.
+#[tauri::command]
+fn set_avatar_window_position(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
+    let win = app
+        .get_webview_window("avatar")
+        .ok_or_else(|| "avatar window not found".to_string())?;
+    win.set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|e| e.to_string())
+}
+
+/// Return the work area of the monitor containing the avatar window
+/// (in physical screen coords). Used by the snap-to-edge helper to
+/// compute how close the pet is to a screen edge.
+#[tauri::command]
+fn get_avatar_monitor(app: AppHandle) -> Result<MonitorBounds, String> {
+    let win = app
+        .get_webview_window("avatar")
+        .ok_or_else(|| "avatar window not found".to_string())?;
+    let monitor = win
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no current monitor".to_string())?;
+    let pos = monitor.position();
+    let size = monitor.size();
+    Ok(MonitorBounds {
+        x: pos.x,
+        y: pos.y,
+        width: size.width,
+        height: size.height,
+    })
 }
