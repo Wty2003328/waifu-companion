@@ -47,7 +47,10 @@ impl PulseSubsystem {
 
         let mut list: Vec<Arc<dyn Collector>> = Vec::new();
         if let Some(rss) = cfg.collectors.rss.clone() {
-            list.push(Arc::new(collectors::rss::RssCollector::new(rss)));
+            list.push(Arc::new(collectors::rss::RssCollector::with_db(
+                rss,
+                Some(db.clone()),
+            )));
         }
         if let Some(hn) = cfg.collectors.hackernews.clone() {
             list.push(Arc::new(collectors::hackernews::HackerNewsCollector::new(

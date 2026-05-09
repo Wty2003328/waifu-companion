@@ -9,20 +9,30 @@ use chrono::{DateTime, Utc};
 use super::{Collector, parse_interval};
 use crate::config::RssConfig;
 use crate::models::RawItem;
+use crate::storage::PulseDatabase;
 
 pub struct RssCollector {
     config: RssConfig,
+    /// Optional handle to the database — when present, the collector
+    /// merges runtime-managed feeds (from the `user_feeds` table,
+    /// editable via the /pulse Sources tab) on top of the static
+    /// list in companion.toml. None for the unit-test path.
+    db: Option<PulseDatabase>,
     client: reqwest::Client,
 }
 
 impl RssCollector {
     pub fn new(config: RssConfig) -> Self {
+        Self::with_db(config, None)
+    }
+
+    pub fn with_db(config: RssConfig, db: Option<PulseDatabase>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("zeroclaw-companion/0.1.0 (+pulse)")
             .build()
             .unwrap_or_default();
-        Self { config, client }
+        Self { config, db, client }
     }
 
     /// Parse an arbitrary feed body (RSS or Atom) into [`RawItem`]s.
@@ -89,15 +99,41 @@ impl Collector for RssCollector {
     }
 
     async fn collect(&self) -> Result<Vec<RawItem>> {
-        let mut all = Vec::new();
+        // Merge static toml feeds + runtime user_feeds (added via the
+        // /pulse Sources tab). De-dupe by URL so a feed listed in both
+        // doesn't get double-fetched. Static-toml entry's name wins
+        // when both list the same URL — that one's the one with the
+        // user-friendly display name in companion.toml.
+        let mut by_url: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if let Some(ref db) = self.db {
+            match db.get_user_feeds().await {
+                Ok(rows) => {
+                    for (name, url) in rows {
+                        by_url.insert(url, name);
+                    }
+                }
+                Err(e) => tracing::warn!("rss: failed to load user feeds: {e}"),
+            }
+        }
         for feed in &self.config.feeds {
-            match self.fetch_feed(&feed.name, &feed.url).await {
+            by_url.insert(feed.url.clone(), feed.name.clone());
+        }
+
+        let mut all = Vec::new();
+        for (url, name) in &by_url {
+            match self.fetch_feed(name, url).await {
                 Ok(items) => {
-                    tracing::info!("rss: {} → {} items", feed.name, items.len());
+                    tracing::info!("rss: {} → {} items", name, items.len());
                     all.extend(items);
                 }
-                Err(e) => tracing::warn!("rss: {} failed: {e}", feed.name),
+                Err(e) => tracing::warn!("rss: {} failed: {e}", name),
             }
+        }
+        if by_url.is_empty() {
+            tracing::debug!(
+                "rss: no feeds configured (toml is empty + no runtime feeds via /api/pulse/feeds)"
+            );
         }
         Ok(all)
     }

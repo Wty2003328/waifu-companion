@@ -142,10 +142,21 @@ impl GithubReleasesCollector {
                     .and_then(|c| c.body)
                     .or_else(|| entry.summary.map(|s| s.content))
                     .unwrap_or_default();
+                // The atom id looks like
+                //   tag:github.com,2008:Repository/41881900/v2.0.6
+                // Extract just the release tag at the end. Falls back to
+                // the full id if the format doesn't match (defensive).
+                let tag_only: String = entry
+                    .id
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| entry.id.clone());
                 let metadata = serde_json::json!({
                     "platform": "github",
                     "repo": repo,
-                    "tag": entry.id,
+                    "tag": tag_only,
+                    "tag_full_id": entry.id,
                     "author": author,
                 });
                 RawItem {
