@@ -25,6 +25,12 @@ companion.characters.json
 .env
 .env.*
 
+# Runtime SQLite database for Pulse — generated on first start
+/data/
+*.db
+*.db-shm
+*.db-wal
+
 # E2E test artifacts (saved audio, captured frames)
 /e2e_audio.wav
 /e2e_*.wav
