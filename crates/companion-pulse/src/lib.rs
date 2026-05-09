@@ -22,6 +22,7 @@ pub mod scheduler;
 pub mod storage;
 
 pub use config::{PulseConfig, RssConfig, FeedEntry, HackerNewsConfig, VideosConfig};
+pub use collectors::github::GithubReleasesConfig;
 pub use models::{CollectorRun, FeedItem, RawItem};
 pub use scheduler::{Scheduler, trigger_collector};
 pub use storage::PulseDatabase;
@@ -60,6 +61,14 @@ impl PulseSubsystem {
             list.push(Arc::new(collectors::videos::VideoCollector::new(
                 db.clone(),
             )));
+        }
+        // GitHub releases — repos in toml, no DB plumbing needed.
+        if let Some(gh) = cfg.collectors.github_releases.clone() {
+            if gh.enabled {
+                list.push(Arc::new(
+                    collectors::github::GithubReleasesCollector::new(gh),
+                ));
+            }
         }
 
         tracing::info!("pulse: {} collector(s) registered", list.len());

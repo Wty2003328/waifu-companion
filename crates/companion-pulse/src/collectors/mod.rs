@@ -4,6 +4,7 @@
 //! The scheduler drives them at their configured cadence; storage handles
 //! deduplication by URL.
 
+pub mod github;
 pub mod hackernews;
 pub mod rss;
 pub mod videos;

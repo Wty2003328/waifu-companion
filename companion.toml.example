@@ -104,6 +104,23 @@ enabled = true
 interval = "15m"
 min_score = 50
 
+# Video subscriptions (YouTube + Bilibili-via-RSSHub).
+# Channels are managed at runtime via the /pulse Sources tab —
+# this block only controls whether the collector runs.
+[pulse.collectors.videos]
+enabled = true
+interval = "30m"
+
+# GitHub Releases — polls each repo's /releases.atom (no API key needed).
+# Watched repo list lives in the toml here; edit + restart to change.
+[pulse.collectors.github_releases]
+enabled = true
+interval = "1h"
+repos = [
+    # "rust-lang/rust",
+    # "tauri-apps/tauri",
+]
+
 
 # ───────────────────────────────────────────────────────────────────
 # Example: Asuna GPT-SoVITS v4 voice (anime cross-lingual)

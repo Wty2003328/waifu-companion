@@ -49,6 +49,11 @@ pub struct CollectorsConfig {
     /// whether the collector runs and how often.
     #[serde(default)]
     pub videos: Option<VideosConfig>,
+    /// GitHub releases for a configured list of repos. Repos live in
+    /// the toml (vs the DB) because they don't need hot-reload — most
+    /// users curate this list rarely.
+    #[serde(default)]
+    pub github_releases: Option<crate::collectors::github::GithubReleasesConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
