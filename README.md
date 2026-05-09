@@ -433,4 +433,34 @@ cargo test --workspace
 
 ## License
 
-MIT OR Apache-2.0
+This project is licensed under either of, at your option:
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+SPDX-License-Identifier: `MIT OR Apache-2.0`
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the
+Apache-2.0 license, shall be dual-licensed as above, without any
+additional terms or conditions.
+
+### Third-party assets
+
+This repository's source code is dual-licensed as above. **Live2D
+model assets** under `web/public/live2d/models/` are NOT covered by
+that license — each model is the property of its original author and
+licensed separately. The repository ships without any models; you
+provide your own and accept the model author's terms when you do.
+The Cubism SDK sample models (Haru, Hiyori, Mark, Wanko, etc.) are
+licensed by Live2D Inc. under the
+[Live2D Free Material License](https://www.live2d.com/eula/live2d-free-material-license-agreement_en.html)
+for individual use and small-team commercial use; verify the terms
+before redistributing. The Cubism SDK runtime files
+(`live2d.min.js`, `live2dcubismcore.min.js`) are similarly subject
+to Live2D's distribution terms — they live under
+`web/public/live2d/` and are gitignored by default.
