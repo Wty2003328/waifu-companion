@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import Live2DViewer, { type Live2DViewerHandle, type ModelActions } from '../components/avatar/Live2DViewer';
+import Live2DViewer, { type Live2DViewerHandle, type ModelActions, type ModelParameter } from '../components/avatar/Live2DViewer';
 import AvatarControls from '../components/avatar/AvatarControls';
 import {
   useAvatarSocket,
@@ -266,6 +266,50 @@ export default function Avatar() {
       window.removeEventListener('companion:userModel', onCustom);
     };
   }, []);
+  // Live2D parameter overrides, keyed by parameter id (e.g.
+  // "PARAM_ANGLE_X"). Live2DViewer continuously re-applies these so
+  // the model's motion system can't overwrite them. Persisted per
+  // active model id so swapping models doesn't carry stale overrides.
+  const [paramOverrides, setParamOverrides] = useState<Record<string, number>>({});
+  const [availableParams, setAvailableParams] = useState<ModelParameter[]>([]);
+  // Read params from the loaded model after onActionsReady fires
+  // (proxies "model finished loading"). Slight delay is intentional
+  // so the model's first motion has populated current values.
+  useEffect(() => {
+    if (modelActions.expressions.length === 0 && modelActions.motions.length === 0) {
+      return;
+    }
+    const id = setTimeout(() => {
+      const params = viewerRef.current?.getParameters() ?? [];
+      setAvailableParams(params);
+    }, 600);
+    return () => clearTimeout(id);
+  }, [modelActions]);
+  // Storage: per-model so overrides don't leak across model swaps.
+  const paramStorageKey = (() => {
+    const mid = userModelId ?? 'server-default';
+    return `companion.params.${mid}.v1`;
+  })();
+  // Hydrate overrides on model swap.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(paramStorageKey);
+      setParamOverrides(raw ? JSON.parse(raw) : {});
+    } catch {
+      setParamOverrides({});
+    }
+  }, [paramStorageKey]);
+  // Persist on every change.
+  useEffect(() => {
+    try {
+      if (Object.keys(paramOverrides).length === 0) {
+        localStorage.removeItem(paramStorageKey);
+      } else {
+        localStorage.setItem(paramStorageKey, JSON.stringify(paramOverrides));
+      }
+    } catch { /* non-fatal */ }
+  }, [paramOverrides, paramStorageKey]);
+
   // Effective model: user's pick from installedModels (if found),
   // otherwise the server's default that arrives via WS ModelInfo.
   const effectiveModelInfo: ModelInfo | null = (() => {
@@ -772,6 +816,7 @@ export default function Avatar() {
                   offsetY: p.offsetY + dy,
                 }))
               }
+              parameterOverrides={paramOverrides}
             />
           ) : (
             <div
@@ -911,6 +956,19 @@ export default function Avatar() {
               prefs={prefs}
               onChange={setPrefs}
               onClose={() => setShowSettings(false)}
+              availableParams={availableParams}
+              paramOverrides={paramOverrides}
+              onParamChange={(id, value) =>
+                setParamOverrides((prev) => ({ ...prev, [id]: value }))
+              }
+              onParamReset={(id) =>
+                setParamOverrides((prev) => {
+                  const next = { ...prev };
+                  delete next[id];
+                  return next;
+                })
+              }
+              onParamResetAll={() => setParamOverrides({})}
             />
           )}
         </div>
@@ -1296,10 +1354,20 @@ function CanvasSettingsPopover({
   prefs,
   onChange,
   onClose,
+  availableParams,
+  paramOverrides,
+  onParamChange,
+  onParamReset,
+  onParamResetAll,
 }: {
   prefs: CanvasPrefs;
   onChange: (next: CanvasPrefs) => void;
   onClose: () => void;
+  availableParams: ModelParameter[];
+  paramOverrides: Record<string, number>;
+  onParamChange: (id: string, value: number) => void;
+  onParamReset: (id: string) => void;
+  onParamResetAll: () => void;
 }) {
   const palette = ['#0a0a0a', '#1f1f23', '#1a1f2e', '#2a1a1a', '#1a2a1a', '#ffffff'];
   return (
@@ -1541,6 +1609,106 @@ function CanvasSettingsPopover({
               </select>
             </div>
           </>
+        )}
+      </div>
+
+      {/* Live2D parameters — manual sliders for every model param.
+          Continuously re-applied by Live2DViewer so the sliders win
+          against the model's own animation. Per-model storage so
+          switching models clears prior overrides. */}
+      <div style={{ borderTop: '1px solid #2a2d33', paddingTop: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <span style={{ fontSize: 12, color: '#aaa' }}>
+            Live2D parameters{availableParams.length > 0 ? ` (${availableParams.length})` : ''}
+          </span>
+          {Object.keys(paramOverrides).length > 0 && (
+            <button
+              type="button"
+              onClick={onParamResetAll}
+              title="Clear every parameter override"
+              style={{
+                background: 'transparent',
+                color: '#888',
+                border: '1px solid #2a2d33',
+                borderRadius: 4,
+                padding: '2px 8px',
+                fontSize: 11,
+                cursor: 'pointer',
+              }}
+            >
+              Reset all ({Object.keys(paramOverrides).length})
+            </button>
+          )}
+        </div>
+        {availableParams.length === 0 ? (
+          <div style={{ fontSize: 11, color: '#666', lineHeight: 1.5 }}>
+            Loading model parameters… (some models don't expose an
+            introspectable param list).
+          </div>
+        ) : (
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            maxHeight: 220,
+            overflowY: 'auto',
+            paddingRight: 4,
+          }}>
+            {availableParams.map((p) => {
+              const value = paramOverrides[p.id] ?? p.current;
+              const overridden = p.id in paramOverrides;
+              const range = p.max - p.min;
+              const step = range > 4 ? 0.05 : 0.01;
+              return (
+                <div key={p.id} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10 }}>
+                    <span
+                      style={{
+                        flex: 1,
+                        color: overridden ? '#a5b4fc' : '#888',
+                        fontFamily: 'ui-monospace, monospace',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={p.id}
+                    >
+                      {p.id}
+                    </span>
+                    <span style={{ color: '#666', minWidth: 36, textAlign: 'right' }}>
+                      {value.toFixed(2)}
+                    </span>
+                    {overridden && (
+                      <button
+                        type="button"
+                        onClick={() => onParamReset(p.id)}
+                        title="Clear override (return to model animation)"
+                        style={{
+                          background: 'transparent',
+                          color: '#666',
+                          border: 'none',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                          padding: 0,
+                        }}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    type="range"
+                    min={p.min}
+                    max={p.max}
+                    step={step}
+                    value={value}
+                    onChange={(e) => onParamChange(p.id, Number(e.target.value))}
+                    style={{ width: '100%', accentColor: overridden ? '#3b82f6' : '#444' }}
+                  />
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
 

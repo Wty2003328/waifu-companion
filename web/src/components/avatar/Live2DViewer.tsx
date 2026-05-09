@@ -34,12 +34,75 @@ async function loadModel(modelUrl: string): Promise<any> {
 export interface Live2DViewerHandle {
   setExpression: (name: string) => void;
   playMotion: (group: string, index: number) => void;
+  /** Read every parameter the loaded model exposes. Returns [] if
+   *  the model isn't ready yet or doesn't expose its core model. */
+  getParameters: () => ModelParameter[];
 }
 
 export interface ModelActions {
   expressions: { name: string }[];
   motions: { group: string; index: number }[];
 }
+
+/**
+ * Information about a single Live2D parameter — what the model
+ * exposes, plus the live current value at the moment of read.
+ * Both Cubism 2 (`PARAM_ANGLE_X`) and Cubism 4 (`ParamAngleX`)
+ * formats are flattened to this shape.
+ */
+export interface ModelParameter {
+  id: string;
+  current: number;
+  min: number;
+  max: number;
+  default: number;
+}
+
+/**
+ * Standard Cubism 2 parameter IDs. The Cubism 2 webgl runtime is
+ * minified (no public getParamCount / getParamId) so we can't
+ * enumerate dynamically. Probing this well-known list against
+ * core.getParamFloat() filters down to the params the loaded model
+ * actually has. Min/max/default come from Cubism 2's documented
+ * conventions.
+ */
+const CUBISM2_KNOWN_PARAMS: { id: string; min: number; max: number; default: number }[] = [
+  // Head pose
+  { id: 'PARAM_ANGLE_X', min: -30, max: 30, default: 0 },
+  { id: 'PARAM_ANGLE_Y', min: -30, max: 30, default: 0 },
+  { id: 'PARAM_ANGLE_Z', min: -30, max: 30, default: 0 },
+  // Body
+  { id: 'PARAM_BODY_ANGLE_X', min: -10, max: 10, default: 0 },
+  { id: 'PARAM_BODY_ANGLE_Y', min: -10, max: 10, default: 0 },
+  { id: 'PARAM_BODY_ANGLE_Z', min: -10, max: 10, default: 0 },
+  { id: 'PARAM_BREATH', min: 0, max: 1, default: 0 },
+  // Eyes
+  { id: 'PARAM_EYE_L_OPEN', min: 0, max: 1, default: 1 },
+  { id: 'PARAM_EYE_R_OPEN', min: 0, max: 1, default: 1 },
+  { id: 'PARAM_EYE_BALL_X', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_EYE_BALL_Y', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_EYE_BALL_FORM', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_EYE_L_SMILE', min: 0, max: 1, default: 0 },
+  { id: 'PARAM_EYE_R_SMILE', min: 0, max: 1, default: 0 },
+  // Brows
+  { id: 'PARAM_BROW_L_Y', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_R_Y', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_L_X', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_R_X', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_L_ANGLE', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_R_ANGLE', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_L_FORM', min: -1, max: 1, default: 0 },
+  { id: 'PARAM_BROW_R_FORM', min: -1, max: 1, default: 0 },
+  // Mouth
+  { id: 'PARAM_MOUTH_OPEN_Y', min: 0, max: 1, default: 0 },
+  { id: 'PARAM_MOUTH_FORM', min: -1, max: 1, default: 0 },
+  // Cheek
+  { id: 'PARAM_CHEEK', min: 0, max: 1, default: 0 },
+  // Hair / accessories
+  { id: 'PARAM_HAIR_FRONT', min: 0, max: 1, default: 0 },
+  { id: 'PARAM_HAIR_SIDE', min: 0, max: 1, default: 0 },
+  { id: 'PARAM_HAIR_BACK', min: 0, max: 1, default: 0 },
+];
 
 interface Live2DViewerProps {
   modelUrl: string;
@@ -99,6 +162,14 @@ interface Live2DViewerProps {
    * state and pass the new offsetX/offsetY back as props on next render.
    */
   onTranslate?: (dx: number, dy: number) => void;
+  /**
+   * Per-parameter overrides keyed by parameter id (e.g.
+   * "PARAM_ANGLE_X" / "ParamAngleX"). Continuously re-applied so
+   * Live2D's motion system can't fight back. Pass an empty object
+   * (the default) to leave the model's internal animation
+   * unsuppressed.
+   */
+  parameterOverrides?: Record<string, number>;
 }
 
 const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
@@ -119,6 +190,7 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   dragRegion = false,
   dragToTranslate = false,
   onTranslate,
+  parameterOverrides,
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const appRef = useRef<PIXI.Application | null>(null);
@@ -148,7 +220,53 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
         console.warn('[Live2DViewer] Motion failed:', e);
       }
     },
+    getParameters: () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const model = modelRef.current as any;
+      if (!model) return [];
+      try {
+        const core = model.internalModel?.coreModel;
+        if (!core) return [];
+        // Cubism 4 layout — params accessible directly as arrays.
+        const c4 = core.parameters;
+        if (c4 && Array.isArray(c4.ids) && Array.isArray(c4.values)) {
+          return c4.ids.map((id: string, i: number) => ({
+            id,
+            current: c4.values[i] ?? 0,
+            min: c4.minimumValues?.[i] ?? c4.minimum?.[i] ?? -1,
+            max: c4.maximumValues?.[i] ?? c4.maximum?.[i] ?? 1,
+            default: c4.defaultValues?.[i] ?? c4.defaults?.[i] ?? 0,
+          })) as ModelParameter[];
+        }
+        // Cubism 2: the runtime is minified (Live2DModelWebGL exposes
+        // `_$MT`, `_$5S`, etc., but not getParamCount/getParamId in
+        // un-mangled form). Probe the well-known list of standard
+        // Cubism 2 parameter IDs — anything the model returns a value
+        // for is something the user can drive.
+        if (typeof core.getParamFloat === 'function') {
+          const known = CUBISM2_KNOWN_PARAMS;
+          const out: ModelParameter[] = [];
+          for (const def of known) {
+            try {
+              const cur = core.getParamFloat(def.id);
+              if (typeof cur === 'number' && !Number.isNaN(cur)) {
+                out.push({ id: def.id, current: cur, min: def.min, max: def.max, default: def.default });
+              }
+            } catch { /* not present on this model */ }
+          }
+          return out;
+        }
+      } catch (e) {
+        console.warn('[Live2DViewer] getParameters failed:', e);
+      }
+      return [];
+    },
   }));
+
+  // Keep a ref to the latest overrides so the high-frequency
+  // re-apply loop reads them without re-subscribing every render.
+  const overridesRef = useRef<Record<string, number> | undefined>(parameterOverrides);
+  useEffect(() => { overridesRef.current = parameterOverrides; }, [parameterOverrides]);
 
   // Initialize PIXI application
   useEffect(() => {
@@ -231,6 +349,10 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (appRef.current.stage as any).addChild(model);
         modelRef.current = model;
+        // Expose the live model on window for diagnostics + e2e tests.
+        // Safe debug global; doesn't affect production behavior.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).__live2dModel = model;
         setLoaded(true);
 
         // Discover available expressions and motions from the model
@@ -437,6 +559,54 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
       canvas.style.cursor = '';
     };
   }, [loaded, dragRegion, dragToTranslate, onTranslate, motionsRef]);
+
+  // Continuously re-apply parameterOverrides so Live2D's motion
+  // system doesn't overwrite the user's slider values on every tick.
+  // pixi-live2d-display runs at ~60fps; we hook into requestAnimationFrame
+  // to land our writes AFTER each motion update (which schedules the
+  // values), so the user's value is what actually renders.
+  useEffect(() => {
+    if (!loaded) return;
+    let raf = 0;
+    const apply = () => {
+      raf = requestAnimationFrame(apply);
+      const ov = overridesRef.current;
+      if (!ov || Object.keys(ov).length === 0) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const model = modelRef.current as any;
+      if (!model) return;
+      try {
+        const core = model.internalModel?.coreModel;
+        if (!core) return;
+        // Cubism 4: write directly into the parameters arrays.
+        const c4 = core.parameters;
+        if (c4 && Array.isArray(c4.ids) && Array.isArray(c4.values)) {
+          for (const [id, value] of Object.entries(ov)) {
+            const idx = c4.ids.indexOf(id);
+            if (idx >= 0) c4.values[idx] = value;
+          }
+          return;
+        }
+        // Cubism 2: setParamFloat is the public API.
+        if (typeof core.setParamFloat === 'function') {
+          for (const [id, value] of Object.entries(ov)) {
+            core.setParamFloat(id, value);
+          }
+          return;
+        }
+        // Fallback: write into _model.parameters directly.
+        const c2 = core._model?.parameters;
+        if (c2 && Array.isArray(c2.ids) && Array.isArray(c2.values)) {
+          for (const [id, value] of Object.entries(ov)) {
+            const idx = c2.ids.indexOf(id);
+            if (idx >= 0) c2.values[idx] = value;
+          }
+        }
+      } catch { /* model is mid-load or destroyed; will retry next frame */ }
+    };
+    raf = requestAnimationFrame(apply);
+    return () => cancelAnimationFrame(raf);
+  }, [loaded]);
 
   // Eye tracking — model gaze follows mouse over the canvas.
   // pixi-live2d-display takes window-coordinate mouse positions; the
