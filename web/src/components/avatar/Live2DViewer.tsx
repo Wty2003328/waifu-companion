@@ -77,6 +77,14 @@ interface Live2DViewerProps {
   eyeTracking?: boolean;
   /** Available motions, used by idle auto-play. */
   motionsRef?: { current: { group: string; index: number }[] | null };
+  /**
+   * When true, the Live2D canvas + its wrapper carry
+   * `data-tauri-drag-region`, so click-and-drag on the avatar moves
+   * the host Tauri window. Without this the inner PIXI canvas captures
+   * mousedown and the parent's drag attribute never fires — that's why
+   * the desktop pet wasn't repositionable.
+   */
+  dragRegion?: boolean;
 }
 
 const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
@@ -94,6 +102,7 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   idleMotionIntervalMs = 12000,
   eyeTracking = false,
   motionsRef,
+  dragRegion = false,
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const appRef = useRef<PIXI.Application | null>(null);
@@ -130,11 +139,20 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
     if (!canvasRef.current) return;
 
     try {
+      // Render quality: match the user's hi-DPI display, anti-alias
+      // edges, and prefer the discrete GPU. The default PIXI config
+      // renders at devicePixelRatio=1 which makes Live2D models look
+      // muddy on retina/4K screens compared to native viewers like
+      // Live2DViewerEX.
       const app = new PIXI.Application({
         view: canvasRef.current,
         backgroundAlpha: 0,
         autoStart: true,
         resizeTo: canvasRef.current.parentElement ?? undefined,
+        resolution: window.devicePixelRatio || 1,
+        autoDensity: true,
+        antialias: true,
+        powerPreference: 'high-performance',
       });
       // Silence pixi-live2d-display@0.4.0's "isInteractive is not a
       // function" pointer-event spam: that library targets an older
@@ -324,6 +342,47 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
     return () => { cancelled = true; clearInterval(id); };
   }, [idleMotion, idleMotionIntervalMs, isPlaying, loaded, motionsRef]);
 
+  // Hit-area click → trigger a motion (like a Live2DViewerEX "react
+  // to touch" feature). pixi-live2d-display models expose hit areas
+  // declared in the .moc/.physics — typically named Head / Body / Arm
+  // etc. Clicking inside one of those areas fires `model.motion(group,
+  // index)` for a matching group, falling back to TapBody.
+  useEffect(() => {
+    if (!loaded) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onClick = (e: MouseEvent) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const model = modelRef.current as any;
+      if (!model) return;
+      // Don't compete with window-drag in pet mode; if dragRegion is
+      // on we let mousedown bubble to the OS.
+      if (dragRegion) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      try {
+        const hits: string[] = model.hitTest?.(x, y) ?? [];
+        if (hits.length === 0) return;
+        // Pick a motion group whose name matches the hit area; common
+        // conventions: Head → "TapHead", Body → "TapBody". Fall back
+        // to any group that starts with "Tap".
+        const motions = motionsRef?.current ?? [];
+        const wanted = `Tap${hits[0]}`.toLowerCase();
+        const exact = motions.find((m) => m.group.toLowerCase() === wanted);
+        const fallback = motions.find((m) => m.group.toLowerCase().startsWith('tap'));
+        const pick = exact ?? fallback;
+        if (pick) {
+          model.motion(pick.group, pick.index);
+        }
+      } catch (err) {
+        console.warn('[Live2DViewer] hit-area motion failed:', err);
+      }
+    };
+    canvas.addEventListener('click', onClick);
+    return () => canvas.removeEventListener('click', onClick);
+  }, [loaded, dragRegion, motionsRef]);
+
   // Eye tracking — model gaze follows mouse over the canvas.
   // pixi-live2d-display takes window-coordinate mouse positions; the
   // model normalizes internally. This only works when the underlying
@@ -407,9 +466,20 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
     );
   }
 
+  // The drag-region attribute on both the wrapper AND the canvas
+  // ensures the click-to-drag-window behavior actually fires when the
+  // user clicks ON the avatar. Without it on the canvas, PIXI's
+  // pointer pipeline swallows mousedown before Tauri's drag handler
+  // sees it — that was the "pet window not repositionable" bug.
+  const dragAttrs = dragRegion ? { 'data-tauri-drag-region': '' } : {};
   return (
-    <div className="relative w-full h-full">
-      <canvas ref={canvasRef} className="w-full h-full" style={{ imageRendering: 'auto' }} />
+    <div className="relative w-full h-full" {...dragAttrs}>
+      <canvas
+        ref={canvasRef}
+        className="w-full h-full"
+        style={{ imageRendering: 'auto' }}
+        {...dragAttrs}
+      />
       {!loaded && !error && (
         <div className="absolute inset-0 flex items-center justify-center text-gray-400">
           <p className="animate-pulse">Loading Live2D model...</p>

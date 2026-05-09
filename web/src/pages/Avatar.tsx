@@ -593,7 +593,12 @@ export default function Avatar() {
             position: 'relative',
             borderRadius: IS_OVERLAY ? 0 : 12,
             overflow: 'hidden',
-            background: IS_OVERLAY ? 'transparent' : canvasBg,
+            // In pet mode the canvas is always transparent (the user
+            // wants the avatar floating on the desktop, not a window
+            // with a colored background). In main mode the user picks.
+            background: IS_OVERLAY
+              ? 'transparent'
+              : (prefs.transparent ? 'transparent' : canvasBg),
             minHeight: 0,
             // Subtle checker pattern when transparent so the user can
             // see the canvas extents. Suppressed in overlay mode.
@@ -646,6 +651,7 @@ export default function Avatar() {
               idleMotionIntervalMs={prefs.idleMotionSecs * 1000}
               eyeTracking={prefs.eyeTracking}
               motionsRef={modelMotionsRef}
+              dragRegion={IS_OVERLAY}
             />
           ) : (
             <div
@@ -694,18 +700,34 @@ export default function Avatar() {
           )}
           {subtitle && (
             <div
+              // Opt out of the parent's drag region so users can
+              // select / scroll subtitle text without picking up the
+              // window in pet mode.
+              {...{ 'data-tauri-drag-region': 'false' } as Record<string, string>}
               style={{
                 position: 'absolute',
-                bottom: 16,
+                // In pet mode, position ABOVE the chat bar (which sits
+                // at bottom: 12 with ~50px height). Without this, the
+                // chat bar covered the subtitle and the user reported
+                // "in pet mode I also want subtitles" — they were
+                // already firing, just hidden behind the input.
+                bottom: IS_OVERLAY ? 76 : 16,
                 left: '50%',
                 transform: 'translateX(-50%)',
-                maxWidth: '80%',
-                background: 'rgba(0, 0, 0, 0.7)',
+                maxWidth: IS_OVERLAY ? '92%' : '80%',
+                background: 'rgba(0, 0, 0, 0.78)',
                 color: '#fff',
-                padding: '8px 16px',
+                padding: '8px 14px',
                 borderRadius: 10,
-                fontSize: 14,
-                backdropFilter: 'blur(4px)',
+                fontSize: IS_OVERLAY ? 13 : 14,
+                lineHeight: 1.4,
+                backdropFilter: 'blur(6px)',
+                WebkitBackdropFilter: 'blur(6px)',
+                boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
+                whiteSpace: 'pre-wrap',
+                pointerEvents: 'none',
+                // Always-visible in pet mode regardless of hover state.
+                zIndex: 5,
               }}
             >
               {subtitle}
