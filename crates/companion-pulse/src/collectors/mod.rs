@@ -6,6 +6,7 @@
 
 pub mod hackernews;
 pub mod rss;
+pub mod videos;
 
 use std::time::Duration;
 

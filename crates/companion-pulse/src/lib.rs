@@ -21,7 +21,7 @@ pub mod models;
 pub mod scheduler;
 pub mod storage;
 
-pub use config::{PulseConfig, RssConfig, FeedEntry, HackerNewsConfig};
+pub use config::{PulseConfig, RssConfig, FeedEntry, HackerNewsConfig, VideosConfig};
 pub use models::{CollectorRun, FeedItem, RawItem};
 pub use scheduler::{Scheduler, trigger_collector};
 pub use storage::PulseDatabase;
@@ -51,6 +51,14 @@ impl PulseSubsystem {
         if let Some(hn) = cfg.collectors.hackernews.clone() {
             list.push(Arc::new(collectors::hackernews::HackerNewsCollector::new(
                 hn,
+            )));
+        }
+        // Video subscriptions (YouTube + Bilibili-via-RSSHub). Channels
+        // come from the DB, not the toml, so the user can curate them
+        // at runtime without a restart.
+        if cfg.collectors.videos.as_ref().map(|v| v.enabled).unwrap_or(false) {
+            list.push(Arc::new(collectors::videos::VideoCollector::new(
+                db.clone(),
             )));
         }
 

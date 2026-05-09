@@ -43,6 +43,29 @@ pub struct CollectorsConfig {
     pub rss: Option<RssConfig>,
     #[serde(default)]
     pub hackernews: Option<HackerNewsConfig>,
+    /// YouTube + Bilibili (via RSSHub) video subscriptions. Channels
+    /// are stored in the database, not the toml — see
+    /// `PulseDatabase::add_video_channel`. This block only controls
+    /// whether the collector runs and how often.
+    #[serde(default)]
+    pub videos: Option<VideosConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideosConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_30m")]
+    pub interval: String,
+}
+
+impl Default for VideosConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: default_30m(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

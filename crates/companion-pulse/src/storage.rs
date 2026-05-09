@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::models::{CollectorRun, FeedItem, RawItem};
@@ -86,6 +86,16 @@ impl PulseDatabase {
                  CREATE TABLE IF NOT EXISTS user_feeds (
                     name TEXT NOT NULL,
                     url TEXT NOT NULL PRIMARY KEY
+                 );
+                 CREATE TABLE IF NOT EXISTS video_channels (
+                    platform     TEXT NOT NULL,
+                    channel_id   TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    PRIMARY KEY (platform, channel_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
                  );",
             )?;
             Ok(())
@@ -308,6 +318,116 @@ impl PulseDatabase {
         })
         .await??;
         Ok(n)
+    }
+
+    // ── Video subscriptions (YouTube + Bilibili-via-RSSHub) ──────────
+    //
+    // The VideoCollector reads channels from this table on every call so
+    // the user can add/remove subscriptions without a restart. Self-hosted
+    // RSSHub support for Bilibili lives in the `settings` table under the
+    // key `rsshub_url` — leave it unset to fall back to public rsshub.app.
+
+    /// Returns (platform, channel_id, display_name) tuples for every
+    /// configured subscription, ordered by platform then channel_id.
+    pub async fn get_video_channels(
+        &self,
+    ) -> Result<Vec<(String, String, String)>> {
+        let path = self.path.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String)>> {
+            let c = Connection::open(path.as_str())?;
+            let mut stmt = c.prepare(
+                "SELECT platform, channel_id, display_name
+                 FROM video_channels
+                 ORDER BY platform, channel_id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await??;
+        Ok(rows)
+    }
+
+    pub async fn add_video_channel(
+        &self,
+        platform: &str,
+        channel_id: &str,
+        display_name: &str,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let p = platform.to_string();
+        let c = channel_id.to_string();
+        let d = display_name.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            Connection::open(path.as_str())?.execute(
+                "INSERT INTO video_channels (platform, channel_id, display_name)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(platform, channel_id) DO UPDATE SET display_name = excluded.display_name",
+                params![p, c, d],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub async fn remove_video_channel(
+        &self,
+        platform: &str,
+        channel_id: &str,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let p = platform.to_string();
+        let c = channel_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            Connection::open(path.as_str())?.execute(
+                "DELETE FROM video_channels WHERE platform = ?1 AND channel_id = ?2",
+                params![p, c],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    // ── Generic key/value settings table ─────────────────────────────
+    //
+    // Used by VideoCollector to read `rsshub_url` (override the default
+    // public RSSHub instance with a self-hosted one to bypass rate
+    // limits + region blocks). Open-ended k/v store; future settings
+    // can be added without a schema change.
+
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let path = self.path.clone();
+        let k = key.to_string();
+        let val = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let c = Connection::open(path.as_str())?;
+            let mut stmt = c.prepare("SELECT value FROM settings WHERE key = ?1")?;
+            let val: Option<String> = stmt
+                .query_row(params![k], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
+            Ok(val)
+        })
+        .await??;
+        Ok(val)
+    }
+
+    pub async fn set_setting(&self, key: &str, value: Option<&str>) -> Result<()> {
+        let path = self.path.clone();
+        let k = key.to_string();
+        let v = value.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            Connection::open(path.as_str())?.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![k, v],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 }
 
