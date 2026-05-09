@@ -21,6 +21,7 @@ import {
   getUserModelChoice,
   type InstalledModel,
 } from '../lib/models';
+import { startWebcamTracking, stopWebcamTracking } from '../lib/webcamTracker';
 
 interface ModelInfo {
   modelUrl: string;
@@ -68,6 +69,14 @@ interface CanvasPrefs {
   idleMotionSecs: number;
   /** Model gaze follows the mouse cursor over the canvas. */
   eyeTracking: boolean;
+  /**
+   * Webcam-driven gaze tracking. When enabled, requests webcam
+   * permission and uses frame-difference motion detection (no ML
+   * model download) to estimate where the user is moving and steer
+   * the avatar's gaze toward it. Wins over mouse-based eyeTracking
+   * when both are on.
+   */
+  webcamTracking: boolean;
 }
 const PREFS_KEY = 'companion.avatarPrefs.v1';
 const DEFAULT_PREFS: CanvasPrefs = {
@@ -85,6 +94,7 @@ const DEFAULT_PREFS: CanvasPrefs = {
   idleMotion: false,
   idleMotionSecs: 12,
   eyeTracking: false,
+  webcamTracking: false,
 };
 function loadPrefs(): CanvasPrefs {
   try {
@@ -319,6 +329,38 @@ export default function Avatar() {
     if (!picked) return modelInfo;
     return { ...modelInfo, modelUrl: picked.modelUrl };
   })();
+
+  // Webcam face/motion tracking — drive model.focus() from the
+  // user's webcam. Frame-difference based, no ML library bundled.
+  // Requests camera permission on enable; releases on disable or
+  // unmount. Suppressed silently if the browser denies access.
+  const [webcamError, setWebcamError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!prefs.webcamTracking) return;
+    let cancelled = false;
+    setWebcamError(null);
+    startWebcamTracking((focus) => {
+      if (cancelled) return;
+      // pixi-live2d-display's model.focus expects window/page-pixel
+      // coords. Map (-1, 1) → a virtual point centered at the canvas.
+      const canvas = document.querySelector('canvas');
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const px = rect.left + rect.width * (focus.x * 0.5 + 0.5);
+      const py = rect.top + rect.height * (focus.y * 0.5 + 0.5);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const model = (window as any).__live2dModel;
+      try {
+        model?.focus?.(px, py);
+      } catch { /* model unloaded */ }
+    }).catch((e) => {
+      console.warn('webcam tracking failed:', e);
+      setWebcamError(String(e?.message ?? e));
+      // Auto-disable so the toggle reflects the actual state.
+      setPrefs((p) => ({ ...p, webcamTracking: false }));
+    });
+    return () => { cancelled = true; stopWebcamTracking(); };
+  }, [prefs.webcamTracking]);
 
   // Pet window placement: restore on mount + persist + snap-to-edge.
   //
@@ -1740,6 +1782,19 @@ function CanvasSettingsPopover({
           />
           Gaze follows cursor
         </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#aaa', cursor: 'pointer', marginTop: 6 }}>
+          <input
+            type="checkbox"
+            checked={prefs.webcamTracking}
+            onChange={(e) => onChange({ ...prefs, webcamTracking: e.target.checked })}
+          />
+          Webcam motion tracking <span style={{ color: '#666', fontSize: 10 }}>(experimental)</span>
+        </label>
+        <div style={{ fontSize: 10, color: '#666', marginLeft: 24, marginTop: 2, lineHeight: 1.4 }}>
+          Asks for webcam permission. Detects motion via frame
+          difference (no ML model download) and steers the avatar's
+          gaze toward where you move.
+        </div>
       </div>
     </div>
   );
