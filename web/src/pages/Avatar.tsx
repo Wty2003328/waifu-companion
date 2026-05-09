@@ -185,6 +185,16 @@ export default function Avatar() {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const audioUnlockedRef = useRef(false);
   const playbackRef = useRef<PlaybackHandle | null>(null);
+  // Set when /api/chat returns a reply we haven't seen on the WS yet;
+  // cleared by the WS onText handler when it delivers the same turn.
+  // Used by handleSendChat's fallback to know whether it should
+  // re-append after a grace period.
+  const pendingHttpReplyRef = useRef<string | null>(null);
+  // Set when the HTTP fallback path actually appended a turn (WS
+  // missed the deadline). If the WS Text frame eventually does arrive
+  // later, the onText handler REPLACES the just-added fallback turn
+  // with the cleaner WS version instead of appending a duplicate.
+  const httpFallbackFiredRef = useRef<string | null>(null);
   // Sentence-chunked playback queue. The companion server can send
   // several Audio frames per turn (one per sentence). Buffer them
   // here and drain sequentially via `drainQueue` so back-to-back
@@ -348,6 +358,35 @@ export default function Avatar() {
     },
     onText: (content) => {
       setSubtitle(content);
+      // WS delivered the assistant turn — clear the pending HTTP
+      // fallback so handleSendChat's setTimeout doesn't double-append.
+      pendingHttpReplyRef.current = null;
+      // If the HTTP fallback already added a turn for THIS reply,
+      // replace it with the WS version (cleaner, comes with audio
+      // sync) instead of appending a duplicate.
+      const fallbackText = httpFallbackFiredRef.current;
+      httpFallbackFiredRef.current = null;
+      if (fallbackText !== null) {
+        setHistory((prev) => {
+          if (prev.length === 0) return prev;
+          const last = prev[prev.length - 1];
+          if (last.role !== 'assistant' || last.text !== fallbackText) {
+            // Last turn isn't our fallback — fall through to append.
+            return [
+              ...prev,
+              { role: 'assistant', text: content, ts: Date.now() } as ChatTurn,
+            ].slice(-HISTORY_LIMIT);
+          }
+          // Replace the fallback turn with the WS-delivered one.
+          const next = prev.slice(0, -1);
+          next.push({ role: 'assistant', text: content, ts: Date.now() });
+          console.log(
+            `[chat] replaced fallback "${fallbackText.slice(0, 40)}" → "${content.slice(0, 40)}"`
+          );
+          return next;
+        });
+        return;
+      }
       // Append the assistant's reply to history (the chat-language text
       // shown in the subtitle, NOT the TTS-language version).
       appendTurn({ role: 'assistant', text: content, ts: Date.now() });
@@ -424,10 +463,36 @@ export default function Avatar() {
           display = `[error ${resp.status}] ${body || resp.statusText}`;
         }
         appendTurn({ role: 'assistant', text: display, ts: Date.now() });
+      } else {
+        // Append the assistant reply from the HTTP response IF the WS
+        // didn't already deliver it. The WS Text frame is preferred —
+        // it carries the subagent-cleaned text + arrives in sync with
+        // audio — but if the WS dropped during a long agent loop (we
+        // saw a real case: 2-minute wait on "how to deal with sleep
+        // disruption"), the user would otherwise see no reply at all.
+        try {
+          const body: { reply?: string } = await resp.json();
+          if (body.reply) {
+            const candidate = body.reply;
+            // Bump the turn counter; the WS onText handler clears
+            // pendingHttpReplyRef.current when it receives the next
+            // Text frame for this turn. If the ref is still set after
+            // 8s, the WS missed it and we fall back to the raw text.
+            // 8s is the longest wait we've seen between /api/chat
+            // returning and the corresponding WS Text frame arriving.
+            pendingHttpReplyRef.current = candidate;
+            setTimeout(() => {
+              if (pendingHttpReplyRef.current !== candidate) {
+                return; // WS delivered first; nothing to do
+              }
+              pendingHttpReplyRef.current = null;
+              httpFallbackFiredRef.current = candidate;
+              console.log('[chat] +assistant (HTTP fallback — WS missed)');
+              appendTurn({ role: 'assistant', text: candidate, ts: Date.now() });
+            }, 8000);
+          }
+        } catch { /* not JSON or already consumed; non-fatal */ }
       }
-      // Note: assistant reply is appended via the onText WS handler, not
-      // here. /api/chat returns the same text but the WS path delivers it
-      // alongside the audio frame — we want history and audio in sync.
     } catch (e) {
       console.error('Chat send error:', e);
       appendTurn({
