@@ -1,4 +1,4 @@
-# zeroclaw-companion configuration.
+# waifu-companion configuration.
 # Copy this to `companion.toml` next to the binary, or set
 # COMPANION_CONFIG=/abs/path/to/companion.toml.
 
@@ -128,26 +128,26 @@ repos = [
 
 
 # ───────────────────────────────────────────────────────────────────
-# Example: Asuna GPT-SoVITS v4 voice (anime cross-lingual)
+# Example: GPT-SoVITS v4 cloned voice (cross-lingual)
 # ───────────────────────────────────────────────────────────────────
-# Chat with the agent in English, hear Asuna reply in Japanese.
+# Chat in English, hear the avatar reply in Japanese (or any pair).
 #
-# 1. Train your GPT-SoVITS v4 model (see GPT-SoVITS docs).
-# 2. Edit tools/avatar/asuna_tts_server.py to point at your weights.
-# 3. Replace the [avatar.tts] block above with:
+# 1. Fine-tune a GPT-SoVITS v4 model for your voice. Guide:
+#    https://github.com/Wty2003328/gpt-sovits-voice-cloning-guide
+# 2. Replace the [avatar.tts] block above with:
 #
 # [avatar.tts]
-# engine = "gpt-sovits-v4"
-# port = 9880
-# language = "ja"
-# voice = "asuna"
-# speed = 1.0
-# auto_start = true
-# launch_command = "python tools/avatar/asuna_tts_server.py"
-# model_path = "/path/to/GPT-SoVITS"
-# reference_audio = "/path/to/asuna_reference.wav"
-# reference_text = "ここは私に任せて私を選んでくれる"
+# engine             = "gpt-sovits-v4"
+# port               = 9880
+# language           = "ja"                                          # speech language
+# voice              = "<your-voice-id>"                             # used as the LoRA-name prefix
+# speed              = 1.0
+# auto_start         = true
+# launch_command     = "python tools/avatar/gptsovits_tts_server.py"
+# model_path         = "/path/to/GPT-SoVITS"                         # repo root
+# reference_audio    = "/path/to/your_reference_clip.wav"            # 3-10 s sample
+# reference_text     = "<exact transcript of the clip>"
 # reference_language = "ja"
-# gpu_device = 0
+# gpu_device         = 0
 #
-# And enable [avatar.subagent] so cross-language replies get translated.
+# Then enable [avatar.subagent] so cross-language replies get translated.

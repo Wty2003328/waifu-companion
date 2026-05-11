@@ -45,7 +45,7 @@ black box: we consume its public REST + SSE API and never edit its source.
              ▼                 ▼
         ┌─────────┐      ┌──────────────┐
         │ browser │      │ TTS wrapper  │   <- model-agnostic
-        │  / tauri│      │ (Python /    │      e.g. Asuna v4 GPT-SoVITS
+        │  / tauri│      │ (Python /    │      e.g. GPT-SoVITS v4
         └─────────┘      │  Node / …)   │
                          └──────────────┘
 ```

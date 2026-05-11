@@ -29,7 +29,7 @@ impl RssCollector {
     pub fn with_db(config: RssConfig, db: Option<PulseDatabase>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent("zeroclaw-companion/0.1.0 (+pulse)")
+            .user_agent("waifu-companion/0.1.0 (+pulse)")
             .build()
             .unwrap_or_default();
         Self { config, db, client }

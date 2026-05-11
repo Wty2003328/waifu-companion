@@ -1,6 +1,6 @@
 # Pulse — what's done, what's next
 
-The Pulse subsystem is now part of `zeroclaw-companion` proper. The
+The Pulse subsystem is now part of `waifu-companion` proper. The
 fork's old `src/pulse/` does not need to exist anywhere else.
 
 ## What's in `companion-pulse`

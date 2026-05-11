@@ -1,6 +1,6 @@
 # companion-tauri
 
-Tauri 2 desktop shell for `zeroclaw-companion`. Bundles
+Tauri 2 desktop shell for `waifu-companion`. Bundles
 `companion-server` as a sidecar binary and shows the companion web
 UI in two native windows: a main window for chat / settings /
 characters, and a transparent always-on-top "desktop pet" overlay.

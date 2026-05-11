@@ -48,7 +48,7 @@ impl VideoCollector {
     pub fn new(db: PulseDatabase) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
-            .user_agent("zeroclaw-companion-pulse/0.1.0")
+            .user_agent("waifu-companion-pulse/0.1.0")
             .build()
             .unwrap_or_default();
         Self { client, db }

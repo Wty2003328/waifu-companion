@@ -229,7 +229,7 @@ pub struct AvatarOverride {
     #[serde(default)]
     pub tts_engine: Option<String>,
     /// Full launch command for the TTS server process (e.g.
-    /// `"<conda>/python.exe tools/avatar/asuna_tts_server.py"`).
+    /// `"<conda>/python.exe tools/avatar/gptsovits_tts_server.py"`).
     /// companion-server spawns this with `auto_start = true`.
     #[serde(default)]
     pub tts_launch_command: Option<String>,

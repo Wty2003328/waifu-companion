@@ -19,8 +19,8 @@ exclude = ["apps/companion-tauri"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-authors = ["zeroclaw-companion contributors"]
-repository = "https://github.com/Wty2003328/zeroclaw-companion"
+authors = ["waifu-companion contributors"]
+repository = "https://github.com/Wty2003328/waifu-companion"
 rust-version = "1.88"
 
 [workspace.dependencies]

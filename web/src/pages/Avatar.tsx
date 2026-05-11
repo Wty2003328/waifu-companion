@@ -1251,7 +1251,7 @@ export default function Avatar() {
 
       {/* Compact chat bar — only in overlay (desktop pet) mode. The
           overlay window is transparent + frameless, so this is the
-          ONLY way to talk to Asuna without opening the main window.
+          ONLY way to talk to the companion without opening the main window.
           Hidden by default so the pet looks like just an avatar
           floating on the desktop; fades in when the user hovers over
           the canvas. Anchored to the bottom edge with a translucent
@@ -1356,7 +1356,7 @@ function ChatBubble({ turn }: { turn: ChatTurn }) {
       }}
     >
       <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>
-        {isUser ? 'you' : 'asuna'} · {fmtTime(turn.ts)}
+        {isUser ? 'you' : 'companion'} · {fmtTime(turn.ts)}
         {hasDetails && (
           <button
             type="button"

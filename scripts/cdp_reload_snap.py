@@ -21,7 +21,7 @@ def shoot(ws, mid, name):
     data = res.get("result", {}).get("data")
     if not data:
         print("no shot for", name); return
-    out = f"C:/Users/user/Desktop/workspace/zeroclaw-companion/scripts/_tauri_{name}.png"
+    out = f"C:/Users/user/Desktop/workspace/waifu-companion/scripts/_tauri_{name}.png"
     open(out, "wb").write(base64.b64decode(data))
     print("wrote", out)
 

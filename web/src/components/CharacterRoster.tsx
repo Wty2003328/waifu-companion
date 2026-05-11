@@ -304,7 +304,7 @@ function EditModal({
           <textarea
             value={draft.system_prompt}
             onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
-            placeholder="You are Yuuki Asuna from SAO. Speak warmly, use playful Japanese mannerisms..."
+            placeholder="You are a warm, casual companion. Speak naturally, like a close friend..."
             style={{ ...inputStyle, minHeight: 160, resize: 'vertical', fontFamily: 'ui-monospace, monospace' }}
           />
           <div style={{ fontSize: 11, color: '#666', marginTop: 4 }}>

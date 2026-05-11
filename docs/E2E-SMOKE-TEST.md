@@ -9,7 +9,7 @@ covering individual components in isolation).
 
 ```
    user types        →   zeroclaw    →   SSE event   →    companion   →   TTS port  →   audio
-   "Hi Asuna"           (any model)      agent.reply       subagent        (Asuna v4)     in browser
+   "Hello"           (any model)      agent.reply       subagent        (GPT-SoVITS v4)     in browser
                                                            translate +
                                                            pick face
 ```
@@ -27,7 +27,7 @@ bridge, the TTS port, and the WebSocket frame ordering.
 - An OpenAI-compatible API key for the avatar subagent (used for
   translation + expression analysis). Fastest options: OpenAI's
   `gpt-4o-mini`, OpenRouter's free tier, or Ollama on `localhost:11434/v1`.
-- *Optional but recommended:* the Asuna GPT-SoVITS v4 wrapper or any
+- *Optional but recommended:* the GPT-SoVITS v4 wrapper or any
   other TTS server that speaks the `/tts` + `/health` contract.
 
 ## Step 1 — boot zeroclaw
@@ -77,7 +77,7 @@ api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o-mini"
 ```
 
-For the cross-language case (chat in English, Asuna speaks Japanese):
+For the cross-language case (chat in English, avatar speaks Japanese):
 
 ```toml
 [avatar]
@@ -85,11 +85,11 @@ chat_language = "en"     # subtitles + LLM reasoning
 
 [avatar.tts]
 engine = "gpt-sovits-v4"
-launch_command = "python tools/avatar/asuna_tts_server.py"
+launch_command = "python tools/avatar/gptsovits_tts_server.py"
 auto_start = true
 language = "ja"          # what the avatar speaks
-voice = "asuna"
-reference_audio = "/abs/path/to/asuna_reference.wav"
+voice = "<your-voice-id>"
+reference_audio = "/abs/path/to/reference.wav"
 reference_text  = "ここは私に任せて私を選んでくれる"
 reference_language = "ja"
 model_path = "/abs/path/to/GPT-SoVITS"
@@ -104,9 +104,9 @@ If `auto_start = false`, start it yourself in a separate terminal:
 # generic example
 python my_tts_server.py    # binds 127.0.0.1:9880
 
-# Asuna v4 example
-COMPANION_REPO=/path/to/zeroclaw-companion
-python "$COMPANION_REPO/tools/avatar/asuna_tts_server.py"
+# GPT-SoVITS v4 example
+COMPANION_REPO=/path/to/waifu-companion
+python "$COMPANION_REPO/tools/avatar/gptsovits_tts_server.py"
 ```
 
 Verify:
@@ -125,7 +125,7 @@ file /tmp/check.wav    # → "RIFF (little-endian) data, WAVE audio"
 ## Step 4 — boot companion-server
 
 ```bash
-cd /path/to/zeroclaw-companion
+cd /path/to/waifu-companion
 COMPANION_CONFIG=$(pwd)/companion.toml ./target/release/companion-server
 ```
 

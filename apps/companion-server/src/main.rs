@@ -1,17 +1,14 @@
-//! companion-server — entry point for the zeroclaw companion.
+//! companion-server — entry point for waifu-companion.
 //!
 //! Lifecycle:
 //! 1. Load `companion.toml` (or use defaults).
-//! 2. Health-check the upstream zeroclaw daemon.
+//! 2. Health-check the upstream agent daemon (zeroclaw / openclaw /
+//!    hermes / custom, selected by `[zeroclaw] kind`).
 //! 3. Build the avatar subsystem (subagent + TTS port + WS state).
-//! 4. Spawn the SSE bridge: subscribe to zeroclaw `/api/events`, forward
-//!    `agent.reply` events to the avatar broadcast channel.
-//! 5. Auto-start the configured TTS server (e.g. the Asuna v4 wrapper).
+//! 4. Spawn the SSE bridge: subscribe to the agent's `/api/events`,
+//!    forward `agent.reply` events to the avatar broadcast channel.
+//! 5. Auto-start the configured TTS server.
 //! 6. Serve the companion UI + WS routes on its own HTTP port.
-//!
-//! The fork's old approach was: edit zeroclaw, rebuild zeroclaw, ship a
-//! patched zeroclaw. The new approach is: zeroclaw stays vanilla, the
-//! companion runs as a sidecar and consumes zeroclaw's public API.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -261,7 +258,7 @@ fn config_path() -> Result<PathBuf> {
         return Ok(local);
     }
     if let Some(home) = directories::UserDirs::new() {
-        let home_cfg = home.home_dir().join(".zeroclaw-companion").join("companion.toml");
+        let home_cfg = home.home_dir().join(".waifu-companion").join("companion.toml");
         return Ok(home_cfg);
     }
     Ok(local)
@@ -424,7 +421,7 @@ fn build_pulse_summarizer(
 ///     so any avatar-Speak we emitted here would have empty text, and
 /// (2) the load-bearing path is /api/chat → process_speak, which runs
 ///     subagent + TTS exactly once per turn. Re-emitting via SSE would
-///     risk doubling that work and producing two simultaneous Asunas.
+///     risk doubling that work and producing two simultaneous replies.
 ///
 /// Reconnects on failure with exponential backoff capped at 30s.
 async fn run_sse_bridge(zc: ZeroclawClient, _avatar_tx: broadcast::Sender<AvatarEvent>) {

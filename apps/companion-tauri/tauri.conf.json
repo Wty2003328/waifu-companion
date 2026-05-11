@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ZeroClaw Companion",
+  "productName": "Waifu Companion",
   "version": "0.1.0",
-  "identifier": "ai.zeroclaw.companion",
+  "identifier": "ai.waifu.companion",
   "build": {
     "frontendDist": "../../web/dist",
     "devUrl": "http://localhost:5173"
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "ZeroClaw Companion",
+        "title": "Waifu Companion",
         "width": 1100,
         "height": 760,
         "minWidth": 800,

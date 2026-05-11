@@ -1,34 +1,45 @@
-"""Reference TTS-port wrapper for the Asuna GPT-SoVITS v4 fine-tune.
+"""Reference TTS-port wrapper for GPT-SoVITS v4 zero-shot voice cloning.
 
-Speaks the model-agnostic ZeroClaw avatar TTS contract:
+Speaks the model-agnostic waifu-companion avatar TTS contract:
 
     POST /tts   {"text": "...", "language": "ja", "voice": "...", "speed": 1.0}
                 -> WAV bytes (with X-Sample-Rate / X-Channels / X-Format headers)
     GET  /health
                 -> 200 OK once the model is loaded
 
-Anyone can swap models by writing a similar wrapper that conforms to the
-same contract. Configure ZeroClaw with:
+Any TTS engine can plug in by writing a wrapper that conforms to the
+same contract. Configure the companion with:
 
     [avatar.tts]
-    engine          = "gpt-sovits-v4"
-    launch_command  = "python tools/avatar/asuna_tts_server.py"
-    port            = 9880
-    voice           = "asuna"
-    reference_audio = "<GPT-SoVITS root>/logs/asuna_combined/0_sliced/0003.wav"
-    reference_text  = "ここは私に任せて私を選んでくれる"
+    engine             = "gpt-sovits-v4"
+    launch_command     = "python tools/avatar/gptsovits_tts_server.py"
+    port               = 9880
+    voice              = "<your-voice-id>"
+    reference_audio    = "<GPT-SoVITS root>/logs/<voice>/0_sliced/<clip>.wav"
+    reference_text     = "<transcript of the reference clip>"
     reference_language = "ja"
-    language        = "ja"   # default speech language
-    auto_start      = true
-    gpu_device      = 0
+    language           = "ja"   # default speech language
+    auto_start         = true
+    gpu_device         = 0
 
-Env vars set by ZeroClaw (all optional — script has sane defaults):
-    TTS_PORT, TTS_VOICE, TTS_LANGUAGE,
-    TTS_REFERENCE_AUDIO, TTS_REFERENCE_TEXT, TTS_REFERENCE_LANG,
-    TTS_MODEL_PATH (= GPT-SoVITS root), CUDA_VISIBLE_DEVICES.
+Env vars (all optional — companion-server forwards these from
+`[avatar.tts]`):
+
+    TTS_PORT               server bind port (default 9880)
+    TTS_VOICE              voice id; also the default fine-tune name prefix
+    TTS_LANGUAGE           default speech language
+    TTS_REFERENCE_AUDIO    path to the reference clip (3-10 s)
+    TTS_REFERENCE_TEXT     transcript of the reference clip
+    TTS_REFERENCE_LANG     language of the reference clip
+    TTS_MODEL_PATH         GPT-SoVITS install root
+    TTS_LORA_NAME          fine-tune file-name prefix to load from
+                           SoVITS_weights_v4/ and GPT_weights_v3/.
+                           Defaults to `$TTS_VOICE` (if set) or the
+                           first checkpoint found in each directory.
+    CUDA_VISIBLE_DEVICES   GPU index; -1 for CPU
 
 Run standalone for testing:
-    python tools/avatar/asuna_tts_server.py
+    python tools/avatar/gptsovits_tts_server.py
 """
 
 import atexit
@@ -56,9 +67,9 @@ from pathlib import Path
 # bulk of fragmentation at the right time. Users who still observe
 # game stutter can re-enable by setting the env var explicitly.
 if os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING") == "1":
-    print("[asuna-tts] CUDA caching DISABLED (slower; explicit env var)")
+    print("[gpt-sovits-tts] CUDA caching DISABLED (slower; explicit env var)")
 else:
-    print("[asuna-tts] CUDA caching ON (default — ~2x faster inference)")
+    print("[gpt-sovits-tts] CUDA caching ON (default — ~2x faster inference)")
 
 # When companion-server spawns this script via Tauri's sidecar, the
 # parent's PATH does NOT include the conda env's Scripts/ dir, so
@@ -156,19 +167,19 @@ for pkg in ("averaged_perceptron_tagger_eng", "cmudict", "averaged_perceptron_ta
     except LookupError:
         nltk.download(pkg, quiet=True)
 
-print("[asuna-tts] Loading HuBERT...")
+print("[gpt-sovits-tts] Loading HuBERT...")
 from GPT_SoVITS.feature_extractor import cnhubert  # noqa: E402
 
 cnhubert.cnhubert_base_path = CNHUBERT_PATH
 hubert = cnhubert.get_model().half().to(DEVICE).eval()
 
-print("[asuna-tts] Loading BERT...")
+print("[gpt-sovits-tts] Loading BERT...")
 from transformers import AutoModelForMaskedLM, AutoTokenizer  # noqa: E402
 
 tokenizer = AutoTokenizer.from_pretrained(BERT_PATH)
 bert = AutoModelForMaskedLM.from_pretrained(BERT_PATH).half().to(DEVICE).eval()
 
-print("[asuna-tts] Loading SoVITS v4 (DiT + LoRA-merged)...")
+print("[gpt-sovits-tts] Loading SoVITS v4 (DiT + LoRA-merged)...")
 import GPT_SoVITS.utils as utils  # noqa: E402
 from GPT_SoVITS.module.models import Generator, SynthesizerTrnV3  # noqa: E402
 from GPT_SoVITS.module.mel_processing import (  # noqa: E402
@@ -197,21 +208,39 @@ lora_config = LoraConfig(
 )
 vits.cfm = get_peft_model(vits.cfm, lora_config)
 
+# Fine-tune name prefix for picking checkpoints from
+# SoVITS_weights_v4/ and GPT_weights_v3/. Convention from GPT-SoVITS
+# training: files named `<prefix>_e<epoch>_...pth` (SoVITS) and
+# `<prefix>-e<epoch>.ckpt` (GPT). Defaults to $TTS_VOICE if set;
+# otherwise picks whichever checkpoint the directory glob returns
+# first so an unconfigured user with a single fine-tune still works.
+_LORA_PREFIX = os.environ.get("TTS_LORA_NAME") or os.environ.get("TTS_VOICE") or ""
+
 sovits_dir = GPT_SOVITS_ROOT / "SoVITS_weights_v4"
-sovits_files = sorted(
-    sovits_dir.glob("asuna_combined*.pth"),
-    key=lambda p: int(p.stem.split("_e")[1].split("_")[0]),
-)
+sovits_pattern = f"{_LORA_PREFIX}*.pth" if _LORA_PREFIX else "*.pth"
+sovits_files = sorted(sovits_dir.glob(sovits_pattern))
+# Sort by epoch when the naming convention exposes one; otherwise lexical.
+try:
+    sovits_files = sorted(
+        sovits_files,
+        key=lambda p: int(p.stem.split("_e")[1].split("_")[0]),
+    )
+except (IndexError, ValueError):
+    pass
 if not sovits_files:
-    raise SystemExit(f"No Asuna SoVITS LoRA checkpoints found in {sovits_dir}")
+    raise SystemExit(
+        f"No SoVITS LoRA checkpoints matching '{sovits_pattern}' found in "
+        f"{sovits_dir}. Set TTS_LORA_NAME or place a fine-tune in "
+        f"SoVITS_weights_v4/."
+    )
 SOVITS_PATH = str(sovits_files[-1])
-print(f"[asuna-tts]   SoVITS ckpt: {Path(SOVITS_PATH).name}")
+print(f"[gpt-sovits-tts]   SoVITS ckpt: {Path(SOVITS_PATH).name}")
 ft_state = torch.load(SOVITS_PATH, map_location="cpu", weights_only=False)["weight"]
 vits.load_state_dict(ft_state, strict=False)
 vits.cfm = vits.cfm.merge_and_unload()
 vits = vits.half().to(DEVICE).eval()
 
-print("[asuna-tts] Loading 48kHz vocoder...")
+print("[gpt-sovits-tts] Loading 48kHz vocoder...")
 vocoder = Generator(
     initial_channel=100,
     resblock="1",
@@ -228,19 +257,25 @@ vocoder.remove_weight_norm()
 vocoder.load_state_dict(torch.load(VOCODER_PATH, map_location="cpu", weights_only=False))
 vocoder = vocoder.half().to(DEVICE).eval()
 
-print("[asuna-tts] Loading GPT (v3-base, fine-tuned)...")
+print("[gpt-sovits-tts] Loading GPT (v3-base, fine-tuned)...")
 from GPT_SoVITS.AR.models.t2s_lightning_module import (  # noqa: E402
     Text2SemanticLightningModule,
 )
 
-gpt_files = sorted(
-    (GPT_SOVITS_ROOT / "GPT_weights_v3").glob("asuna_combined-e*.ckpt"),
-    key=lambda p: int(p.stem.split("-e")[1]),
-)
+gpt_dir = GPT_SOVITS_ROOT / "GPT_weights_v3"
+gpt_pattern = f"{_LORA_PREFIX}-e*.ckpt" if _LORA_PREFIX else "*-e*.ckpt"
+gpt_files = list(gpt_dir.glob(gpt_pattern))
+try:
+    gpt_files = sorted(gpt_files, key=lambda p: int(p.stem.split("-e")[1]))
+except (IndexError, ValueError):
+    gpt_files = sorted(gpt_files)
 if not gpt_files:
-    raise SystemExit("No Asuna GPT checkpoints found")
+    raise SystemExit(
+        f"No GPT checkpoints matching '{gpt_pattern}' found in {gpt_dir}. "
+        f"Set TTS_LORA_NAME or place a fine-tune in GPT_weights_v3/."
+    )
 GPT_PATH = str(gpt_files[-1])
-print(f"[asuna-tts]   GPT ckpt: {Path(GPT_PATH).name}")
+print(f"[gpt-sovits-tts]   GPT ckpt: {Path(GPT_PATH).name}")
 s1config = {
     "data": {"max_sec": 54, "pad_val": 1024},
     "model": {
@@ -344,16 +379,21 @@ def _ref_mel(wav_path):
 # Reference cache.
 # ---------------------------------------------------------------------------
 
-REF_WAV = os.environ.get(
-    "TTS_REFERENCE_AUDIO",
-    str(GPT_SOVITS_ROOT / "logs" / "asuna_combined" / "0_sliced" / "0003.wav"),
-)
-REF_TEXT = os.environ.get("TTS_REFERENCE_TEXT", "ここは私に任せて私を選んでくれる")
+REF_WAV = os.environ.get("TTS_REFERENCE_AUDIO")
+REF_TEXT = os.environ.get("TTS_REFERENCE_TEXT")
 REF_LANG = os.environ.get("TTS_REFERENCE_LANG", "ja")
-DEFAULT_VOICE = os.environ.get("TTS_VOICE", "asuna")
+DEFAULT_VOICE = os.environ.get("TTS_VOICE", "default")
 DEFAULT_LANGUAGE = os.environ.get("TTS_LANGUAGE", "ja")
 
-print(f"[asuna-tts] Caching reference: {Path(REF_WAV).name} ({REF_LANG})")
+if not REF_WAV or not REF_TEXT:
+    raise SystemExit(
+        "GPT-SoVITS zero-shot needs a reference clip. Set TTS_REFERENCE_AUDIO "
+        "to a 3-10s WAV of the target voice and TTS_REFERENCE_TEXT to its "
+        "transcript (or configure [avatar.tts] reference_audio/reference_text "
+        "in companion.toml)."
+    )
+
+print(f"[gpt-sovits-tts] Caching reference: {Path(REF_WAV).name} ({REF_LANG})")
 ref_ssl = _ssl(REF_WAV)
 with torch.no_grad():
     ref_codes = vits.extract_latent(ref_ssl)
@@ -429,7 +469,7 @@ def synthesize(text: str, lang: str, top_k: int = 15, temperature: float = 1.0,
 
 
 # ---------------------------------------------------------------------------
-# HTTP server (ZeroClaw avatar TTS port contract).
+# HTTP server (waifu-companion avatar TTS port contract).
 # ---------------------------------------------------------------------------
 
 
@@ -442,7 +482,7 @@ class TtsRequest(BaseModel):
 
 SAMPLE_RATE = 48000
 
-app = FastAPI(title="asuna-tts (GPT-SoVITS v4)")
+app = FastAPI(title="gpt-sovits-tts")
 
 
 def _wav_bytes(audio_f32: np.ndarray, sr: int) -> bytes:
@@ -491,7 +531,7 @@ async def tts(req: TtsRequest):
     wav = _wav_bytes(audio, SAMPLE_RATE)
     duration = len(audio) / SAMPLE_RATE
     print(
-        f"[asuna-tts] /tts lang={req.language} chars={len(req.text)} "
+        f"[gpt-sovits-tts] /tts lang={req.language} chars={len(req.text)} "
         f"audio={duration:.2f}s wall={time.time() - t0:.2f}s"
     )
     return Response(
@@ -551,16 +591,16 @@ def shutdown_cleanup() -> None:
                 torch.cuda.reset_peak_memory_stats()
             except Exception:
                 pass
-        print("[asuna-tts] CUDA cleanup done; exiting cleanly")
+        print("[gpt-sovits-tts] CUDA cleanup done; exiting cleanly")
     except Exception as e:
-        print(f"[asuna-tts] cleanup error (continuing): {e}")
+        print(f"[gpt-sovits-tts] cleanup error (continuing): {e}")
 
 
 atexit.register(shutdown_cleanup)
 
 
 def _on_signal(sig, _frame):
-    print(f"[asuna-tts] received signal {sig}; cleaning up")
+    print(f"[gpt-sovits-tts] received signal {sig}; cleaning up")
     shutdown_cleanup()
     # _exit avoids the uvicorn-graceful-tcp-close stall.
     os._exit(0)
@@ -594,8 +634,8 @@ async def shutdown():
 
 if __name__ == "__main__":
     port = int(os.environ.get("TTS_PORT", "9880"))
-    print(f"[asuna-tts] serving on http://127.0.0.1:{port}")
-    print("[asuna-tts] PYTORCH_NO_CUDA_MEMORY_CACHING="
+    print(f"[gpt-sovits-tts] serving on http://127.0.0.1:{port}")
+    print("[gpt-sovits-tts] PYTORCH_NO_CUDA_MEMORY_CACHING="
           + os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", ""))
     try:
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")

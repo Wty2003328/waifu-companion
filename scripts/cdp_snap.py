@@ -29,7 +29,7 @@ def main():
     shot = call(ws, 4, "Page.captureScreenshot", {"format": "png"})
     data = shot.get("result", {}).get("data")
     if data:
-        out = "C:/Users/user/Desktop/workspace/zeroclaw-companion/scripts/_tauri_main.png"
+        out = "C:/Users/user/Desktop/workspace/waifu-companion/scripts/_tauri_main.png"
         open(out, "wb").write(base64.b64decode(data))
         print("screenshot:", out)
     ws.close()

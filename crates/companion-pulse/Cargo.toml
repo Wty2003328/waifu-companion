@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Pulse dashboard subsystem (collectors, scheduler, storage) for the zeroclaw companion."
+description = "Pulse dashboard subsystem (collectors, scheduler, storage) for waifu-companion."
 
 [dependencies]
 companion-core.workspace = true

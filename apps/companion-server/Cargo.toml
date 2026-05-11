@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "zeroclaw-companion server: serves the avatar/Pulse UI, drives TTS, bridges to the upstream zeroclaw daemon."
+description = "waifu-companion server: serves the avatar/Pulse UI, drives TTS, bridges to the upstream zeroclaw daemon."
 
 [[bin]]
 name = "companion-server"

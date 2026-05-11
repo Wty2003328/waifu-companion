@@ -36,7 +36,7 @@ export default function Home() {
       overscrollBehavior: 'contain',
     }}>
       <div style={{ padding: 28, maxWidth: 880, margin: '0 auto' }}>
-        <h1 style={{ marginTop: 0, marginBottom: 12, fontSize: 24 }}>zeroclaw companion</h1>
+        <h1 style={{ marginTop: 0, marginBottom: 12, fontSize: 24 }}>waifu-companion</h1>
         <SystemPanels />
         <div style={{ marginTop: 20 }}>
           <CharacterRoster />

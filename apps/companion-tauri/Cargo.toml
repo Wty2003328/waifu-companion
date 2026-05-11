@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-authors = ["zeroclaw-companion contributors"]
-description = "Tauri 2 desktop shell for the zeroclaw companion. Bundles companion-server as a sidecar."
+authors = ["waifu-companion contributors"]
+description = "Tauri 2 desktop shell for waifu-companion. Bundles companion-server as a sidecar."
 publish = false
 
 # This crate is intentionally NOT a member of the parent workspace

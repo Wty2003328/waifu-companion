@@ -1,4 +1,4 @@
-# zeroclaw-companion
+# waifu-companion
 
 > Desktop companion for self-hosted AI agents — Live2D avatar, voice
 > synthesis, multi-character roster, and an ambient information
@@ -8,7 +8,7 @@
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tauri 2](https://img.shields.io/badge/tauri-2.x-brightgreen.svg)](https://tauri.app/)
 
-`zeroclaw-companion` is a Tauri 2 desktop application that gives a
+`waifu-companion` is a Tauri 2 desktop application that gives a
 self-hosted AI agent a face, a voice, and a workspace. The agent runs
 wherever you want — this machine, a home server, a Raspberry Pi — and
 the companion talks to it over its public HTTP API. The companion
@@ -41,7 +41,7 @@ opening the main window.
 **Voice synthesis.** Any TTS engine that speaks a small wire contract
 (`POST /tts` + `GET /health`) works — GPT-SoVITS, Fish-Speech,
 MeloTTS, XTTS, F5-TTS, edge-tts. The reference wrapper at
-`tools/avatar/asuna_tts_server.py` is a GPT-SoVITS launcher. Audio
+`tools/avatar/gptsovits_tts_server.py` is a GPT-SoVITS launcher. Audio
 plays through native rodio (cpal → WASAPI multimedia on Windows) so
 the voice isn't subject to WebView2's communications-channel DSP.
 
@@ -102,8 +102,8 @@ by the companion — it's a separate daemon you manage.
 ## Quickstart
 
 ```bash
-git clone https://github.com/Wty2003328/zeroclaw-companion
-cd zeroclaw-companion
+git clone https://github.com/Wty2003328/waifu-companion
+cd waifu-companion
 
 cp companion.toml.example companion.toml
 $EDITOR companion.toml          # set agent URL, TTS engine, etc.
@@ -237,12 +237,12 @@ git clone https://github.com/RVC-Boss/GPT-SoVITS
 [avatar.tts]
 engine             = "gpt-sovits-v4"
 api_url            = "http://127.0.0.1:9880"
-launch_command     = "<conda-env>/python.exe tools/avatar/asuna_tts_server.py"
+launch_command     = "<conda-env>/python.exe tools/avatar/gptsovits_tts_server.py"
 auto_start         = true
 language           = "ja"
-voice              = "asuna"
+voice              = "<your-voice-id>"            # used as the LoRA-name prefix
 reference_audio    = "<GPT-SoVITS root>/logs/<voice>/0_sliced/0001.wav"
-reference_text     = "..."   # transcript of the reference clip
+reference_text     = "<exact transcript of the clip>"
 reference_language = "ja"
 model_path         = "<GPT-SoVITS root>"
 gpu_device         = 0
@@ -296,9 +296,9 @@ chat_language = "en"            # what the user types
 engine          = "gpt-sovits-v4"
 api_url         = "http://127.0.0.1:9880"
 language        = "ja"          # what the avatar speaks
-voice           = "asuna"
+voice           = "<your-voice-id>"
 auto_start      = true
-launch_command  = "python tools/avatar/asuna_tts_server.py"
+launch_command  = "python tools/avatar/gptsovits_tts_server.py"
 model_path      = "/path/to/GPT-SoVITS"
 gpu_device      = 0
 streaming       = true
@@ -309,8 +309,8 @@ use_zeroclaw_webhook  = true    # or false for a direct LLM call
 only_when_translating = true
 
 [avatar.model]
-model_dir          = "/live2d/models/asuna/model0.json"
-default_expression = "F_NOMAL"
+model_dir          = "/live2d/models/<your-model>/model.json"
+default_expression = "neutral"
 scale              = 0.2
 anchor             = "center"
 ```
@@ -321,13 +321,13 @@ character roster lives in `companion.characters.json`:
 
 ```json
 {
-  "active_id": "asuna",
+  "active_id": "default",
   "characters": [
     {
-      "id": "asuna",
-      "name": "Asuna",
-      "model_id": "asuna",
-      "system_prompt": "You are Yuuki Asuna from SAO. ..."
+      "id": "default",
+      "name": "<character name>",
+      "model_id": "<live2d model dir name>",
+      "system_prompt": "You are a warm, casual companion. Speak naturally..."
     }
   ]
 }
@@ -336,7 +336,7 @@ character roster lives in `companion.characters.json`:
 ## Project layout
 
 ```
-zeroclaw-companion/
+waifu-companion/
 ├── crates/
 │   ├── companion-core/     agent client, SSE bridge, LLM client, config
 │   ├── companion-avatar/   TTS port, subagent, lip sync, WS handler

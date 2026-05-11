@@ -7,8 +7,8 @@
  * That centroid is our "face is here" estimate. Crude — a real
  * face-landmark detector (MediaPipe / face-api.js) would be more
  * accurate — but: no ML model download, no CSP changes for CDN
- * fetches, ~70 lines of code. Good enough for "Asuna looks toward
- * me when I move."
+ * fetches, ~70 lines of code. Good enough for "the avatar looks
+ * toward me when I move."
  *
  * The caller starts tracking with `start(onFocus)` — we deliver a
  * normalized (x, y) in [-1, 1] each tick. Calling `stop()` releases

@@ -1,4 +1,4 @@
-//! Shared building blocks for the zeroclaw companion.
+//! Shared building blocks for waifu-companion.
 //!
 //! - [`zeroclaw`]: REST + SSE client for the upstream zeroclaw daemon
 //! - [`llm`]: OpenAI-compatible chat client (works with OpenAI, OpenRouter,

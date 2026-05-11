@@ -1,4 +1,4 @@
-//! Live2D anime avatar for the zeroclaw companion.
+//! Live2D anime avatar for waifu-companion.
 //!
 //! Architecture (port-style, model-agnostic TTS):
 //!

@@ -1,6 +1,6 @@
 //! Generic, model-agnostic TTS port.
 //!
-//! ZeroClaw speaks a single HTTP contract to any TTS server. The wire
+//! The companion speaks a single HTTP contract to any TTS server. The wire
 //! protocol is identical regardless of the backing model — GPT-SoVITS,
 //! Fish-Speech, MeloTTS, XTTS, F5-TTS, edge-tts, or anything else.
 //! Users plug in a new model by writing a thin Python (or Rust, Go, …)

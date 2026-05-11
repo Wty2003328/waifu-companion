@@ -1,4 +1,4 @@
-//! Pulse — personal intelligence dashboard for the zeroclaw companion.
+//! Pulse — personal intelligence dashboard for waifu-companion.
 //!
 //! Periodic collectors (RSS, HackerNews, …) push items into a SQLite-backed
 //! store. The companion-server exposes the feed at `/api/pulse/*`. The

@@ -768,7 +768,7 @@ function AvatarEditor({
               <PathPicker
                 value={ttsScript}
                 onChange={setTtsScript}
-                placeholder="tools/avatar/asuna_tts_server.py"
+                placeholder="tools/avatar/gptsovits_tts_server.py"
                 pick={async () => {
                   const path = await pickFile({
                     title: 'Pick the TTS server script',
