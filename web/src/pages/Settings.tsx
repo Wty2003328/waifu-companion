@@ -9,6 +9,90 @@ import {
 import { invalidateCache, useCachedJson } from '../lib/fetchCache';
 import { pickFile, pickFolder, listGpus, type DetectedGpu } from '../lib/tauriShell';
 
+// ── Design tokens ────────────────────────────────────────────────
+// Centralized so the Settings primitives below stay consistent and
+// the values can be tweaked once. Matches the rest of the dark UI.
+const tokens = {
+  // Surfaces
+  bgPage:    '#0b0d10',   // page background (set by index.html body)
+  bgPanel:   '#161a20',   // section background
+  bgPanelHi: '#1c2128',   // subtle inset panel (hint/info boxes)
+  bgInput:   '#0d1015',   // input background
+  // Lines + text
+  border:    '#262a31',   // panel borders + input borders
+  borderHi:  '#3a4150',   // hover/focused input border
+  text:      '#e6e9ef',   // primary body text
+  textMuted: '#9aa3b2',   // labels + secondary copy
+  textDim:   '#6b7280',   // hints + footnotes
+  // Status
+  primary:   '#3b82f6',   // primary action
+  primaryHi: '#4f8cff',   // primary hover
+  success:   '#10b981',
+  warn:      '#f59e0b',
+  danger:    '#ef4444',
+  // Geometry
+  radius:    8,
+  radiusSm:  6,
+} as const;
+
+/// One-time global stylesheet for the Settings surface. Lives here
+/// because inline styles can't reach `:hover` / `:focus-visible` and
+/// pseudo-classes are what separates "polished" UIs from "static" ones.
+/// Mounted by the page root; selectors are scoped under `.ws-settings`
+/// so nothing leaks to the rest of the app.
+function SettingsStyles() {
+  return (
+    <style>{`
+      .ws-settings input[type=text],
+      .ws-settings input[type=password],
+      .ws-settings input[type=number],
+      .ws-settings input[type=search],
+      .ws-settings select,
+      .ws-settings textarea {
+        transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+      }
+      .ws-settings input[type=text]:hover,
+      .ws-settings input[type=password]:hover,
+      .ws-settings input[type=number]:hover,
+      .ws-settings input[type=search]:hover,
+      .ws-settings select:hover,
+      .ws-settings textarea:hover {
+        border-color: ${tokens.borderHi};
+      }
+      .ws-settings input:focus-visible,
+      .ws-settings select:focus-visible,
+      .ws-settings textarea:focus-visible {
+        border-color: ${tokens.primary};
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.22);
+      }
+      .ws-settings .ws-btn {
+        transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 80ms ease;
+      }
+      .ws-settings .ws-btn:not(:disabled):hover {
+        border-color: ${tokens.borderHi};
+        color: ${tokens.text};
+      }
+      .ws-settings .ws-btn--primary:not(:disabled):hover {
+        background: ${tokens.primaryHi};
+      }
+      .ws-settings .ws-btn:not(:disabled):active {
+        transform: translateY(1px);
+      }
+      .ws-settings .ws-btn:focus-visible {
+        outline: 2px solid ${tokens.primary};
+        outline-offset: 2px;
+      }
+      .ws-settings code {
+        background: rgba(255,255,255,0.06);
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 11.5px;
+        color: ${tokens.text};
+      }
+    `}</style>
+  );
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
   if (typeof window === 'undefined') return null;
@@ -146,26 +230,33 @@ export default function Settings() {
   const isUsingDefaultUrl = !getStoredServerUrl();
 
   return (
-    <div style={{
-      flex: '1 1 0', minHeight: 0, overflow: 'auto',
-      contain: 'paint',
-      overscrollBehavior: 'contain',
-    }}>
-      <div style={{ padding: 32, maxWidth: 880, margin: '0 auto' }}>
-      <h1 style={{ marginTop: 0, fontSize: 24 }}>Settings</h1>
-      <p style={{ color: '#888', fontSize: 13, marginTop: -4 }}>
-        Most changes save instantly. A few (voice engine, language defaults)
-        only take effect after a quick app restart — the Save button will tell
-        you when that's needed.
-      </p>
+    <div
+      className="ws-settings"
+      style={{
+        flex: '1 1 0', minHeight: 0, overflow: 'auto',
+        contain: 'paint',
+        overscrollBehavior: 'contain',
+      }}
+    >
+      <SettingsStyles />
+      <div style={{ padding: '40px 32px', maxWidth: 880, margin: '0 auto' }}>
+      <header style={{ marginBottom: 24 }}>
+        <h1 style={{ margin: 0, fontSize: 28, fontWeight: 700, letterSpacing: '-0.01em', color: tokens.text }}>
+          Settings
+        </h1>
+        <p style={{ color: tokens.textMuted, fontSize: 13, margin: '6px 0 0 0', lineHeight: 1.55 }}>
+          Most changes save instantly. A few (voice engine, language defaults)
+          take effect after a quick app restart — the Save button will tell
+          you when that's needed.
+        </p>
+      </header>
 
       {error && <ErrorBox message={error} />}
 
-      <Section title="Server address">
-        <div style={{ color: '#888', fontSize: 12, marginBottom: 8, lineHeight: 1.5 }}>
-          Address this app uses to reach its background service. Leave blank
-          unless the service is on a different computer or port.
-        </div>
+      <Section
+        title="Server address"
+        description="Address this app uses to reach its background service. Leave blank unless the service is on a different computer or port."
+      >
         <Row>
           <input
             type="text"
@@ -500,15 +591,16 @@ function ZeroclawEditor({
 
   return (
     <>
-      <div style={{ fontSize: 12, color: '#888', marginBottom: 12, lineHeight: 1.5 }}>
-        Where the companion finds your main agent. It can be zeroclaw,
-        openclaw, or hermes-agent — pick the flavor below and point it
-        at the host running it (this machine, a home server, a Raspberry
-        Pi, another laptop on your LAN). The companion only sends chat
-        messages and shows replies; the agent never gets to touch the
-        computer the companion runs on.
-      </div>
-      <FieldRow label="Agent">
+      <p style={{
+        margin: '0 0 14px 0', fontSize: 12.5, color: tokens.textMuted, lineHeight: 1.55,
+      }}>
+        Where the companion finds your main agent. Pick the flavor and
+        point it at the host running it (this machine, a home server, a
+        Raspberry Pi, another laptop on your LAN). The companion only
+        sends chat messages and shows replies; the agent never gets to
+        touch the computer the companion runs on.
+      </p>
+      <FieldRow label="Agent" hint={spec.blurb}>
         <select
           value={kind}
           onChange={(e) => handleKindChange(e.target.value as typeof AGENT_KINDS[number]['id'])}
@@ -519,16 +611,13 @@ function ZeroclawEditor({
           ))}
         </select>
       </FieldRow>
-      <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
-        {spec.blurb}
-      </div>
       <FieldRow label="Gateway URL">
         <input
           type="text"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder={`http://192.168.1.50:${spec.port}  (or http://127.0.0.1:${spec.port} for local)`}
-          style={inputStyle}
+          style={monoInputStyle}
         />
       </FieldRow>
       <FieldRow label="Pairing token">
@@ -536,51 +625,57 @@ function ZeroclawEditor({
           type="password"
           value={token}
           onChange={(e) => setToken(e.target.value)}
-          placeholder={current.pair_token_set ? '••• set (paste to replace)' : 'optional — only if your zeroclaw requires one'}
-          style={inputStyle}
+          placeholder={current.pair_token_set ? '••• set (paste to replace)' : 'optional — only if your agent requires one'}
+          style={monoInputStyle}
           autoComplete="off"
         />
       </FieldRow>
-      <FieldRow label="Request timeout (s)">
+      <FieldRow
+        label="Request timeout (s)"
+        hint={
+          <>
+            Long enough for the agent's full tool-use loop (web searches,
+            browser, shell). 300s is a safe default; bump it if you see
+            "timed out" on complex requests.
+            <br />
+            For a LAN agent, make sure its gateway binds to{' '}
+            <code>0.0.0.0</code> (not <code>127.0.0.1</code>) so it's
+            reachable from this machine.
+          </>
+        }
+      >
         <input
           type="number" min={5} max={1800}
           value={timeout}
           onChange={(e) => setTimeout_(Math.max(5, Math.min(1800, parseInt(e.target.value, 10) || 300)))}
-          style={{ ...inputStyle, maxWidth: 100 }}
+          style={{ ...inputStyle, maxWidth: 110 }}
         />
       </FieldRow>
-      <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
-        Long enough for the agent's full tool-use loop (web searches,
-        browser, shell). 300s is a safe default; bump it if you see
-        "timed out" on complex requests.
-        <br />
-        For a LAN agent, make sure its gateway binds to{' '}
-        <code style={{ color: '#888' }}>0.0.0.0</code> (not{' '}
-        <code style={{ color: '#888' }}>127.0.0.1</code>) so it's
-        reachable from this machine.
-      </div>
-      <Row>
-        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12 }}>
-          {error && <Hint tone="warn">{error}</Hint>}
-          {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
-          {!error && !dirty && savedAt && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
-          {!error && !dirty && !savedAt && (
-            <Hint tone={current.reachable ? 'good' : 'warn'}>
-              {current.reachable
-                ? '● connected'
-                : `● not reachable — check the URL or start ${spec.id}`}
-            </Hint>
-          )}
-          {testResult === 'testing' && <Hint tone="muted">testing…</Hint>}
-          {testResult === 'ok' && <Hint tone="good">✓ reachable</Hint>}
-          {testResult === 'fail' && <Hint tone="warn">✗ no response</Hint>}
-        </div>
+      <EditorFooter
+        status={
+          <>
+            {error && <Hint tone="warn">{error}</Hint>}
+            {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+            {!error && !dirty && savedAt && <Hint tone="good">Saved — click <strong>Restart</strong> to apply.</Hint>}
+            {!error && !dirty && !savedAt && (
+              <Hint tone={current.reachable ? 'good' : 'warn'}>
+                {current.reachable
+                  ? '● connected'
+                  : `● not reachable — check the URL or start ${spec.id}`}
+              </Hint>
+            )}
+            {testResult === 'testing' && <Hint tone="muted">testing…</Hint>}
+            {testResult === 'ok' && <Hint tone="good">✓ reachable</Hint>}
+            {testResult === 'fail' && <Hint tone="warn">✗ no response</Hint>}
+          </>
+        }
+      >
         <Button onClick={testConnection} disabled={testResult === 'testing'}>Test connection</Button>
         <Button onClick={save} primary disabled={!dirty || saving}>
-          {saving ? 'saving…' : 'Save'}
+          {saving ? 'Saving…' : 'Save'}
         </Button>
         <Button onClick={restart}>Restart</Button>
-      </Row>
+      </EditorFooter>
     </>
   );
 }
@@ -945,21 +1040,24 @@ function AvatarEditor({
         </div>
       </AdvancedDisclosure>
 
-      <Row>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {error && <Hint tone="warn">{error}</Hint>}
-          {/* Order matters: a fresh dirty edit should switch from
-              "Saved" back to "unsaved changes". Without dirty taking
-              precedence, the green "Saved" hint stuck around forever
-              after the first save. */}
-          {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
-          {!error && !dirty && savedAt && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
-        </div>
+      <EditorFooter
+        status={
+          <>
+            {error && <Hint tone="warn">{error}</Hint>}
+            {/* Order matters: a fresh dirty edit should switch from
+                "Saved" back to "unsaved changes". Without dirty taking
+                precedence, the green "Saved" hint stuck around forever
+                after the first save. */}
+            {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+            {!error && !dirty && savedAt && <Hint tone="good">Saved — click <strong>Restart</strong> to apply.</Hint>}
+          </>
+        }
+      >
         <Button onClick={save} primary disabled={!dirty || saving}>
-          {saving ? 'saving…' : 'Save'}
+          {saving ? 'Saving…' : 'Save'}
         </Button>
         <Button onClick={restart}>Restart</Button>
-      </Row>
+      </EditorFooter>
     </>
   );
 }
@@ -1143,21 +1241,20 @@ function SubagentEditor({
         </div>
       </AdvancedDisclosure>
 
-      <Row>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {error && <Hint tone="warn">{error}</Hint>}
-          {/* Order matters: a fresh dirty edit should switch from
-              "Saved" back to "unsaved changes". Without dirty taking
-              precedence, the green "Saved" hint stuck around forever
-              after the first save. */}
-          {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
-          {!error && !dirty && savedAt && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
-        </div>
+      <EditorFooter
+        status={
+          <>
+            {error && <Hint tone="warn">{error}</Hint>}
+            {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+            {!error && !dirty && savedAt && <Hint tone="good">Saved — click <strong>Restart</strong> to apply.</Hint>}
+          </>
+        }
+      >
         <Button onClick={save} primary disabled={!dirty || saving}>
-          {saving ? 'saving…' : 'Save'}
+          {saving ? 'Saving…' : 'Save'}
         </Button>
         <Button onClick={restart}>Restart</Button>
-      </Row>
+      </EditorFooter>
 
       {backend === 'webhook' && !tomlHintDismissed && (
         <SubagentSpeedupHint onDismiss={onDismissHint} />
@@ -1175,18 +1272,21 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
       onClick={() => onChange(!checked)}
       role="switch"
       aria-checked={checked}
+      className="ws-btn"
       style={{
-        width: 36, height: 20,
-        background: checked ? '#3b82f6' : '#2a2d33',
-        borderRadius: 10, border: 'none', position: 'relative',
-        cursor: 'pointer', flexShrink: 0,
+        width: 38, height: 22,
+        background: checked ? tokens.primary : '#2a2f3a',
+        borderRadius: 11, border: 'none', position: 'relative',
+        cursor: 'pointer', flexShrink: 0, padding: 0,
         transition: 'background 120ms ease',
       }}
     >
       <span style={{
         position: 'absolute', top: 2, left: checked ? 18 : 2,
-        width: 16, height: 16, borderRadius: '50%',
-        background: '#fff', transition: 'left 120ms ease',
+        width: 18, height: 18, borderRadius: '50%',
+        background: '#fff',
+        boxShadow: '0 1px 2px rgba(0,0,0,0.3)',
+        transition: 'left 140ms cubic-bezier(0.4, 0, 0.2, 1)',
       }} />
     </button>
   );
@@ -1234,15 +1334,40 @@ function PathPicker({
   );
 }
 
-function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
+function FieldRow({
+  label, hint, children,
+}: {
+  label: string;
+  /** Optional secondary copy under the field. */
+  hint?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
     <div style={{
-      display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
-      padding: '8px 0', borderBottom: '1px solid #1f2227',
+      display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap',
+      padding: '12px 0',
+      borderBottom: `1px solid ${tokens.border}`,
     }}>
-      <span style={{ minWidth: 160, color: '#888', fontSize: 12 }}>{label}</span>
-      <div style={{ flex: '1 1 280px', minWidth: 220, display: 'flex', alignItems: 'center', gap: 8 }}>
-        {children}
+      <label style={{
+        minWidth: 168,
+        paddingTop: 9,                 // visually centers against the input
+        color: tokens.textMuted,
+        fontSize: 12.5,
+        fontWeight: 500,
+        letterSpacing: '0.005em',
+      }}>{label}</label>
+      <div style={{
+        flex: '1 1 280px', minWidth: 220,
+        display: 'flex', flexDirection: 'column', gap: 6,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {children}
+        </div>
+        {hint && (
+          <div style={{ fontSize: 11.5, color: tokens.textDim, lineHeight: 1.5 }}>
+            {hint}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1302,12 +1427,39 @@ function AdvancedDisclosure({
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({
+  title, description, children,
+}: {
+  title: string;
+  /** Optional one-liner under the section title. Sets context for the section's controls. */
+  description?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
     <section style={{
-      background: '#16181c', borderRadius: 10, padding: 20, marginTop: 16,
+      background: tokens.bgPanel,
+      border: `1px solid ${tokens.border}`,
+      borderRadius: tokens.radius,
+      padding: '20px 22px',
+      marginTop: 20,
     }}>
-      <h2 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 600 }}>{title}</h2>
+      <header style={{ marginBottom: description ? 14 : 12 }}>
+        <h2 style={{
+          margin: 0,
+          fontSize: 15.5,
+          fontWeight: 600,
+          color: tokens.text,
+          letterSpacing: '-0.005em',
+        }}>{title}</h2>
+        {description && (
+          <p style={{
+            margin: '4px 0 0 0',
+            fontSize: 12.5,
+            color: tokens.textMuted,
+            lineHeight: 1.55,
+          }}>{description}</p>
+        )}
+      </header>
       {children}
     </section>
   );
@@ -1317,6 +1469,32 @@ function Row({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 12 }}>
       {children}
+    </div>
+  );
+}
+
+/// Footer toolbar for an editor: status hints on the left, action
+/// buttons on the right, separator above. Use this in place of an
+/// ad-hoc `<Row>` to give every editor the same end-of-form rhythm.
+function EditorFooter({
+  status, children,
+}: {
+  status?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+      marginTop: 16,
+      paddingTop: 16,
+      borderTop: `1px solid ${tokens.border}`,
+    }}>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        {status}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {children}
+      </div>
     </div>
   );
 }
@@ -1343,42 +1521,70 @@ function ReadonlyRow({
 }
 
 function Hint({ tone, children }: { tone: 'muted' | 'good' | 'warn'; children: React.ReactNode }) {
-  const color = tone === 'good' ? '#10b981' : tone === 'warn' ? '#f59e0b' : '#666';
-  return <div style={{ fontSize: 11, color }}>{children}</div>;
+  const color =
+    tone === 'good' ? tokens.success :
+    tone === 'warn' ? tokens.warn :
+    tokens.textDim;
+  return (
+    <div style={{
+      fontSize: 12,
+      color,
+      lineHeight: 1.5,
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+    }}>
+      {children}
+    </div>
+  );
 }
 
 function ErrorBox({ message }: { message: string }) {
   return (
-    <div style={{
-      background: '#1f1316', color: '#fca5a5', padding: 12,
-      borderRadius: 8, marginTop: 16, fontSize: 13,
+    <div role="alert" style={{
+      background: 'rgba(239, 68, 68, 0.10)',
+      border: `1px solid rgba(239, 68, 68, 0.30)`,
+      color: '#fca5a5',
+      padding: '12px 14px',
+      borderRadius: tokens.radius,
+      marginTop: 16,
+      fontSize: 13,
+      lineHeight: 1.5,
     }}>
-      Failed to load config: {message}
+      <strong style={{ color: '#fecaca' }}>Failed to load config.</strong>{' '}
+      {message}
     </div>
   );
 }
 
 function Button({
-  children, onClick, primary, disabled,
+  children, onClick, primary, disabled, title,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   primary?: boolean;
   disabled?: boolean;
+  title?: string;
 }) {
+  const isPrimary = !!primary && !disabled;
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
+      title={title}
+      className={`ws-btn${isPrimary ? ' ws-btn--primary' : ''}`}
       style={{
         padding: '8px 14px',
-        background: primary && !disabled ? '#3b82f6' : 'transparent',
-        color: primary && !disabled ? '#fff' : '#888',
-        border: primary && !disabled ? 'none' : '1px solid #2a2d33',
-        borderRadius: 6, fontSize: 13,
+        background: isPrimary ? tokens.primary : 'transparent',
+        color: isPrimary ? '#fff' : tokens.textMuted,
+        border: `1px solid ${isPrimary ? tokens.primary : tokens.border}`,
+        borderRadius: tokens.radiusSm,
+        fontSize: 12.5,
+        fontWeight: 500,
         cursor: disabled ? 'not-allowed' : 'pointer',
-        opacity: disabled ? 0.4 : 1,
+        opacity: disabled ? 0.45 : 1,
+        minHeight: 34,
       }}
     >
       {children}
@@ -1386,9 +1592,26 @@ function Button({
   );
 }
 
+/// Default style for plain text/number inputs and selects. Use
+/// `monoInputStyle` for path/URL/code fields where monospace is
+/// actually helpful — most text inputs read better in the system font.
 const inputStyle: React.CSSProperties = {
   flex: '1 1 280px', minWidth: 220,
-  background: '#0b0d10', color: '#fff',
-  padding: '8px 12px', borderRadius: 6, border: '1px solid #2a2d33',
-  fontSize: 13, fontFamily: 'monospace', outline: 'none',
+  background: tokens.bgInput,
+  color: tokens.text,
+  padding: '9px 12px',
+  borderRadius: tokens.radiusSm,
+  border: `1px solid ${tokens.border}`,
+  fontSize: 13,
+  fontFamily: 'inherit',
+  outline: 'none',
+};
+
+/// Monospace variant for paths, URLs, tokens, and code-shaped values
+/// where character alignment is the point. Inherits everything else
+/// from `inputStyle`.
+const monoInputStyle: React.CSSProperties = {
+  ...inputStyle,
+  fontFamily: 'ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace',
+  fontSize: 12.5,
 };
