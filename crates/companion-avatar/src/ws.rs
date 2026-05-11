@@ -777,7 +777,7 @@ async fn run_streaming_speak(
     let translation_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let buf_clone = translation_buf.clone();
     let tx_clone = tx.clone();
-    let _full = subagent
+    let full = subagent
         .translate_stream(&subtitle_text, tts_lang, move |delta| {
             let mut buf = buf_clone.lock().unwrap();
             buf.push_str(delta);
@@ -797,6 +797,24 @@ async fn run_streaming_speak(
     }
     drop(tx);
     let _ = dispatcher.await;
+
+    // The early Debug frame above was sent with an empty `spoken_text`
+    // because streaming hadn't produced the translation yet. Now that
+    // it has, re-emit Debug with the full spoken-language text so the
+    // chat-bubble "details" panel reflects what was actually voiced.
+    // translate_stream returns Some(full_translation) on success, None
+    // when it couldn't stream (and fell back to chunk-translate, or
+    // failed outright). On None we leave spoken_text blank — the panel
+    // just stays empty rather than lying.
+    let spoken_full = full.as_deref().map(|s| s.trim().to_string()).unwrap_or_default();
+    if !spoken_full.is_empty() {
+        bcast(AvatarNotification::Debug {
+            chat_text: subtitle_text.clone(),
+            spoken_text: spoken_full,
+            expression: keyword_expr.name.clone(),
+            subagent_used: true,
+        });
+    }
 
     bcast(AvatarNotification::Idle);
     Ok(subtitle_text)
