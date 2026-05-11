@@ -49,7 +49,14 @@ use crate::config::AvatarTtsConfig;
 const TTS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Maximum time to wait for TTS server to become healthy after start.
-const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// Cold-start budget for the spawned TTS subprocess. GPT-SoVITS v4 with
+// LoRA-merged weights loads in ~30 s on a warm cache + RTX 30/50-class
+// GPU, but the first run on a fresh checkout downloads NLTK corpora,
+// instantiates BERT + HuBERT + vocoder, and JIT-compiles cuDNN kernels.
+// 240 s leaves headroom without making "real" failures take forever
+// to surface; the watchdog continues to monitor `/health` after this
+// budget expires.
+const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Interval between health check polls during startup.
 const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -196,16 +203,47 @@ impl AnimeTtsManager {
             cmd.env("TTS_VOICE", voice);
         }
 
-        let child = cmd
+        // Capture the child's stdout + stderr and pipe each line into
+        // our tracing log with an `[engine-stderr]` prefix. Without
+        // this, the previous behaviour was to inherit the parent's
+        // stdio — which Tauri's sidecar discards, making Python
+        // crashes invisible. (Last bug: spawn returned success, the
+        // wrapper aborted on an import, and we waited 120 s for a
+        // process that had been dead the whole time.)
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
             .spawn()
             .context("Failed to spawn TTS server subprocess")?;
+        let engine_name = self.engine.clone();
+        if let Some(stdout) = child.stdout.take() {
+            let label = engine_name.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::info!("[{label}-stdout] {line}");
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let label = engine_name.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::info!("[{label}-stderr] {line}");
+                }
+            });
+        }
         *child_guard = Some(child);
         drop(child_guard);
 
         tracing::info!(
-            "avatar: started engine={} TTS server on port {}",
+            "avatar: spawned engine={} TTS subprocess on port {} (waiting for /health up to {}s)",
             self.engine,
             self.port,
+            HEALTH_CHECK_TIMEOUT.as_secs(),
         );
         self.wait_for_health().await?;
         Ok(())

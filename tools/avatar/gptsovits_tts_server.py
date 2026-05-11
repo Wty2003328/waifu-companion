@@ -52,6 +52,18 @@ import time
 import wave
 from pathlib import Path
 
+# When companion-server pipes our stdout/stderr, those streams open in
+# Windows's default cp1252 instead of utf-8. Any em-dash in a log line
+# (the wrapper prints a few) then raises `UnicodeEncodeError` inside
+# Python's logging handler and the access log goes silent. Reconfigure
+# both streams to utf-8 with `replace` errors so the wrapper never
+# crashes its own logger.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Whether to disable PyTorch's CUDA caching allocator. When enabled,
 # every tensor `del` returns memory to the driver immediately instead
 # of into PyTorch's per-process pool — preventing VRAM fragmentation
@@ -217,8 +229,17 @@ vits.cfm = get_peft_model(vits.cfm, lora_config)
 _LORA_PREFIX = os.environ.get("TTS_LORA_NAME") or os.environ.get("TTS_VOICE") or ""
 
 sovits_dir = GPT_SOVITS_ROOT / "SoVITS_weights_v4"
-sovits_pattern = f"{_LORA_PREFIX}*.pth" if _LORA_PREFIX else "*.pth"
-sovits_files = sorted(sovits_dir.glob(sovits_pattern))
+# Same forgiving pattern as the GPT side: prefer prefix-matched files,
+# then fall through to "any .pth in the directory".
+_sovits_patterns = ([f"{_LORA_PREFIX}*.pth"] if _LORA_PREFIX else []) + ["*.pth"]
+sovits_files: list = []
+sovits_pattern = "*.pth"
+for _pat in _sovits_patterns:
+    hits = list(sovits_dir.glob(_pat))
+    if hits:
+        sovits_pattern = _pat
+        sovits_files = hits
+        break
 # Sort by epoch when the naming convention exposes one; otherwise lexical.
 try:
     sovits_files = sorted(
@@ -263,8 +284,24 @@ from GPT_SoVITS.AR.models.t2s_lightning_module import (  # noqa: E402
 )
 
 gpt_dir = GPT_SOVITS_ROOT / "GPT_weights_v3"
-gpt_pattern = f"{_LORA_PREFIX}-e*.ckpt" if _LORA_PREFIX else "*-e*.ckpt"
-gpt_files = list(gpt_dir.glob(gpt_pattern))
+# GPT-SoVITS' training script names the file with a free-form prefix
+# followed by `-e<epoch>.ckpt`. The user-supplied `TTS_LORA_NAME` (or
+# `TTS_VOICE`) may be the full prefix (`asuna_combined`) or a shorter
+# nickname (`asuna`). Try the strict form first; if that finds nothing,
+# fall back to `<prefix>*-e*.ckpt` which tolerates suffixed prefixes.
+def _find_gpt_ckpts(prefix: str):
+    patterns = []
+    if prefix:
+        patterns.append(f"{prefix}-e*.ckpt")
+        patterns.append(f"{prefix}*-e*.ckpt")  # tolerate suffixed prefixes
+    patterns.append("*-e*.ckpt")               # last-resort: any LoRA in dir
+    for pat in patterns:
+        hits = list(gpt_dir.glob(pat))
+        if hits:
+            return pat, hits
+    return patterns[-1], []
+
+gpt_pattern, gpt_files = _find_gpt_ckpts(_LORA_PREFIX)
 try:
     gpt_files = sorted(gpt_files, key=lambda p: int(p.stem.split("-e")[1]))
 except (IndexError, ValueError):
