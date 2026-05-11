@@ -18,6 +18,7 @@ import Home from './pages/Home';
 import Avatar from './pages/Avatar';
 import Pulse from './pages/Pulse';
 import Settings from './pages/Settings';
+import ServiceToasts from './components/ServiceToasts';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
@@ -45,6 +46,7 @@ export default function App() {
       <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
         {!IS_OVERLAY_WINDOW && <Nav />}
         {!IS_OVERLAY_WINDOW && <ZeroclawHealthBanner />}
+        {!IS_OVERLAY_WINDOW && <ServiceToasts />}
         {/* Pages set their own scroll container. The wrapper here uses
             `flex: 1 1 0` + `minHeight: 0` so the child can compute its
             `height: 100%` against a definite cross-size — without

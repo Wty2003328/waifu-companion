@@ -131,7 +131,7 @@ use tokio::sync::broadcast;
 use crate::config::AvatarConfig;
 use crate::expression::ExpressionMapper;
 use crate::protocol::{AvatarMessage, AvatarNotification};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use crate::subagent::AvatarSubagent;
 use crate::tts_server::AnimeTtsManager;
@@ -159,16 +159,24 @@ pub enum AvatarEvent {
 
 /// Shared state for the avatar WebSocket route.
 ///
-/// `subagent` lives behind an [`ArcSwapOption`] so the settings UI can
-/// rebuild it at runtime (new backend / API key / model / base URL)
-/// without a process restart. Read path is lock-free: each call site
-/// `.load()`s a snapshot for the duration of one turn, so a swap that
-/// lands mid-turn doesn't tear state.
+/// Three fields are swappable at runtime so settings changes apply
+/// without a process restart:
+///
+/// - `config` ([`ArcSwap<AvatarConfig>`]) — chat / TTS language, speed,
+///   voice, subagent toggles, expression mappings.
+/// - `subagent` ([`ArcSwapOption<AvatarSubagent>`]) — backend, key, model.
+/// - `tts` ([`ArcSwap<AnimeTtsManager>`]) — engine, launch command, model
+///   path, reference clip, GPU device. The hot-swap performs the
+///   graceful `stop_server()` → `start_server()` dance so the previous
+///   TTS child process exits cleanly (CUDA `empty_cache()` + sync).
+///
+/// Read path is lock-free: each call site `.load_full()`s a snapshot at
+/// the top of a turn so a swap that lands mid-turn doesn't tear state.
 pub struct AvatarWsState {
-    pub config: AvatarConfig,
+    pub config: ArcSwap<AvatarConfig>,
     pub event_tx: broadcast::Sender<AvatarEvent>,
     pub subagent: ArcSwapOption<AvatarSubagent>,
-    pub tts: Arc<AnimeTtsManager>,
+    pub tts: ArcSwap<AnimeTtsManager>,
 }
 
 /// Axum handler for `GET /ws/avatar`.
@@ -192,17 +200,18 @@ async fn handle_avatar_socket(mut socket: WebSocket, state: Arc<AvatarWsState>) 
     // Default model URL lives under `/live2d/`, NOT `/avatar/`, to avoid
     // colliding with the React Router route `/avatar`. The frontend
     // serves these files from web/public/live2d/.
+    let cfg_snap = state.config.load();
     let model_info = AvatarNotification::ModelInfo {
-        model_url: state
-            .config
+        model_url: cfg_snap
             .model
             .model_dir
             .clone()
             .unwrap_or_else(|| "/live2d/models/haru/Haru.model3.json".to_string()),
-        scale: state.config.model.scale,
-        anchor: state.config.model.anchor.clone(),
-        default_expression: state.config.model.default_expression.clone(),
+        scale: cfg_snap.model.scale,
+        anchor: cfg_snap.model.anchor.clone(),
+        default_expression: cfg_snap.model.default_expression.clone(),
     };
+    drop(cfg_snap);
     if send_notification(&mut socket, &model_info).await.is_err() {
         return;
     }
@@ -261,33 +270,35 @@ async fn handle_avatar_socket(mut socket: WebSocket, state: Arc<AvatarWsState>) 
 /// Returns the chat-language reply text on success so the caller can
 /// echo it (e.g. as the synchronous /api/chat response body).
 pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<String> {
-    let chat_lang = state.config.chat_language.clone();
-    let tts_lang = state.config.tts.language.clone();
-    let expression_mapper = ExpressionMapper::new(&state.config.expressions);
+    // Snapshot the three hot-swappable handles for the duration of this
+    // turn. Once captured, the rest of the function can read freely
+    // even if the user flips settings mid-call — the in-flight turn
+    // keeps using the snapshot, the next call picks up the new state.
+    let cfg = state.config.load_full();
+    let tts = state.tts.load_full();
+    let subagent_snap = state.subagent.load_full();
+
+    let chat_lang = cfg.chat_language.clone();
+    let tts_lang = cfg.tts.language.clone();
+    let expression_mapper = ExpressionMapper::new(&cfg.expressions);
 
     let keyword_expr = expression_mapper.detect(text);
     let mut motion_to_send: Option<AvatarNotification> = None;
     let mut subagent_used = false;
-
-    // Snapshot the current subagent for the duration of this turn.
-    // If the user changes subagent config mid-turn via Settings, the
-    // running turn keeps using the old client; the next turn picks up
-    // the new one. Lock-free read, cheap to clone the Arc.
-    let subagent_snap = state.subagent.load_full();
 
     // Skip subagent when chat == tts language and the user opted into
     // the fast-path: the "translation" would be a no-op and keyword
     // detection picks a sensible expression. Saves ~5–10s per turn.
     let need_translation = chat_lang != tts_lang;
     let should_run_subagent = subagent_snap.is_some()
-        && (need_translation || !state.config.subagent.only_when_translating);
+        && (need_translation || !cfg.subagent.only_when_translating);
 
     // Streaming branch: when enabled + the backend supports it, take
     // a different path that fires TTS per sentence as the LLM streams
     // tokens. Skips the bulk JSON analyze() (saves 15-25s on long
     // replies); uses keyword-based expression detection.
     let streaming_eligible = should_run_subagent
-        && state.config.subagent.streaming
+        && cfg.subagent.streaming
         && need_translation
         && subagent_snap.as_ref().map(|s| s.supports_streaming()).unwrap_or(false);
     if streaming_eligible {
@@ -467,10 +478,10 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let turn_id = uuid::Uuid::new_v4().to_string();
     let chunks: Vec<String> = if tts_chunks.len() > 1 {
         tts_chunks
-    } else if state.config.tts.streaming {
+    } else if cfg.tts.streaming {
         let parts = crate::config::split_sentences(
             &tts_text,
-            state.config.tts.streaming_min_chars,
+            cfg.tts.streaming_min_chars,
         );
         if parts.is_empty() { vec![tts_text.clone()] } else { parts }
     } else {
@@ -479,7 +490,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let total = chunks.len();
     tracing::info!(
         "avatar: tts streaming={} chunks={} turn_id={}",
-        state.config.tts.streaming,
+        cfg.tts.streaming,
         total,
         turn_id,
     );
@@ -491,7 +502,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             i + 1, total, chunk.chars().count(),
             safe_prefix(chunk, 120)
         );
-        match state.tts.synthesize_with(chunk, &tts_lang).await {
+        match tts.synthesize_with(chunk, &tts_lang).await {
             Ok(audio) => {
                 use base64::Engine;
                 let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
@@ -642,7 +653,7 @@ async fn run_streaming_speak(
     let raw_subtitle = expression_mapper.strip_tags(text);
     let subtitle_text = raw_subtitle.clone();
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let min_len = state.config.tts.streaming_min_chars;
+    let min_len = state.config.load().tts.streaming_min_chars;
 
     // Send initial frames: expression + subtitle text + debug. The
     // chat bubble shows immediately; audio follows as TTS produces it.
@@ -705,7 +716,10 @@ async fn run_streaming_speak(
                 cleaned.chars().count(),
                 safe_prefix(&cleaned, 100),
             );
-            match dispatcher_state.tts.synthesize_with(&cleaned, &dispatcher_lang).await {
+            // Resnap the TTS each chunk so a hot-swap mid-stream picks
+            // up the new manager on the next sentence. Cheap (Arc clone).
+            let tts_snap = dispatcher_state.tts.load_full();
+            match tts_snap.synthesize_with(&cleaned, &dispatcher_lang).await {
                 Ok(audio) => {
                     use base64::Engine;
                     let audio_b64 = base64::engine::general_purpose::STANDARD

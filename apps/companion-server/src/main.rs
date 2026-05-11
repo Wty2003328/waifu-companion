@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
     let pulse_state = build_pulse(&cfg, pulse_summarizer).await?;
 
     // ── 5. Build the axum app ─────────────────────────────────────
+    let health = std::sync::Arc::new(state::AppHealth::default());
     let app_state = AppState {
         avatar: avatar_state,
         pulse: pulse_state,
@@ -84,7 +85,20 @@ async fn main() -> Result<()> {
         // client mid-process — no restart required for agent changes.
         zeroclaw: Arc::new(ArcSwap::from_pointee(zc)),
         config_path: config_path.clone(),
+        health: health.clone(),
     };
+
+    // ── Health watchdog ───────────────────────────────────────────
+    // Probes the agent, TTS, and subagent every 10s on a background
+    // task and writes results into AppHealth. /api/status reads from
+    // there without re-issuing the network calls itself, so the UI
+    // refresh rate is decoupled from probe latency.
+    {
+        let watch_state = app_state.clone();
+        tokio::spawn(async move {
+            run_health_watchdog(watch_state).await;
+        });
+    }
 
     // Shutdown channel: GET /api/shutdown sends () through this so
     // the main loop knows to wind down (graceful TTS stop, then exit).
@@ -231,7 +245,8 @@ async fn main() -> Result<()> {
     // leaks fragmented VRAM into whatever graphics workload runs next.
     if let Some(avatar) = avatar_for_shutdown {
         tracing::info!("companion: stopping TTS server before exit");
-        if let Err(e) = avatar.tts.stop_server().await {
+        let tts_snap = avatar.tts.load_full();
+        if let Err(e) = tts_snap.stop_server().await {
             tracing::warn!("companion: TTS stop_server returned {e}");
         }
     }
@@ -354,12 +369,11 @@ async fn build_avatar(
     );
 
     Ok(Some(Arc::new(AvatarWsState {
-        config: avatar_cfg,
+        // All three handles wrapped for runtime hot-swap.
+        config: arc_swap::ArcSwap::from_pointee(avatar_cfg),
         event_tx,
-        // ArcSwapOption: starts with whatever the config produced;
-        // hot-swappable via POST /api/config/subagent without restart.
         subagent: arc_swap::ArcSwapOption::from(subagent),
-        tts,
+        tts: arc_swap::ArcSwap::new(tts),
     })))
 }
 
@@ -507,14 +521,105 @@ async fn handle_health() -> &'static str {
 async fn handle_status(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::Json<serde_json::Value> {
-    let zc = state.zeroclaw.load_full();
-    let zc_up = zc.health().await.unwrap_or(false);
+    use std::sync::atomic::Ordering;
+
+    // Read the watchdog's most-recent observations. We deliberately
+    // do NOT re-probe inline here so /api/status responds instantly
+    // even when the agent / TTS are unreachable; the dots stay
+    // accurate within the 10s watchdog cadence.
+    let h = &state.health;
+    let agent_up = h.agent_up.load(Ordering::Relaxed);
+    let tts_up = h.tts_up.load(Ordering::Relaxed);
+    let subagent_up = h.subagent_up.load(Ordering::Relaxed);
+    let agent_err = h.agent_last_error.lock().unwrap().clone();
+    let tts_err = h.tts_last_error.lock().unwrap().clone();
+    let subagent_err = h.subagent_last_error.lock().unwrap().clone();
+    let last_probe_secs = h
+        .last_probe
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs());
+
     axum::Json(serde_json::json!({
         "ok": true,
-        "zeroclaw_up": zc_up,
+        // Back-compat key name expected by the existing health banner +
+        // Home status dot — same meaning as agent_up.
+        "zeroclaw_up": agent_up,
+        "agent_up": agent_up,
+        "agent_last_error": agent_err,
+        "tts_up": tts_up,
+        "tts_last_error": tts_err,
+        "subagent_up": subagent_up,
+        "subagent_last_error": subagent_err,
         "avatar_enabled": state.avatar.is_some(),
         "pulse_enabled": state.pulse.is_some(),
+        "last_probe_secs_ago": last_probe_secs,
     }))
+}
+
+/// Background loop: probe the agent, TTS, and subagent every ~10 s
+/// and stash results in [`AppHealth`]. Failures don't propagate — a
+/// down service is the expected case at boot before the user has
+/// configured one, and the watchdog needs to keep running so the UI
+/// can recover automatically when things come back.
+async fn run_health_watchdog(state: AppState) {
+    // First probe quickly so the UI gets accurate dots within ~2 s of
+    // boot, then settle into a 10 s cadence. 10 s is short enough to
+    // catch a TTS crash before the user notices but long enough that
+    // a flaky agent doesn't burn the network.
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    loop {
+        // ── Agent ────────────────────────────────────────────────
+        let zc = state.zeroclaw.load_full();
+        match zc.health().await {
+            Ok(true) => state.health.set_agent(true, None),
+            Ok(false) => state
+                .health
+                .set_agent(false, Some(format!("{}/health returned non-2xx", zc.base_url()))),
+            Err(e) => state.health.set_agent(false, Some(format!("{e}"))),
+        }
+
+        // ── TTS ──────────────────────────────────────────────────
+        if let Some(ref av) = state.avatar {
+            let tts = av.tts.load_full();
+            match tts.health_check().await {
+                Ok(true) => state.health.set_tts(true, None),
+                Ok(false) => state
+                    .health
+                    .set_tts(false, Some(format!("{} /health returned non-2xx", tts.engine()))),
+                Err(e) => state.health.set_tts(false, Some(format!("{e}"))),
+            }
+        } else {
+            // Avatar subsystem disabled in config — neither up nor a
+            // failure. Use a neutral "off" state by clearing errors
+            // and reporting up=false (UI shows it as "off in config",
+            // not red).
+            state.health.set_tts(false, None);
+        }
+
+        // ── Subagent ─────────────────────────────────────────────
+        if let Some(ref av) = state.avatar {
+            // We can't ping the LLM endpoint cheaply (no /health), so
+            // "up" here means "a subagent client is configured". A
+            // user-visible LLM failure shows up via the analyze() error
+            // path which writes to the same field.
+            let sub = av.subagent.load_full();
+            if sub.is_some() {
+                state.health.set_subagent(true, None);
+            } else {
+                state.health.set_subagent(false, None);
+            }
+        } else {
+            state.health.set_subagent(false, None);
+        }
+
+        state.health.mark_swept();
+        tick.tick().await;
+    }
 }
 
 /// Read-only snapshot of the loaded companion configuration so the
@@ -538,7 +643,7 @@ async fn handle_get_config(
         let cfg: AvatarConfig = disk_cfg
             .as_ref()
             .and_then(|d| serde_json::from_value(d.avatar.clone()).ok())
-            .unwrap_or_else(|| state.avatar.as_ref().unwrap().config.clone());
+            .unwrap_or_else(|| (*state.avatar.as_ref().unwrap().config.load_full()).clone());
         serde_json::json!({
             "enabled": cfg.enabled,
             "chat_language": cfg.chat_language,
@@ -1007,15 +1112,27 @@ struct AvatarOverrideRequest {
     subagent_streaming: Option<bool>,
 }
 
-/// Persist user-flippable avatar settings to companion.runtime.json.
-/// Same restart-required semantics as the subagent endpoint — the
-/// avatar config is built once at startup and we don't currently
-/// support hot-swapping (TTS launches a child process keyed off a
-/// snapshot of the config). Settings UI shows a "Restart" button.
+/// Persist user-flippable avatar settings to companion.runtime.json
+/// **and** hot-swap the live `AvatarConfig` (and the TTS child process
+/// when the swap touches engine / launch_command / model_path /
+/// reference clip / gpu_device).
+///
+/// AvatarWsState now holds config inside an `ArcSwap`, so simple knobs
+/// (chat / tts language, speed, voice, subagent flags) become visible
+/// to the next turn the moment we `store()` the new Arc. Process-level
+/// changes go through `swap_tts_process` below: gracefully `stop_server`
+/// the current TTS, rebuild the `AnimeTtsManager` from the new config,
+/// `start_server`, then publish via `ArcSwap`.
+///
+/// Fail-open semantics on the TTS restart: if `start_server` returns
+/// an error, we keep the previous manager in place and surface the
+/// error to the UI so the user can edit + retry. The override file is
+/// always persisted regardless — the user's intent is captured even
+/// when the immediate apply fails.
 async fn handle_post_avatar_override(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::Json(req): axum::Json<AvatarOverrideRequest>,
-) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+) -> axum::response::Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     use companion_core::{RuntimeOverride, runtime_override_path};
 
     let path = runtime_override_path(&state.config_path);
@@ -1031,6 +1148,17 @@ async fn handle_post_avatar_override(
     } else {
         RuntimeOverride::default()
     };
+
+    // Whether anything that affects the TTS child process changed. If
+    // not, we can skip the stop/start dance entirely — most edits are
+    // language/speed/voice and shouldn't churn the GPU.
+    let tts_process_affected = req.tts_engine.is_some()
+        || req.tts_launch_command.is_some()
+        || req.tts_reference_audio.is_some()
+        || req.tts_reference_text.is_some()
+        || req.tts_reference_language.is_some()
+        || req.tts_model_path.is_some()
+        || req.tts_gpu_device.is_some();
 
     let mut av = over.avatar.unwrap_or_default();
     if let Some(v) = req.enabled { av.enabled = Some(v); }
@@ -1089,11 +1217,120 @@ async fn handle_post_avatar_override(
             format!("write {}: {e}", path.display()),
         )
     })?;
+
+    // Hot-swap the live avatar config (always synchronous). The TTS
+    // child-process swap, when needed, runs on a background task so
+    // the HTTP response returns immediately even if the new TTS takes
+    // a long time to start (model load + GPU warmup easily exceeds
+    // typical HTTP timeouts). The watchdog will update tts_up within
+    // ~10 s of the swap completing.
+    let mut applied = false;
+    let mut tts_restart_pending = false;
+    let mut build_error: Option<String> = None;
+    if let Some(ref avatar_state) = state.avatar {
+        let new_cfg = CompanionConfig::load(&state.config_path).map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reload config: {e}"),
+            )
+        })?;
+        let new_avatar_cfg: AvatarConfig = serde_json::from_value(new_cfg.avatar.clone())
+            .unwrap_or_default();
+
+        // 1. Publish the new config first. Subagent / language / speed
+        //    / streaming changes are now live for the next turn.
+        avatar_state
+            .config
+            .store(std::sync::Arc::new(new_avatar_cfg.clone()));
+        applied = true;
+
+        // 2. If TTS process-affecting fields changed, swap the manager
+        //    asynchronously. Construction is sync + cheap; the
+        //    stop/start cycle goes onto a tokio task that updates
+        //    AvatarWsState.tts when done.
+        if tts_process_affected {
+            match AnimeTtsManager::new(&new_avatar_cfg.tts) {
+                Ok(new_mgr) => {
+                    let new_mgr = std::sync::Arc::new(new_mgr);
+                    let avatar_clone = std::sync::Arc::clone(avatar_state);
+                    let health = state.health.clone();
+                    let auto_start = new_avatar_cfg.tts.auto_start;
+                    // Mark the watchdog's `tts_last_error` so the UI
+                    // gets an immediate "restart in progress" hint;
+                    // the watchdog will clear it on the next probe if
+                    // the new TTS comes up successfully.
+                    health.set_tts(false, Some("TTS restart in progress…".into()));
+                    tokio::spawn(async move {
+                        // 1) Graceful shutdown of the old TTS (CUDA
+                        //    empty_cache + sync inside the Python
+                        //    wrapper). Bounded at the wrapper's
+                        //    /shutdown timeout (~8 s) plus our retry
+                        //    delay.
+                        let old_mgr = avatar_clone.tts.load_full();
+                        if let Err(e) = old_mgr.stop_server().await {
+                            tracing::warn!(
+                                "companion: previous TTS stop_server returned {e} (continuing)"
+                            );
+                        }
+                        // 2) Publish the new manager handle first so
+                        //    even if start_server takes a while the
+                        //    rest of the app already knows about it
+                        //    (the watchdog can probe its /health url).
+                        avatar_clone.tts.store(new_mgr.clone());
+                        // 3) Start it.
+                        if auto_start {
+                            match new_mgr.start_server().await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "companion: TTS hot-swap completed successfully"
+                                    );
+                                    health.set_tts(true, None);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "companion: TTS start_server failed in hot-swap: {e}"
+                                    );
+                                    health.set_tts(
+                                        false,
+                                        Some(format!("TTS start failed: {e}")),
+                                    );
+                                }
+                            }
+                        } else {
+                            // auto_start off: the user is responsible
+                            // for running the external TTS process.
+                            // Let the watchdog determine actual status.
+                            health.set_tts(false, Some("TTS auto_start off; managed externally".into()));
+                        }
+                    });
+                    tts_restart_pending = true;
+                }
+                Err(e) => {
+                    // Bad config → reject the swap with a clear error
+                    // but keep the previous TTS running.
+                    build_error = Some(format!("Build TTS manager failed: {e}"));
+                    tracing::warn!(
+                        "companion: new TTS manager build failed: {e}; keeping previous"
+                    );
+                }
+            }
+        }
+    }
+
     tracing::info!(
-        "companion: wrote avatar override to {} (restart required to apply)",
-        path.display()
+        "companion: avatar override saved to {} (applied_live={applied}, tts_restart_pending={tts_restart_pending}, build_error={build_error:?})",
+        path.display(),
     );
-    Ok(axum::http::StatusCode::ACCEPTED)
+
+    // 200 OK + JSON body so the UI can render an accurate hint.
+    Ok(axum::Json(serde_json::json!({
+        "applied_live": applied,
+        "tts_process_affected": tts_process_affected,
+        "tts_restart_pending": tts_restart_pending,
+        // Build error is the synchronous failure mode — bad config
+        // values like a missing file. Surface immediately.
+        "tts_error": build_error,
+    })))
 }
 
 #[derive(serde::Deserialize)]

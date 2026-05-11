@@ -13,8 +13,15 @@ import { tokens, monoInputStyle } from '../lib/theme';
 interface CompanionStatus {
   ok: boolean;
   zeroclaw_up: boolean;
+  agent_up?: boolean;
+  agent_last_error?: string | null;
+  tts_up?: boolean;
+  tts_last_error?: string | null;
+  subagent_up?: boolean;
+  subagent_last_error?: string | null;
   avatar_enabled: boolean;
   pulse_enabled?: boolean;
+  last_probe_secs_ago?: number | null;
 }
 
 /**
@@ -88,7 +95,12 @@ function SystemPanels() {
   ) : (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 14, fontSize: 12, color: tokens.textMuted }}>
       <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.ok)}server</span>
-      <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.zeroclaw_up)}agent</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center' }} title={status.agent_last_error ?? undefined}>
+        {dot(status.zeroclaw_up)}agent
+      </span>
+      <span style={{ display: 'inline-flex', alignItems: 'center' }} title={status.tts_last_error ?? undefined}>
+        {dot(!!status.tts_up)}tts
+      </span>
       <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.avatar_enabled)}avatar</span>
       {status.pulse_enabled !== undefined &&
         <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.pulse_enabled)}pulse</span>}
@@ -113,13 +125,39 @@ function SystemPanels() {
           <table style={{ width: '100%', fontSize: 13 }}>
             <tbody>
               <StatusRow label="App service" ok={status.ok} value={status.ok ? 'running' : 'not running'} />
-              <StatusRow label="Main agent" ok={status.zeroclaw_up} value={status.zeroclaw_up ? 'connected' : "can't reach"} />
+              <StatusRow
+                label="Main agent"
+                ok={status.zeroclaw_up}
+                value={status.zeroclaw_up ? 'connected' : "can't reach"}
+                detail={status.agent_last_error ?? undefined}
+              />
+              {status.avatar_enabled && (
+                <StatusRow
+                  label="TTS"
+                  ok={!!status.tts_up}
+                  value={status.tts_up ? 'ready' : (status.tts_last_error ? 'failed' : 'not running')}
+                  detail={status.tts_last_error ?? undefined}
+                />
+              )}
+              {status.avatar_enabled && (
+                <StatusRow
+                  label="Subagent"
+                  ok={!!status.subagent_up}
+                  value={status.subagent_up ? 'ready' : 'off'}
+                  detail={status.subagent_last_error ?? undefined}
+                />
+              )}
               <StatusRow label="Avatar" ok={status.avatar_enabled} value={status.avatar_enabled ? 'on' : 'off in config'} />
               {status.pulse_enabled !== undefined && (
                 <StatusRow label="Pulse" ok={status.pulse_enabled} value={status.pulse_enabled ? 'on' : 'off in config'} />
               )}
             </tbody>
           </table>
+        )}
+        {status?.last_probe_secs_ago !== undefined && status?.last_probe_secs_ago !== null && (
+          <div style={{ marginTop: 8, fontSize: 11, color: tokens.textDim }}>
+            Last health check {status.last_probe_secs_ago}s ago.
+          </div>
         )}
       </CollapsibleRow>
 
@@ -260,9 +298,17 @@ function ServerConnectionForm() {
   );
 }
 
-function StatusRow({ label, ok, value }: { label: string; ok: boolean; value: string }) {
+function StatusRow({
+  label, ok, value, detail,
+}: {
+  label: string;
+  ok: boolean;
+  value: string;
+  /** Tooltip text — usually the last error string from the server. */
+  detail?: string;
+}) {
   return (
-    <tr>
+    <tr title={detail}>
       <td style={{ padding: '5px 0', color: tokens.textMuted }}>{label}</td>
       <td style={{ padding: '5px 0', textAlign: 'right' }}>
         <span style={{

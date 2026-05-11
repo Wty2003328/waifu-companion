@@ -678,20 +678,21 @@ function AvatarEditor({
         body: JSON.stringify(body),
       });
       if (!r.ok) throw new Error(`save failed: ${r.status} ${await r.text()}`);
-      setSavedAt(Date.now());
+      // Server returns a JSON body describing what got applied live
+      // and whether a TTS child-process restart is pending. The
+      // restart itself runs on a background task — the watchdog
+      // updates /api/status when it finishes (success or fail).
+      const result = await r.json().catch(() => ({}));
+      if (result?.tts_error) {
+        // Synchronous build error — bad path or similar. Surface now.
+        setError(`Apply: ${result.tts_error}`);
+      } else {
+        setSavedAt(Date.now());
+        setTimeout(() => setSavedAt(null), 4000);
+      }
       onSaved();
     } catch (e) { setError((e as Error).message); }
     finally { setSaving(false); }
-  };
-
-  const restart = async () => {
-    const inv = tauriInvoke();
-    if (!inv) {
-      window.alert('Restart the companion-server process to apply.');
-      return;
-    }
-    try { await inv('restart_app'); }
-    catch (e) { setError(`restart failed: ${(e as Error).message}`); }
   };
 
   return (
@@ -968,19 +969,16 @@ function AvatarEditor({
         status={
           <>
             {error && <Hint tone="warn">{error}</Hint>}
-            {/* Order matters: a fresh dirty edit should switch from
-                "Saved" back to "unsaved changes". Without dirty taking
-                precedence, the green "Saved" hint stuck around forever
-                after the first save. */}
+            {/* Order matters: a fresh dirty edit should switch back
+                to "unsaved" instead of stale-"Applied". */}
             {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
-            {!error && !dirty && savedAt && <Hint tone="good">Saved — click <strong>Restart</strong> to apply.</Hint>}
+            {!error && !dirty && savedAt && <Hint tone="good">✓ Applied — voice changes are live.</Hint>}
           </>
         }
       >
         <Button onClick={save} primary disabled={!dirty || saving}>
-          {saving ? 'Saving…' : 'Save'}
+          {saving ? 'Applying…' : 'Apply'}
         </Button>
-        <Button onClick={restart}>Restart</Button>
       </EditorFooter>
     </>
   );
