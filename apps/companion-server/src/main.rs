@@ -1442,6 +1442,13 @@ async fn handle_post_zeroclaw_override(
 #[derive(serde::Deserialize)]
 struct ChatRequest {
     message: String,
+    /// Optional conversation-session id. Forwarded to the agent (as
+    /// `X-Session-Id` for the `/webhook` family) so it retains context
+    /// across turns. The avatar UI owns this — it stores a UUID in
+    /// localStorage and rotates it on "New session". Absent → the
+    /// agent runs the turn statelessly.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1517,8 +1524,12 @@ async fn handle_chat(
     // this request is in flight, we keep using the old one for this
     // response (safe — Arc cloned), and the next request picks up the new.
     let zc = state.zeroclaw.load_full();
+    let session_id = req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(sid) = session_id {
+        tracing::debug!("companion: /api/chat in session {sid}");
+    }
     let reply = zc
-        .send_chat(&outbound)
+        .send_chat_in_session(&outbound, session_id)
         .await
         .map_err(|e| {
             let elapsed = started.elapsed().as_secs();

@@ -112,30 +112,61 @@ impl ZeroclawClient {
     }
 
     /// Send a user message to the agent and return the textual reply.
-    /// Dispatches by `kind`.
+    /// Sessionless — each call is independent. For conversation
+    /// continuity use [`send_chat_in_session`](Self::send_chat_in_session).
     pub async fn send_chat(&self, message: &str) -> anyhow::Result<String> {
+        self.send_chat_in_session(message, None).await
+    }
+
+    /// Send a user message in a named conversation session so the agent
+    /// retains context across turns. `session_id` is forwarded to
+    /// zeroclaw's `/webhook` as the `X-Session-Id` header — zeroclaw
+    /// keys its per-conversation history off that, so the same id over
+    /// successive calls makes a coherent dialogue (bounded by zeroclaw's
+    /// `[agent] max_history_messages`). A `None` id, or any agent kind
+    /// other than the `/webhook` family, behaves identically to
+    /// [`send_chat`](Self::send_chat) — openclaw's `/v1/chat/completions`
+    /// is stateless per request and hermes-via-bridge re-spawns the CLI
+    /// each call, so there's nothing for an id to hook into there.
+    pub async fn send_chat_in_session(
+        &self,
+        message: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         match self.kind {
             // zeroclaw and hermes-via-bridge both speak `/webhook`
             // {message}→{response}. "custom" defaults to the same shape
             // so any other webhook-style endpoint Just Works.
             AgentKind::Zeroclaw | AgentKind::Hermes | AgentKind::Custom => {
-                self.send_chat_webhook(message).await
+                self.send_chat_webhook(message, session_id).await
             }
             // openclaw exposes an OpenAI-compatible chat-completions
             // endpoint (we enable `gateway.http.endpoints.chatCompletions`
             // server-side). `model:"openclaw"` is the magic string that
-            // routes to the agent rather than a raw LLM model.
+            // routes to the agent rather than a raw LLM model. No
+            // session header — the endpoint is stateless per request.
             AgentKind::Openclaw => self.send_chat_openai(message).await,
         }
     }
 
     /// `POST /webhook` shape (zeroclaw + hermes bridge + custom).
-    async fn send_chat_webhook(&self, message: &str) -> anyhow::Result<String> {
+    async fn send_chat_webhook(
+        &self,
+        message: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let url = format!("{}/webhook", self.base_url);
         let body = serde_json::json!({ "message": message });
         let mut req = self.http.post(&url).json(&body);
         if let Some(ref tok) = self.pair_token {
             req = req.bearer_auth(tok);
+        }
+        if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            // zeroclaw validates this header to ASCII alnum + `-_.`,
+            // ≤128 chars. We send whatever the UI gave us; if it fails
+            // that check zeroclaw just ignores it and runs sessionless,
+            // which is a graceful degrade.
+            req = req.header("X-Session-Id", sid);
         }
         let resp = req.send().await?;
         let status = resp.status();

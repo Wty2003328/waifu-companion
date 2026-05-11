@@ -49,6 +49,38 @@ interface ChatTurn {
 const HISTORY_KEY = 'companion.chatHistory.v1';
 const HISTORY_LIMIT = 200; // keep last N turns
 
+// ── Conversation session ────────────────────────────────────────
+// The companion forwards this id to the agent as `X-Session-Id` (for
+// the /webhook family) so it retains context across turns. We own it
+// here — one id per "conversation". "New session" rotates it (agent
+// forgets); "Clear" only tidies the visible history (agent keeps the
+// thread). Stored in localStorage so it survives an app restart AND so
+// the overlay window reads the same id as the main window.
+const SESSION_KEY = 'companion.sessionId.v1';
+
+function newSessionId(): string {
+  try {
+    // crypto.randomUUID → 8-4-4-4-12 hex with dashes; passes zeroclaw's
+    // ASCII-alnum-plus-`-_.`, ≤128 chars validation.
+    return crypto.randomUUID();
+  } catch {
+    return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+function getOrCreateSessionId(): string {
+  try {
+    let id = localStorage.getItem(SESSION_KEY);
+    if (!id || !id.trim()) {
+      id = newSessionId();
+      localStorage.setItem(SESSION_KEY, id);
+    }
+    return id;
+  } catch {
+    return newSessionId();
+  }
+}
+
 // ── Canvas / panel preferences ──────────────────────────────────
 interface CanvasPrefs {
   background: string;     // CSS color, e.g. '#0a0a0a' or 'transparent'
@@ -645,11 +677,50 @@ export default function Avatar() {
     });
   }, []);
 
+  // Conversation session id (see SESSION_KEY). The agent retains
+  // context per id. Initialised from localStorage so a restart — and
+  // the overlay window — keep the same thread.
+  const [sessionId, setSessionId] = useState<string>(() =>
+    IS_OVERLAY ? (localStorage.getItem(SESSION_KEY) ?? '') : getOrCreateSessionId(),
+  );
+  // Stay in sync if the *other* window (or a future tab) rotates it.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === SESSION_KEY && e.newValue) setSessionId(e.newValue);
+    };
+    const onCustom = () => {
+      const v = localStorage.getItem(SESSION_KEY);
+      if (v) setSessionId(v);
+    };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('companion:session', onCustom);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('companion:session', onCustom);
+    };
+  }, []);
+
+  /// "Clear" — tidy the visible history only. The session id (and so
+  /// the agent's memory of the conversation) is left alone.
   const clearHistory = useCallback(() => {
-    if (confirm('Clear all chat history?')) {
+    if (history.length === 0 || confirm('Clear the visible chat history? (The agent still remembers this conversation — use "New session" to make it forget.)')) {
       setHistory([]);
     }
-  }, []);
+  }, [history.length]);
+
+  /// "New session" — rotate the session id (the agent starts fresh,
+  /// no memory of what was said) and clear the visible history. Other
+  /// windows pick up the new id via the storage / custom event.
+  const startNewSession = useCallback(() => {
+    if (history.length > 0 && !confirm('Start a new session? The agent will forget this conversation and the chat history will clear.')) {
+      return;
+    }
+    const id = newSessionId();
+    try { localStorage.setItem(SESSION_KEY, id); } catch { /* non-fatal */ }
+    setSessionId(id);
+    setHistory([]);
+    window.dispatchEvent(new CustomEvent('companion:session'));
+  }, [history.length]);
 
   const { connected, sendReady, sendMotionRequest, sendExpressionRequest } = useAvatarSocket(wsUrl, {
     onModelInfo: (info) => {
@@ -821,7 +892,12 @@ export default function Avatar() {
       const resp = await fetch(`${HTTP_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text }),
+        // session_id ties this turn to the running conversation so the
+        // agent keeps context. Read from the latest localStorage value
+        // rather than the React state so a rotation in the other window
+        // takes effect on the very next message even before our event
+        // listener fires.
+        body: JSON.stringify({ message: text, session_id: localStorage.getItem(SESSION_KEY) || sessionId || undefined }),
       });
       if (!resp.ok) {
         const body = await resp.text();
@@ -877,7 +953,7 @@ export default function Avatar() {
     } finally {
       setSending(false);
     }
-  }, [chatInput, sending, appendTurn]);
+  }, [chatInput, sending, appendTurn, sessionId]);
 
   useEffect(() => {
     return () => stopCurrentAudio();
@@ -1214,13 +1290,38 @@ export default function Avatar() {
             justifyContent: 'space-between',
           }}
         >
-          <div style={{ fontSize: 13, fontWeight: 600 }}>Chat history</div>
-          <div style={{ fontSize: 11, color: '#666', display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Chat history</div>
+            <span
+              style={{ fontSize: 10, color: '#555', fontFamily: 'ui-monospace, Menlo, Consolas, monospace' }}
+              title={sessionId ? `Session ${sessionId} — the agent remembers this conversation across turns.` : 'No session id yet.'}
+            >
+              {sessionId ? `session ${sessionId.slice(0, 4)}` : ''}
+            </span>
+          </div>
+          <div style={{ fontSize: 11, color: '#666', display: 'flex', gap: 8, alignItems: 'center' }}>
             <span>{history.length} turn{history.length === 1 ? '' : 's'}</span>
+            <button
+              type="button"
+              onClick={startNewSession}
+              title="Start a new session — the agent forgets this conversation and the history clears."
+              style={{
+                background: 'transparent',
+                color: '#7aa9ff',
+                border: '1px solid #2a3550',
+                borderRadius: 4,
+                padding: '2px 8px',
+                fontSize: 11,
+                cursor: 'pointer',
+              }}
+            >
+              + New session
+            </button>
             <button
               type="button"
               onClick={clearHistory}
               disabled={history.length === 0}
+              title="Clear the visible history. The agent still remembers this conversation — use New session to make it forget."
               style={{
                 background: 'transparent',
                 color: '#888',
