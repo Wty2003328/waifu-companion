@@ -1,4 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { useCachedJson } from '../lib/fetchCache';
+import { tokens } from '../lib/theme';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Live2DViewer, { type Live2DViewerHandle, type ModelActions, type ModelParameter } from '../components/avatar/Live2DViewer';
@@ -226,6 +229,17 @@ const IS_OVERLAY =
 
 
 export default function Avatar() {
+  // Server-side avatar state — if the user has `[avatar] enabled = false`
+  // in companion.toml (or the override turned it off), there's no WS
+  // endpoint to connect to. Detect this up front so we can render an
+  // explanatory empty state instead of a permanent "Connecting…"
+  // spinner.
+  const { data: cfg } = useCachedJson<{ avatar: unknown | null }>(
+    `${HTTP_BASE}/api/config`,
+    30_000,
+  );
+  const avatarDisabled = cfg !== undefined && cfg !== null && cfg.avatar === null;
+
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [subtitle, setSubtitle] = useState<string>('');
   const [isPlaying, setIsPlaying] = useState(false);
@@ -937,6 +951,33 @@ export default function Avatar() {
               }
               parameterOverrides={paramOverrides}
             />
+          ) : avatarDisabled ? (
+            <div style={{
+              height: '100%', display: 'flex',
+              alignItems: 'center', justifyContent: 'center',
+              padding: 32, color: tokens.textMuted,
+            }}>
+              <div style={{ textAlign: 'center', maxWidth: 380, lineHeight: 1.55 }}>
+                <div style={{ fontSize: 32, marginBottom: 12 }}>🌙</div>
+                <div style={{
+                  fontSize: 15, fontWeight: 600, color: tokens.text, marginBottom: 6,
+                }}>
+                  Avatar is turned off
+                </div>
+                <div style={{ fontSize: 13, marginBottom: 14 }}>
+                  Enable it in <strong>Settings → Avatar &amp; voice</strong> to
+                  load a Live2D model and hear replies spoken back.
+                </div>
+                <Link to="/settings" style={{
+                  display: 'inline-block', padding: '8px 14px',
+                  background: tokens.primary, color: '#fff',
+                  borderRadius: tokens.radiusSm, textDecoration: 'none',
+                  fontSize: 13, fontWeight: 500,
+                }}>
+                  Open Settings →
+                </Link>
+              </div>
+            </div>
           ) : (
             <div
               style={{
@@ -944,7 +985,7 @@ export default function Avatar() {
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                color: '#888',
+                color: tokens.textMuted,
               }}
             >
               <div style={{ textAlign: 'center' }}>

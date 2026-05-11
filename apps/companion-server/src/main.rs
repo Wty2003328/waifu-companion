@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use axum::routing::get;
 use axum::Router;
 use futures_util::StreamExt;
@@ -79,7 +80,9 @@ async fn main() -> Result<()> {
     let app_state = AppState {
         avatar: avatar_state,
         pulse: pulse_state,
-        zeroclaw: Arc::new(zc),
+        // Behind ArcSwap so the settings UI can rebuild + swap the
+        // client mid-process — no restart required for agent changes.
+        zeroclaw: Arc::new(ArcSwap::from_pointee(zc)),
         config_path: config_path.clone(),
     };
 
@@ -353,7 +356,9 @@ async fn build_avatar(
     Ok(Some(Arc::new(AvatarWsState {
         config: avatar_cfg,
         event_tx,
-        subagent,
+        // ArcSwapOption: starts with whatever the config produced;
+        // hot-swappable via POST /api/config/subagent without restart.
+        subagent: arc_swap::ArcSwapOption::from(subagent),
         tts,
     })))
 }
@@ -502,7 +507,8 @@ async fn handle_health() -> &'static str {
 async fn handle_status(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::Json<serde_json::Value> {
-    let zc_up = state.zeroclaw.health().await.unwrap_or(false);
+    let zc = state.zeroclaw.load_full();
+    let zc_up = zc.health().await.unwrap_or(false);
     axum::Json(serde_json::json!({
         "ok": true,
         "zeroclaw_up": zc_up,
@@ -514,11 +520,25 @@ async fn handle_status(
 /// Read-only snapshot of the loaded companion configuration so the
 /// Settings page can render what's actually running. Sensitive fields
 /// (api keys) are redacted.
+///
+/// Avatar values are re-read from `companion.toml` + the runtime
+/// override file on every call so that values flipped via the hot-
+/// swap save handlers show up immediately. (The AvatarWsState's
+/// captured `config` is only used for the in-process behavior that
+/// is genuinely fixed at startup — anything we hot-swap also lives
+/// in the runtime override, so disk is the truth for display.)
 async fn handle_get_config(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::Json<serde_json::Value> {
-    let avatar = state.avatar.as_ref().map(|a| {
-        let cfg = &a.config;
+    // Fresh disk read — cheap, runs on the axum executor.
+    let disk_cfg = CompanionConfig::load(&state.config_path).ok();
+    let avatar = state.avatar.as_ref().map(|_| {
+        // Prefer the live avatar config from disk; fall back to the
+        // startup snapshot if the on-disk parse failed.
+        let cfg: AvatarConfig = disk_cfg
+            .as_ref()
+            .and_then(|d| serde_json::from_value(d.avatar.clone()).ok())
+            .unwrap_or_else(|| state.avatar.as_ref().unwrap().config.clone());
         serde_json::json!({
             "enabled": cfg.enabled,
             "chat_language": cfg.chat_language,
@@ -555,17 +575,18 @@ async fn handle_get_config(
             },
         })
     });
-    let zc_up = state.zeroclaw.health().await.unwrap_or(false);
+    let zc = state.zeroclaw.load_full();
+    let zc_up = zc.health().await.unwrap_or(false);
     axum::Json(serde_json::json!({
         "avatar": avatar,
         // Connection to the (possibly remote) agent daemon. The
         // pairing token is never sent back — only whether one is set.
         // `kind` is one of "zeroclaw" | "openclaw" | "hermes" | "custom".
         "zeroclaw": {
-            "kind": state.zeroclaw.kind().label(),
-            "url": state.zeroclaw.base_url(),
-            "timeout_secs": state.zeroclaw.timeout_secs(),
-            "pair_token_set": state.zeroclaw.has_pair_token(),
+            "kind": zc.kind().label(),
+            "url": zc.base_url(),
+            "timeout_secs": zc.timeout_secs(),
+            "pair_token_set": zc.has_pair_token(),
             "reachable": zc_up,
         },
         // Legacy field some older UI builds read; keep for one release.
@@ -835,11 +856,15 @@ struct SubagentOverrideRequest {
 }
 
 /// Persist the user's subagent settings choice to
-/// `companion.runtime.json` (sibling of companion.toml). The change
-/// takes effect on the next process restart — this handler never tries
-/// to hot-swap the live subagent because the wire path through
-/// `AvatarWsState` holds an `Option<Arc<AvatarSubagent>>` directly,
-/// not a lock. UI shows a "restart required" hint after success.
+/// `companion.runtime.json` (sibling of companion.toml) **and**
+/// hot-swap the live `AvatarSubagent` so the change takes effect
+/// immediately — no restart needed.
+///
+/// The avatar WsState now holds the subagent inside an
+/// [`arc_swap::ArcSwapOption`]; rebuilding it from the freshly-merged
+/// config + `store`ing publishes the new client atomically. In-flight
+/// turns keep using whichever client they `load_full`ed when the turn
+/// began.
 async fn handle_post_subagent_override(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::Json(req): axum::Json<SubagentOverrideRequest>,
@@ -895,12 +920,57 @@ async fn handle_post_subagent_override(
         )
     })?;
 
+    // Hot-swap the live subagent.
+    //
+    // Re-parse companion.toml + runtime.json into a CompanionConfig
+    // (mirrors startup), pull out the subagent block, rebuild the
+    // client, and atomically publish it via the avatar WsState's
+    // ArcSwapOption. Skipped when the avatar subsystem itself isn't
+    // running (no place to put the client).
+    let mut swapped = false;
+    if let Some(ref avatar_state) = state.avatar {
+        let new_cfg = CompanionConfig::load(&state.config_path).map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reload config: {e}"),
+            )
+        })?;
+        let avatar_cfg: AvatarConfig = serde_json::from_value(new_cfg.avatar.clone())
+            .unwrap_or_default();
+        if avatar_cfg.subagent.enabled {
+            let zc_for_sub = if avatar_cfg.subagent.use_zeroclaw_webhook {
+                Some((*state.zeroclaw.load_full()).clone())
+            } else {
+                None
+            };
+            match AvatarSubagent::new(&avatar_cfg.subagent, zc_for_sub) {
+                Ok(s) => {
+                    avatar_state.subagent.store(Some(std::sync::Arc::new(s)));
+                    swapped = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "companion: subagent rebuild failed; keeping previous client: {e}"
+                    );
+                }
+            }
+        } else {
+            // User disabled the subagent — clear the live one.
+            avatar_state.subagent.store(None);
+            swapped = true;
+        }
+    }
+
     tracing::info!(
-        "companion: wrote subagent override to {} (restart required to apply)",
-        path.display()
+        "companion: subagent override saved to {} ({})",
+        path.display(),
+        if swapped {
+            "applied live, no restart needed"
+        } else {
+            "restart required — avatar subsystem not active"
+        },
     );
-    // 202 Accepted — saved, but takes effect after restart.
-    Ok(axum::http::StatusCode::ACCEPTED)
+    Ok(axum::http::StatusCode::OK)
 }
 
 #[derive(serde::Deserialize)]
@@ -1040,15 +1110,22 @@ struct ZeroclawOverrideRequest {
     timeout_secs: Option<u64>,
 }
 
-/// Persist the zeroclaw connection override (url / pair token /
-/// timeout) to companion.runtime.json. Restart-required: the
-/// ZeroclawClient is built once at companion-server startup, so the
-/// Settings UI shows a "Restart" button after a successful save.
+/// Persist the agent connection override (kind / url / pair token /
+/// timeout) to companion.runtime.json **and** hot-swap the live
+/// `ZeroclawClient` so the change takes effect immediately. No restart
+/// required: the AppState holds the client inside an [`ArcSwap`], so
+/// rebuilding + `store`-ing a fresh `Arc<ZeroclawClient>` publishes
+/// the new agent atomically to every subsequent request. In-flight
+/// `/api/chat` calls keep their own clone of the old client until
+/// they finish, so concurrent requests can never observe a torn state.
 ///
-/// This is what lets the companion talk to a zeroclaw running on a
+/// This is what lets the companion talk to an agent running on a
 /// different machine — a home server, a Raspberry Pi, a laptop on the
-/// LAN. The companion is a thin client; it never asks zeroclaw to do
+/// LAN. The companion is a thin client; it never asks the agent to do
 /// anything on the machine companion itself runs on.
+///
+/// Returns 200 OK on success (no longer 202 Accepted — the swap has
+/// already happened by the time we respond).
 async fn handle_post_zeroclaw_override(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::Json(req): axum::Json<ZeroclawOverrideRequest>,
@@ -1091,11 +1168,31 @@ async fn handle_post_zeroclaw_override(
     std::fs::write(&path, body).map_err(|e| {
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("write {}: {e}", path.display()))
     })?;
+
+    // Re-parse companion.toml + the freshly-written runtime.json into
+    // a full CompanionConfig — mirrors the startup load path exactly,
+    // no parallel "apply override on top of cached base" code path to
+    // drift out of sync. Then build a new ZeroclawClient and publish.
+    let new_cfg = CompanionConfig::load(&state.config_path).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reload config after save: {e}"),
+        )
+    })?;
+    let new_client = ZeroclawClient::new(&new_cfg.zeroclaw).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("build new agent client: {e}"),
+        )
+    })?;
+    state.zeroclaw.store(std::sync::Arc::new(new_client));
+
     tracing::info!(
-        "companion: wrote zeroclaw override to {} (restart required to apply)",
-        path.display()
+        "companion: applied agent override {} {} (hot-swapped, no restart needed)",
+        new_cfg.zeroclaw.kind.label(),
+        new_cfg.zeroclaw.url,
     );
-    Ok(axum::http::StatusCode::ACCEPTED)
+    Ok(axum::http::StatusCode::OK)
 }
 
 #[derive(serde::Deserialize)]
@@ -1172,8 +1269,11 @@ async fn handle_chat(
     };
 
     let started = std::time::Instant::now();
-    let reply = state
-        .zeroclaw
+    // Snapshot the current agent client. If the user swaps agents while
+    // this request is in flight, we keep using the old one for this
+    // response (safe — Arc cloned), and the next request picks up the new.
+    let zc = state.zeroclaw.load_full();
+    let reply = zc
         .send_chat(&outbound)
         .await
         .map_err(|e| {

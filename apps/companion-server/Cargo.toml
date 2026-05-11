@@ -15,6 +15,11 @@ companion-core.workspace = true
 companion-avatar.workspace = true
 companion-pulse.workspace = true
 
+# Lock-free atomic swap for the agent client so config changes apply
+# without a process restart. ArcSwap::store atomically publishes a new
+# Arc<ZeroclawClient> visible to subsequent `.load()` calls.
+arc-swap = "1"
+
 tokio.workspace = true
 tokio-stream.workspace = true
 futures-util.workspace = true

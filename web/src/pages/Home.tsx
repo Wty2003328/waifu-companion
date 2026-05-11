@@ -8,6 +8,7 @@ import {
 } from '../lib/apiBase';
 import { cachedJson, useCachedJson } from '../lib/fetchCache';
 import CharacterRoster from '../components/CharacterRoster';
+import { tokens, monoInputStyle } from '../lib/theme';
 
 interface CompanionStatus {
   ok: boolean;
@@ -17,11 +18,9 @@ interface CompanionStatus {
 }
 
 /**
- * Home — the main page. Used to be a status dashboard with deep-links
- * to the other pages, but the rest of the UI was just plumbing around
- * the active character anyway, so as of 2026-05 the character roster
- * is the primary content and status / server-connection are tucked
- * into collapsible panels at the top.
+ * Home — primary page. Character roster is the main content; status
+ * + companion-service URL are tucked into collapsible panels at the
+ * top of the page so they're available without dominating.
  */
 export default function Home() {
   return (
@@ -35,10 +34,23 @@ export default function Home() {
       contain: 'paint',
       overscrollBehavior: 'contain',
     }}>
-      <div style={{ padding: 28, maxWidth: 880, margin: '0 auto' }}>
-        <h1 style={{ marginTop: 0, marginBottom: 12, fontSize: 24 }}>waifu-companion</h1>
+      <div style={{ padding: '40px 32px', maxWidth: 880, margin: '0 auto' }}>
+        <header style={{ marginBottom: 24 }}>
+          <h1 style={{
+            margin: 0, fontSize: tokens.fontPage, fontWeight: 700,
+            letterSpacing: '-0.01em', color: tokens.text,
+          }}>
+            waifu-companion
+          </h1>
+          <p style={{
+            color: tokens.textMuted, fontSize: 13, lineHeight: 1.55,
+            margin: '6px 0 0 0',
+          }}>
+            Manage your characters and check that the agent's listening.
+          </p>
+        </header>
         <SystemPanels />
-        <div style={{ marginTop: 20 }}>
+        <div style={{ marginTop: 24 }}>
           <CharacterRoster />
         </div>
       </div>
@@ -46,11 +58,8 @@ export default function Home() {
   );
 }
 
-/** Combined collapsible bar that surfaces server status + connection
- *  config in one place. Default-collapsed because the user has already
- *  configured this once — the character roster is what they're here
- *  to manage. The panels expand independently, and the title bar shows
- *  a quick health summary so a glance is enough most of the time. */
+/** Status + server-connection collapsibles, side-by-side rhythm with
+ *  the rest of the dark UI (matches the Settings section styling). */
 function SystemPanels() {
   const [statusOpen, setStatusOpen] = useState(false);
   const [serverOpen, setServerOpen] = useState(false);
@@ -70,16 +79,16 @@ function SystemPanels() {
   const dot = (ok: boolean) => (
     <span style={{
       width: 7, height: 7, borderRadius: '50%',
-      background: ok ? '#10b981' : '#ef4444',
+      background: ok ? tokens.success : tokens.danger,
       display: 'inline-block', marginRight: 6, flexShrink: 0,
     }} />
   );
   const summary = !status ? (
-    <span style={{ color: '#666' }}>checking…</span>
+    <span style={{ color: tokens.textDim, fontSize: 12 }}>checking…</span>
   ) : (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12, fontSize: 12, color: '#888' }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 14, fontSize: 12, color: tokens.textMuted }}>
       <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.ok)}server</span>
-      <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.zeroclaw_up)}zeroclaw</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.zeroclaw_up)}agent</span>
       <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.avatar_enabled)}avatar</span>
       {status.pulse_enabled !== undefined &&
         <span style={{ display: 'inline-flex', alignItems: 'center' }}>{dot(status.pulse_enabled)}pulse</span>}
@@ -87,22 +96,27 @@ function SystemPanels() {
   );
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <CollapsibleRow
         title="Status"
         rightSummary={summary}
         open={statusOpen}
         onToggle={() => setStatusOpen((v) => !v)}
       >
-        {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 6 }}>error: {error}</div>}
+        {error && (
+          <div style={{
+            color: tokens.danger, fontSize: 12.5, marginBottom: 8,
+            lineHeight: 1.5,
+          }}>error: {error}</div>
+        )}
         {status && (
           <table style={{ width: '100%', fontSize: 13 }}>
             <tbody>
-              <Row label="App service" ok={status.ok} value={status.ok ? 'running' : 'not running'} />
-              <Row label="Main agent" ok={status.zeroclaw_up} value={status.zeroclaw_up ? 'connected' : "can't reach"} />
-              <Row label="Avatar" ok={status.avatar_enabled} value={status.avatar_enabled ? 'on' : 'off in config'} />
+              <StatusRow label="App service" ok={status.ok} value={status.ok ? 'running' : 'not running'} />
+              <StatusRow label="Main agent" ok={status.zeroclaw_up} value={status.zeroclaw_up ? 'connected' : "can't reach"} />
+              <StatusRow label="Avatar" ok={status.avatar_enabled} value={status.avatar_enabled ? 'on' : 'off in config'} />
               {status.pulse_enabled !== undefined && (
-                <Row label="Pulse" ok={status.pulse_enabled} value={status.pulse_enabled ? 'on' : 'off in config'} />
+                <StatusRow label="Pulse" ok={status.pulse_enabled} value={status.pulse_enabled ? 'on' : 'off in config'} />
               )}
             </tbody>
           </table>
@@ -110,8 +124,15 @@ function SystemPanels() {
       </CollapsibleRow>
 
       <CollapsibleRow
-        title="Server address"
-        rightSummary={<span style={{ fontSize: 12, color: '#666', fontFamily: 'monospace' }}>{getServerUrl()}</span>}
+        title="Companion service URL"
+        rightSummary={
+          <span style={{
+            fontSize: 12, color: tokens.textDim,
+            fontFamily: 'ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace',
+          }}>
+            {getServerUrl()}
+          </span>
+        }
         open={serverOpen}
         onToggle={() => setServerOpen((v) => !v)}
       >
@@ -131,18 +152,24 @@ function CollapsibleRow({
   children: React.ReactNode;
 }) {
   return (
-    <div style={{ background: '#16181c', border: '1px solid #1f2227', borderRadius: 10 }}>
+    <div style={{
+      background: tokens.bgPanel,
+      border: `1px solid ${tokens.border}`,
+      borderRadius: tokens.radius,
+      overflow: 'hidden',
+    }}>
       <button
         type="button"
         onClick={onToggle}
+        className="ws-btn"
         style={{
           width: '100%', display: 'flex', alignItems: 'center', gap: 10,
-          padding: '10px 14px', background: 'transparent', border: 'none',
-          color: '#cbd5e1', fontSize: 13, cursor: 'pointer', textAlign: 'left',
+          padding: '11px 16px', background: 'transparent', border: 'none',
+          color: tokens.text, fontSize: 13, cursor: 'pointer', textAlign: 'left',
         }}
         aria-expanded={open}
       >
-        <span style={{ fontSize: 11, color: '#666', width: 12, textAlign: 'center' }}>
+        <span style={{ fontSize: 11, color: tokens.textDim, width: 12, textAlign: 'center' }}>
           {open ? '▾' : '▸'}
         </span>
         <span style={{ fontWeight: 500 }}>{title}</span>
@@ -150,7 +177,10 @@ function CollapsibleRow({
         {rightSummary}
       </button>
       {open && (
-        <div style={{ padding: '4px 14px 14px 38px', borderTop: '1px solid #1f2227' }}>
+        <div style={{
+          padding: '4px 16px 16px 40px',
+          borderTop: `1px solid ${tokens.border}`,
+        }}>
           {children}
         </div>
       )}
@@ -158,9 +188,7 @@ function CollapsibleRow({
   );
 }
 
-/** Editor for the companion-server URL stored in localStorage. Same
- *  control as before — just lifted into its own component so the
- *  collapsible can swap it in without bloating the parent. */
+/** Editor for the companion-server URL stored in localStorage. */
 function ServerConnectionForm() {
   const [serverInput, setServerInput] = useState<string>(getStoredServerUrl());
   const [savedHint, setSavedHint] = useState<string | null>(null);
@@ -184,11 +212,12 @@ function ServerConnectionForm() {
   const isUsingDefault = !getStoredServerUrl();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 8 }}>
-      <p style={{ color: '#888', fontSize: 12, margin: 0, lineHeight: 1.5 }}>
-        Where this app looks for its background service. Leave blank for
-        the default ({getDefaultServerUrl()}). Only change this if you've
-        moved the service to a different computer or port.
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 8 }}>
+      <p style={{ color: tokens.textMuted, fontSize: 12.5, margin: 0, lineHeight: 1.55 }}>
+        Where this UI reaches its background service. Leave blank for
+        the default ({getDefaultServerUrl()}). Only change this if
+        you've moved the service to a different machine or port.{' '}
+        <strong>Not</strong> the agent URL — set that in <em>Settings → Main agent</em>.
       </p>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <input
@@ -197,46 +226,52 @@ function ServerConnectionForm() {
           onChange={(e) => setServerInput(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSave()}
           placeholder={`${getDefaultServerUrl()}  (default)`}
-          style={{
-            flex: '1 1 280px', minWidth: 220,
-            background: '#0b0d10', color: '#fff', padding: '8px 12px',
-            borderRadius: 6, border: '1px solid #2a2d33',
-            fontSize: 13, fontFamily: 'monospace', outline: 'none',
-          }}
+          style={monoInputStyle}
         />
-        <button type="button" onClick={handleSave} style={{
-          padding: '8px 14px', background: '#3b82f6', color: '#fff',
-          border: 'none', borderRadius: 6, fontSize: 13, cursor: 'pointer',
-        }}>Save</button>
+        <button
+          type="button"
+          onClick={handleSave}
+          className="ws-btn ws-btn--primary"
+          style={{
+            padding: '8px 14px', background: tokens.primary, color: '#fff',
+            border: `1px solid ${tokens.primary}`,
+            borderRadius: tokens.radiusSm,
+            fontSize: 12.5, fontWeight: 500, cursor: 'pointer', minHeight: 34,
+          }}
+        >Save</button>
         <button
           type="button"
           onClick={handleClear}
           disabled={isUsingDefault}
+          className="ws-btn"
           style={{
-            padding: '8px 14px', background: 'transparent', color: '#888',
-            border: '1px solid #2a2d33', borderRadius: 6, fontSize: 13,
+            padding: '8px 14px', background: 'transparent',
+            color: tokens.textMuted,
+            border: `1px solid ${tokens.border}`,
+            borderRadius: tokens.radiusSm,
+            fontSize: 12.5, fontWeight: 500,
             cursor: isUsingDefault ? 'not-allowed' : 'pointer',
-            opacity: isUsingDefault ? 0.4 : 1,
+            opacity: isUsingDefault ? 0.45 : 1, minHeight: 34,
           }}
         >Reset</button>
       </div>
-      {savedHint && <div style={{ fontSize: 11, color: '#10b981' }}>{savedHint}</div>}
+      {savedHint && <div style={{ fontSize: 12, color: tokens.success, lineHeight: 1.5 }}>{savedHint}</div>}
     </div>
   );
 }
 
-function Row({ label, ok, value }: { label: string; ok: boolean; value: string }) {
+function StatusRow({ label, ok, value }: { label: string; ok: boolean; value: string }) {
   return (
     <tr>
-      <td style={{ padding: '4px 0', color: '#aaa' }}>{label}</td>
-      <td style={{ padding: '4px 0', textAlign: 'right' }}>
+      <td style={{ padding: '5px 0', color: tokens.textMuted }}>{label}</td>
+      <td style={{ padding: '5px 0', textAlign: 'right' }}>
         <span style={{
           display: 'inline-flex', alignItems: 'center', gap: 8,
-          color: ok ? '#10b981' : '#ef4444',
+          color: ok ? tokens.success : tokens.danger,
         }}>
           <span style={{
             width: 8, height: 8, borderRadius: '50%',
-            background: ok ? '#10b981' : '#ef4444',
+            background: ok ? tokens.success : tokens.danger,
           }} />
           {value}
         </span>

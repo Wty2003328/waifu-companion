@@ -8,90 +8,7 @@ import {
 } from '../lib/apiBase';
 import { invalidateCache, useCachedJson } from '../lib/fetchCache';
 import { pickFile, pickFolder, listGpus, type DetectedGpu } from '../lib/tauriShell';
-
-// ── Design tokens ────────────────────────────────────────────────
-// Centralized so the Settings primitives below stay consistent and
-// the values can be tweaked once. Matches the rest of the dark UI.
-const tokens = {
-  // Surfaces
-  bgPage:    '#0b0d10',   // page background (set by index.html body)
-  bgPanel:   '#161a20',   // section background
-  bgPanelHi: '#1c2128',   // subtle inset panel (hint/info boxes)
-  bgInput:   '#0d1015',   // input background
-  // Lines + text
-  border:    '#262a31',   // panel borders + input borders
-  borderHi:  '#3a4150',   // hover/focused input border
-  text:      '#e6e9ef',   // primary body text
-  textMuted: '#9aa3b2',   // labels + secondary copy
-  textDim:   '#6b7280',   // hints + footnotes
-  // Status
-  primary:   '#3b82f6',   // primary action
-  primaryHi: '#4f8cff',   // primary hover
-  success:   '#10b981',
-  warn:      '#f59e0b',
-  danger:    '#ef4444',
-  // Geometry
-  radius:    8,
-  radiusSm:  6,
-} as const;
-
-/// One-time global stylesheet for the Settings surface. Lives here
-/// because inline styles can't reach `:hover` / `:focus-visible` and
-/// pseudo-classes are what separates "polished" UIs from "static" ones.
-/// Mounted by the page root; selectors are scoped under `.ws-settings`
-/// so nothing leaks to the rest of the app.
-function SettingsStyles() {
-  return (
-    <style>{`
-      .ws-settings input[type=text],
-      .ws-settings input[type=password],
-      .ws-settings input[type=number],
-      .ws-settings input[type=search],
-      .ws-settings select,
-      .ws-settings textarea {
-        transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
-      }
-      .ws-settings input[type=text]:hover,
-      .ws-settings input[type=password]:hover,
-      .ws-settings input[type=number]:hover,
-      .ws-settings input[type=search]:hover,
-      .ws-settings select:hover,
-      .ws-settings textarea:hover {
-        border-color: ${tokens.borderHi};
-      }
-      .ws-settings input:focus-visible,
-      .ws-settings select:focus-visible,
-      .ws-settings textarea:focus-visible {
-        border-color: ${tokens.primary};
-        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.22);
-      }
-      .ws-settings .ws-btn {
-        transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 80ms ease;
-      }
-      .ws-settings .ws-btn:not(:disabled):hover {
-        border-color: ${tokens.borderHi};
-        color: ${tokens.text};
-      }
-      .ws-settings .ws-btn--primary:not(:disabled):hover {
-        background: ${tokens.primaryHi};
-      }
-      .ws-settings .ws-btn:not(:disabled):active {
-        transform: translateY(1px);
-      }
-      .ws-settings .ws-btn:focus-visible {
-        outline: 2px solid ${tokens.primary};
-        outline-offset: 2px;
-      }
-      .ws-settings code {
-        background: rgba(255,255,255,0.06);
-        padding: 1px 6px;
-        border-radius: 4px;
-        font-size: 11.5px;
-        color: ${tokens.text};
-      }
-    `}</style>
-  );
-}
+import { tokens, inputStyle, monoInputStyle } from '../lib/theme';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
@@ -231,48 +148,25 @@ export default function Settings() {
 
   return (
     <div
-      className="ws-settings"
       style={{
         flex: '1 1 0', minHeight: 0, overflow: 'auto',
         contain: 'paint',
         overscrollBehavior: 'contain',
       }}
     >
-      <SettingsStyles />
       <div style={{ padding: '40px 32px', maxWidth: 880, margin: '0 auto' }}>
       <header style={{ marginBottom: 24 }}>
         <h1 style={{ margin: 0, fontSize: 28, fontWeight: 700, letterSpacing: '-0.01em', color: tokens.text }}>
           Settings
         </h1>
         <p style={{ color: tokens.textMuted, fontSize: 13, margin: '6px 0 0 0', lineHeight: 1.55 }}>
-          Most changes save instantly. A few (voice engine, language defaults)
-          take effect after a quick app restart — the Save button will tell
-          you when that's needed.
+          Changes apply immediately. Voice-engine swaps and a few other
+          process-level options take effect on the next app start —
+          they'll say so explicitly.
         </p>
       </header>
 
       {error && <ErrorBox message={error} />}
-
-      <Section
-        title="Server address"
-        description="Address this app uses to reach its background service. Leave blank unless the service is on a different computer or port."
-      >
-        <Row>
-          <input
-            type="text"
-            value={serverInput}
-            onChange={(e) => setServerInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSaveUrl()}
-            placeholder={`${getDefaultServerUrl()}  (default)`}
-            style={inputStyle}
-          />
-          <Button onClick={handleSaveUrl} primary>Save</Button>
-          <Button onClick={handleClearUrl} disabled={isUsingDefaultUrl}>Reset</Button>
-        </Row>
-        <Hint tone={savedHint ? 'good' : 'muted'}>
-          {savedHint ?? `Now using: ${getServerUrl()}${isUsingDefaultUrl ? ' (default)' : ''}`}
-        </Hint>
-      </Section>
 
       <Section title="Main agent">
         {!cfg && !error && <Hint tone="muted">loading…</Hint>}
@@ -306,6 +200,38 @@ export default function Settings() {
           />
         )}
       </Section>
+
+      {/* Advanced — companion-service URL. Most users never touch this.
+          It controls where the React app reaches its own background
+          service; typing the agent URL here by mistake breaks all the
+          sections above. Tucked under a disclosure to make that hard. */}
+      <section style={{
+        marginTop: 24, padding: '4px 22px', borderRadius: tokens.radius,
+      }}>
+        <AdvancedDisclosure label="Advanced — companion service URL">
+          <p style={{ margin: '0 0 8px 0', fontSize: 12.5, color: tokens.textMuted, lineHeight: 1.55 }}>
+            Where this UI reaches the local background service (the
+            <code>companion-server</code> sidecar). Leave empty for the
+            default. <strong>Not</strong> the agent address — set that in
+            <em> Main agent</em> above.
+          </p>
+          <Row>
+            <input
+              type="text"
+              value={serverInput}
+              onChange={(e) => setServerInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSaveUrl()}
+              placeholder={`${getDefaultServerUrl()}  (default)`}
+              style={monoInputStyle}
+            />
+            <Button onClick={handleSaveUrl} primary>Save</Button>
+            <Button onClick={handleClearUrl} disabled={isUsingDefaultUrl}>Reset</Button>
+          </Row>
+          <Hint tone={savedHint ? 'good' : 'muted'}>
+            {savedHint ?? `Now using: ${getServerUrl()}${isUsingDefaultUrl ? ' (default)' : ''}`}
+          </Hint>
+        </AdvancedDisclosure>
+      </section>
       </div>
     </div>
   );
@@ -553,15 +479,14 @@ function ZeroclawEditor({
       setSavedAt(Date.now());
       setToken(''); // clear once persisted; server redacts on read
       onSaved();
+      // The server hot-swapped the agent client; tell the health
+      // banner to re-poll right now so the red bar clears instead of
+      // sitting stale until the next 30s tick.
+      window.dispatchEvent(new CustomEvent('companion:agent-changed'));
+      // Fade the "Applied" hint after 4s so it doesn't linger.
+      setTimeout(() => setSavedAt(null), 4000);
     } catch (e) { setError((e as Error).message); }
     finally { setSaving(false); }
-  };
-
-  const restart = async () => {
-    const inv = tauriInvoke();
-    if (!inv) { window.alert('Restart companion-server to apply.'); return; }
-    try { await inv('restart_app'); }
-    catch (e) { setError(`restart failed: ${(e as Error).message}`); }
   };
 
   const testConnection = async () => {
@@ -656,7 +581,7 @@ function ZeroclawEditor({
           <>
             {error && <Hint tone="warn">{error}</Hint>}
             {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
-            {!error && !dirty && savedAt && <Hint tone="good">Saved — click <strong>Restart</strong> to apply.</Hint>}
+            {!error && !dirty && savedAt && <Hint tone="good">✓ Applied — agent switched live.</Hint>}
             {!error && !dirty && !savedAt && (
               <Hint tone={current.reachable ? 'good' : 'warn'}>
                 {current.reachable
@@ -672,9 +597,8 @@ function ZeroclawEditor({
       >
         <Button onClick={testConnection} disabled={testResult === 'testing'}>Test connection</Button>
         <Button onClick={save} primary disabled={!dirty || saving}>
-          {saving ? 'Saving…' : 'Save'}
+          {saving ? 'Applying…' : 'Apply'}
         </Button>
-        <Button onClick={restart}>Restart</Button>
       </EditorFooter>
     </>
   );
@@ -1133,15 +1057,11 @@ function SubagentEditor({
       }
       setSavedAt(Date.now());
       setApiKey('');
+      // The server hot-swapped the subagent in-place. Fade the
+      // "Applied" hint after 4s so it doesn't linger.
+      setTimeout(() => setSavedAt(null), 4000);
     } catch (e) { setError((e as Error).message); }
     finally { setSaving(false); }
-  };
-
-  const restart = async () => {
-    const inv = tauriInvoke();
-    if (!inv) { window.alert('Restart the companion-server process to apply.'); return; }
-    try { await inv('restart_app'); }
-    catch (e) { setError(`restart failed: ${(e as Error).message}`); }
   };
 
   return (
@@ -1246,14 +1166,13 @@ function SubagentEditor({
           <>
             {error && <Hint tone="warn">{error}</Hint>}
             {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
-            {!error && !dirty && savedAt && <Hint tone="good">Saved — click <strong>Restart</strong> to apply.</Hint>}
+            {!error && !dirty && savedAt && <Hint tone="good">✓ Applied — subagent swapped live.</Hint>}
           </>
         }
       >
         <Button onClick={save} primary disabled={!dirty || saving}>
-          {saving ? 'Saving…' : 'Save'}
+          {saving ? 'Applying…' : 'Apply'}
         </Button>
-        <Button onClick={restart}>Restart</Button>
       </EditorFooter>
 
       {backend === 'webhook' && !tomlHintDismissed && (
@@ -1592,26 +1511,4 @@ function Button({
   );
 }
 
-/// Default style for plain text/number inputs and selects. Use
-/// `monoInputStyle` for path/URL/code fields where monospace is
-/// actually helpful — most text inputs read better in the system font.
-const inputStyle: React.CSSProperties = {
-  flex: '1 1 280px', minWidth: 220,
-  background: tokens.bgInput,
-  color: tokens.text,
-  padding: '9px 12px',
-  borderRadius: tokens.radiusSm,
-  border: `1px solid ${tokens.border}`,
-  fontSize: 13,
-  fontFamily: 'inherit',
-  outline: 'none',
-};
-
-/// Monospace variant for paths, URLs, tokens, and code-shaped values
-/// where character alignment is the point. Inherits everything else
-/// from `inputStyle`.
-const monoInputStyle: React.CSSProperties = {
-  ...inputStyle,
-  fontFamily: 'ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace',
-  fontSize: 12.5,
-};
+// inputStyle / monoInputStyle moved to ../lib/theme — imported above.

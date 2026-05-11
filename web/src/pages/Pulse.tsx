@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { HTTP_BASE } from '../lib/apiBase';
 import { openExternal } from '../lib/tauriShell';
 import { cachedJson, invalidateCache } from '../lib/fetchCache';
+import { tokens } from '../lib/theme';
 
 // ── Types mirroring /api/pulse responses ─────────────────────────
 
@@ -62,12 +63,25 @@ export default function Pulse() {
       contain: 'paint',
       overscrollBehavior: 'contain',
     }}>
-      <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 }}>
-          <h1 style={{ margin: 0, fontSize: 24 }}>Pulse</h1>
+      <div style={{ padding: '40px 32px', maxWidth: 1100, margin: '0 auto' }}>
+        <header style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 24 }}>
+          <div>
+            <h1 style={{
+              margin: 0, fontSize: tokens.fontPage, fontWeight: 700,
+              letterSpacing: '-0.01em', color: tokens.text,
+            }}>
+              Pulse
+            </h1>
+            <p style={{
+              color: tokens.textMuted, fontSize: 13, lineHeight: 1.55,
+              margin: '6px 0 0 0',
+            }}>
+              Ambient feeds and triggers from the agent's collectors.
+            </p>
+          </div>
           <span style={{ flex: 1 }} />
           <Tabs current={tab} onChange={setTab} />
-        </div>
+        </header>
 
         {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
@@ -84,19 +98,26 @@ function Tabs({ current, onChange }: { current: Tab; onChange: (t: Tab) => void 
     { id: 'sources', label: 'Sources' },
   ];
   return (
-    <div style={{ display: 'flex', gap: 4, background: '#16181c', padding: 4, borderRadius: 8, border: '1px solid #2a2d33' }}>
+    <div style={{
+      display: 'flex', gap: 4,
+      background: tokens.bgPanel, padding: 4,
+      borderRadius: tokens.radius,
+      border: `1px solid ${tokens.border}`,
+    }}>
       {items.map((it) => (
         <button
           key={it.id}
           type="button"
           onClick={() => onChange(it.id)}
+          className="ws-btn"
           style={{
             padding: '6px 14px',
-            borderRadius: 6,
+            borderRadius: tokens.radiusSm,
             border: 'none',
-            background: current === it.id ? '#3b82f6' : 'transparent',
-            color: current === it.id ? '#fff' : '#aaa',
-            fontSize: 13,
+            background: current === it.id ? tokens.primary : 'transparent',
+            color: current === it.id ? '#fff' : tokens.textMuted,
+            fontSize: 12.5,
+            fontWeight: 500,
             cursor: 'pointer',
           }}
         >

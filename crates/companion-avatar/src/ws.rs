@@ -131,6 +131,8 @@ use tokio::sync::broadcast;
 use crate::config::AvatarConfig;
 use crate::expression::ExpressionMapper;
 use crate::protocol::{AvatarMessage, AvatarNotification};
+use arc_swap::ArcSwapOption;
+
 use crate::subagent::AvatarSubagent;
 use crate::tts_server::AnimeTtsManager;
 
@@ -156,10 +158,16 @@ pub enum AvatarEvent {
 }
 
 /// Shared state for the avatar WebSocket route.
+///
+/// `subagent` lives behind an [`ArcSwapOption`] so the settings UI can
+/// rebuild it at runtime (new backend / API key / model / base URL)
+/// without a process restart. Read path is lock-free: each call site
+/// `.load()`s a snapshot for the duration of one turn, so a swap that
+/// lands mid-turn doesn't tear state.
 pub struct AvatarWsState {
     pub config: AvatarConfig,
     pub event_tx: broadcast::Sender<AvatarEvent>,
-    pub subagent: Option<Arc<AvatarSubagent>>,
+    pub subagent: ArcSwapOption<AvatarSubagent>,
     pub tts: Arc<AnimeTtsManager>,
 }
 
@@ -261,11 +269,17 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let mut motion_to_send: Option<AvatarNotification> = None;
     let mut subagent_used = false;
 
+    // Snapshot the current subagent for the duration of this turn.
+    // If the user changes subagent config mid-turn via Settings, the
+    // running turn keeps using the old client; the next turn picks up
+    // the new one. Lock-free read, cheap to clone the Arc.
+    let subagent_snap = state.subagent.load_full();
+
     // Skip subagent when chat == tts language and the user opted into
     // the fast-path: the "translation" would be a no-op and keyword
     // detection picks a sensible expression. Saves ~5–10s per turn.
     let need_translation = chat_lang != tts_lang;
-    let should_run_subagent = state.subagent.is_some()
+    let should_run_subagent = subagent_snap.is_some()
         && (need_translation || !state.config.subagent.only_when_translating);
 
     // Streaming branch: when enabled + the backend supports it, take
@@ -275,7 +289,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let streaming_eligible = should_run_subagent
         && state.config.subagent.streaming
         && need_translation
-        && state.subagent.as_ref().map(|s| s.supports_streaming()).unwrap_or(false);
+        && subagent_snap.as_ref().map(|s| s.supports_streaming()).unwrap_or(false);
     if streaming_eligible {
         return run_streaming_speak(
             state,
@@ -300,7 +314,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     //     so the user starts hearing audio before the whole bulk
     //     translation finishes generating downstream chunks.
     let (expression, tts_text_opt, clean_chat_opt) = if should_run_subagent {
-        let subagent = state.subagent.as_ref().unwrap();
+        let subagent = subagent_snap.as_ref().unwrap();
         match subagent.analyze(text, &chat_lang, &tts_lang).await {
             Some(analysis) => {
                 subagent_used = true;
@@ -318,7 +332,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             None => (keyword_expr, None, None),
         }
     } else {
-        if state.subagent.is_some() && !need_translation {
+        if subagent_snap.is_some() && !need_translation {
             tracing::debug!(
                 "avatar: subagent skipped (same language; only_when_translating=true)"
             );
@@ -742,7 +756,10 @@ async fn run_streaming_speak(
 
     // Drive the streaming translation. Each delta append triggers a
     // sentence-pop loop; complete sentences flow to the dispatcher.
-    let subagent = state.subagent.as_ref().unwrap();
+    let subagent_snap = state.subagent.load_full();
+    let subagent = subagent_snap
+        .as_ref()
+        .expect("run_streaming_speak called without a subagent — process_speak gates this");
     let translation_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let buf_clone = translation_buf.clone();
     let tx_clone = tx.clone();

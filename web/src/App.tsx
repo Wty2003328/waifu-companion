@@ -161,7 +161,7 @@ function ZeroclawHealthBanner() {
     let cancelled = false;
     const check = async () => {
       try {
-        const r = await fetch('/api/status');
+        const r = await fetch(`${HTTP_BASE}/api/status`);
         let ok = false;
         if (r.ok) {
           const j = await r.json();
@@ -173,8 +173,27 @@ function ZeroclawHealthBanner() {
       }
     };
     void check();
+    // Background re-poll for the unattended case (agent restarted
+    // externally while the user is on the same page).
     const id = setInterval(check, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
+    // Fast re-poll the moment the user successfully changes the
+    // agent in Settings, so the banner clears without waiting up
+    // to 30s for the next tick. The ZeroclawEditor.save() dispatches
+    // this event after a successful POST /api/config/zeroclaw.
+    const onAgentChange = () => {
+      // The hot-swap is done by the time the event fires; one
+      // immediate re-poll and we're current. Also reset `dismissed`
+      // so if the user previously dismissed a "not running" banner
+      // and the agent comes back, no banner re-appears (it'll be
+      // suppressed by healthy=true anyway).
+      void check();
+    };
+    window.addEventListener('companion:agent-changed', onAgentChange);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      window.removeEventListener('companion:agent-changed', onAgentChange);
+    };
   }, []);
 
   if (healthy !== false || dismissed) return null;
@@ -290,8 +309,8 @@ function Nav() {
         flexShrink: 0,
       }}
     >
-      <Link to="/" style={{ color: '#fff', fontWeight: 600, textDecoration: 'none', fontSize: 14 }}>
-        zeroclaw·companion
+      <Link to="/" style={{ color: '#fff', fontWeight: 600, textDecoration: 'none', fontSize: 14, letterSpacing: '-0.005em' }}>
+        waifu·companion
       </Link>
       <span style={{ flex: 1 }} />
       <NavLink to="/" label="Home" />

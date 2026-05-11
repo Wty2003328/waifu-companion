@@ -8,6 +8,9 @@ description = "Live2D anime avatar subsystem for waifu-companion."
 
 [dependencies]
 companion-core.workspace = true
+# Lock-free atomic swap for the avatar subagent so subagent config
+# changes (backend, key, model) take effect without a process restart.
+arc-swap = "1"
 tokio.workspace = true
 tokio-stream.workspace = true
 futures-util.workspace = true
