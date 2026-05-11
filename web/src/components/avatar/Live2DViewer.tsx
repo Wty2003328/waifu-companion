@@ -196,6 +196,10 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   const appRef = useRef<PIXI.Application | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const modelRef = useRef<any>(null);
+  // True while a drag-to-translate gesture is in flight. Read by the
+  // transform-applier effect so it doesn't snap the model back during
+  // the drag.
+  const draggingRef = useRef(false);
   const animFrameRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
   const [loaded, setLoaded] = useState(false);
@@ -412,6 +416,14 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   // / `model.scale.x` recovers the unscaled width regardless of edition.
   useEffect(() => {
     const applyTransform = () => {
+      // While the user is dragging the model, position is driven
+      // imperatively by the drag handler below — re-applying the
+      // prop-derived transform here would fight it (snap-back jitter).
+      // The handler keeps `model.x/y` exactly where the eventual
+      // committed offset will land, so skipping is safe; the next
+      // run after `onUp` (when the new offset prop arrives) is a
+      // visual no-op.
+      if (draggingRef.current) return;
       const model = modelRef.current;
       const app = appRef.current;
       if (!model || !app) return;
@@ -498,11 +510,16 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
     let dragging = false;
     let startX = 0, startY = 0;
     let lastX = 0, lastY = 0;
+    // Cumulative drag delta in screen pixels. Applied imperatively to
+    // the PIXI model on each move (no React round-trip → 60+fps smooth),
+    // then committed to the parent's offset state once on release.
+    let accumDx = 0, accumDy = 0;
 
     const onDown = (e: MouseEvent) => {
       if (e.button !== 0) return; // left button only
       pressing = true;
       dragging = false;
+      accumDx = accumDy = 0;
       startX = lastX = e.clientX;
       startY = lastY = e.clientY;
     };
@@ -513,12 +530,26 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
       if (!dragging) {
         if (Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) > DRAG_THRESHOLD) {
           dragging = true;
-          if (dragToTranslate) canvas.style.cursor = 'grabbing';
+          if (dragToTranslate) {
+            canvas.style.cursor = 'grabbing';
+            draggingRef.current = true; // pause the transform applier
+          }
         } else {
           return;
         }
       }
-      if (dragToTranslate && onTranslate) onTranslate(dx, dy);
+      if (dragToTranslate) {
+        // Move the model directly — no setState, so the drag tracks
+        // the pointer at display refresh rate instead of React's
+        // render cadence. The cumulative delta is committed on `onUp`.
+        const model = modelRef.current;
+        if (model) {
+          model.x += dx;
+          model.y += dy;
+        }
+        accumDx += dx;
+        accumDy += dy;
+      }
       lastX = e.clientX;
       lastY = e.clientY;
     };
@@ -526,8 +557,22 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
       const wasDragging = dragging;
       pressing = false;
       dragging = false;
-      canvas.style.cursor = '';
-      if (wasDragging) return; // suppress click-as-motion when it was a drag
+      canvas.style.cursor = dragToTranslate ? 'grab' : '';
+      if (wasDragging) {
+        if (dragToTranslate) {
+          // Commit the cumulative delta to the parent's offset state
+          // once. When the new offsetX/offsetY props arrive, the
+          // transform applier repositions to the same place the model
+          // already is — a visual no-op — so there's no snap. Clearing
+          // draggingRef *after* the commit means the next applier run
+          // (triggered by the prop change) sees the post-drag offset.
+          if (onTranslate && (accumDx !== 0 || accumDy !== 0)) {
+            onTranslate(accumDx, accumDy);
+          }
+          draggingRef.current = false;
+        }
+        return; // a drag never counts as a hit-area tap
+      }
       // Treat as a tap → hit-area motion.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const model = modelRef.current as any;

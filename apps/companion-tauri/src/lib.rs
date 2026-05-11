@@ -479,13 +479,33 @@ async fn pick_folder(
 
 /// Detected GPU info for the Settings dropdown. The TTS engine uses
 /// the index field; name + vram are display-only.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 struct GpuInfo {
     index: i32,
     name: String,
     /// Free / total VRAM in MB. None when we can't tell (WMI fallback).
     vram_total_mb: Option<u64>,
 }
+
+/// On Windows, `std::process::Command::output()` spawns the child with
+/// a fresh console, which flashes a cmd window for a frame or two. The
+/// `CREATE_NO_WINDOW` flag (0x0800_0000) suppresses that. No-op on
+/// other platforms.
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+/// Process-wide cache for the GPU enumeration. `list_gpus` shells out
+/// to `nvidia-smi` / `wmic`, and the Settings page re-mounts its avatar
+/// editor on every navigation back to the page — without the cache,
+/// each visit re-runs both subprocesses. The GPU set doesn't change
+/// during an app session, so we compute it once.
+static GPU_CACHE: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
 
 /// Enumerate the GPUs available for TTS inference. Order of attempts:
 ///   1. `nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits`
@@ -497,16 +517,22 @@ struct GpuInfo {
 ///   3. Empty list — caller should add a "CPU only" option and
 ///      maybe a generic "GPU 0" guess.
 ///
-/// Always best-effort; never errors out.
+/// Always best-effort; never errors out. Result is memoised for the
+/// process lifetime — see `GPU_CACHE`.
 #[tauri::command]
 fn list_gpus() -> Vec<GpuInfo> {
+    GPU_CACHE.get_or_init(detect_gpus).clone()
+}
+
+fn detect_gpus() -> Vec<GpuInfo> {
     // Try nvidia-smi first — most accurate and gives VRAM.
-    if let Ok(out) = std::process::Command::new("nvidia-smi")
-        .args([
+    if let Ok(out) = no_window(
+        std::process::Command::new("nvidia-smi").args([
             "--query-gpu=index,name,memory.total",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
+        ]),
+    )
+    .output()
     {
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -533,14 +559,15 @@ fn list_gpus() -> Vec<GpuInfo> {
     // either have one GPU or know which slot their training rig is in.
     #[cfg(target_os = "windows")]
     {
-        if let Ok(out) = std::process::Command::new("wmic")
-            .args(["path", "win32_videocontroller", "get", "name"])
-            .output()
+        if let Ok(out) = no_window(
+            std::process::Command::new("wmic").args(["path", "win32_videocontroller", "get", "name"]),
+        )
+        .output()
         {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let mut gpus = Vec::new();
-                for (i, line) in text.lines().enumerate() {
+                for line in text.lines() {
                     let trimmed = line.trim();
                     // First line is "Name" header; skip empty lines.
                     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Name") {
@@ -551,7 +578,6 @@ fn list_gpus() -> Vec<GpuInfo> {
                         name: trimmed.to_string(),
                         vram_total_mb: None,
                     });
-                    let _ = i;
                 }
                 if !gpus.is_empty() {
                     return gpus;

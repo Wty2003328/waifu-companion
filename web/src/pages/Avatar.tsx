@@ -125,7 +125,17 @@ function loadHistory(): ChatTurn[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.slice(-HISTORY_LIMIT);
+    // One-time cleanup: older builds could append the same assistant
+    // reply twice (WS frame + HTTP fallback racing). Collapse any
+    // run of adjacent identical turns on load so the persisted
+    // history doesn't carry that cruft forward.
+    const deduped: ChatTurn[] = [];
+    for (const turn of parsed as ChatTurn[]) {
+      const prev = deduped[deduped.length - 1];
+      if (prev && prev.role === turn.role && prev.text === turn.text) continue;
+      deduped.push(turn);
+    }
+    return deduped.slice(-HISTORY_LIMIT);
   } catch {
     return [];
   }
@@ -605,6 +615,24 @@ export default function Avatar() {
   const appendTurn = useCallback((turn: ChatTurn) => {
     if (IS_OVERLAY) return; // overlay isn't authoritative for chat history
     setHistory((prev) => {
+      // Dedup guard. Both the WS Text frame and the HTTP fallback can
+      // append the same assistant reply when their timing straddles
+      // the fallback timeout; an identical assistant turn that landed
+      // in the last ~20 s is almost certainly the same reply arriving
+      // twice, not the model genuinely repeating itself. (User turns
+      // are already deduped in `onUserMessage`.) Same-text + recent →
+      // drop the second.
+      const last = prev[prev.length - 1];
+      if (
+        last &&
+        last.role === turn.role &&
+        last.text === turn.text &&
+        turn.role === 'assistant' &&
+        turn.ts - last.ts < 20_000
+      ) {
+        console.log(`[chat] deduped duplicate ${turn.role} turn "${turn.text.slice(0, 40)}"`);
+        return prev;
+      }
       const next = [...prev, turn].slice(-HISTORY_LIMIT);
       console.log(
         `[chat] +${turn.role} "${turn.text.slice(0, 40)}" → ${next.length} turns (`
