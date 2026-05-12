@@ -44,17 +44,22 @@ async fn main() -> Result<()> {
 
     // ── 1. Talk to the upstream agent (zeroclaw / openclaw / hermes) ──
     let zc = ZeroclawClient::new(&cfg.zeroclaw)?;
-    match zc.health().await {
-        Ok(true) => tracing::info!(
-            "companion: {} at {} is up",
-            cfg.zeroclaw.kind.label(),
-            cfg.zeroclaw.url
-        ),
-        Ok(false) | Err(_) => tracing::warn!(
-            "companion: {} at {} unreachable — chat features will be limited until it comes up",
-            cfg.zeroclaw.kind.label(),
-            cfg.zeroclaw.url
-        ),
+    // Don't *block* startup on the agent — if it's unreachable a TCP
+    // connect to a dead host can stall ~20s, which froze the whole UI
+    // (companion-server hadn't bound its HTTP listener yet). The health
+    // watchdog (below) tracks the agent's real state; this is just an
+    // informational log line, so fire it off the critical path.
+    {
+        let zc_probe = zc.clone();
+        let (kind_label, url) = (cfg.zeroclaw.kind.label().to_string(), cfg.zeroclaw.url.clone());
+        tokio::spawn(async move {
+            match zc_probe.health().await {
+                Ok(true) => tracing::info!("companion: {kind_label} at {url} is up"),
+                Ok(false) | Err(_) => tracing::warn!(
+                    "companion: {kind_label} at {url} unreachable — chat features limited until it comes up"
+                ),
+            }
+        });
     }
 
     // ── 2. Build the avatar subsystem (if enabled) ───────────────

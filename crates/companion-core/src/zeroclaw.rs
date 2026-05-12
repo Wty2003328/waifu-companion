@@ -75,6 +75,12 @@ impl ZeroclawClient {
     pub fn new(cfg: &ZeroclawConfig) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
+            // Fail fast when the agent host is down/unreachable — a bare
+            // TCP connect to a dead host otherwise stalls ~20s (OS SYN
+            // retries), which made health probes and the chat path hang.
+            // The full `timeout` still governs once a connection is made
+            // (the agent's tool loop can legitimately take a while).
+            .connect_timeout(Duration::from_secs(5))
             .build()?;
         Ok(Self {
             kind: cfg.kind,
