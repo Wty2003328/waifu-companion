@@ -29,6 +29,8 @@ interface AvatarConfigView {
     api_url: string | null;
     speed: number;
     launch_command: string | null;
+    auto_start: boolean;
+    close_with_companion: boolean;
     reference_audio: string | null;
     reference_text: string | null;
     reference_language: string | null;
@@ -625,6 +627,8 @@ function AvatarEditor({
   const [ttsPython, setTtsPython] = useState<string>(initialLaunch.python);
   const [ttsScript, setTtsScript] = useState<string>(initialLaunch.script);
   const ttsLaunchCmd = joinLaunch(ttsPython, ttsScript);
+  const [ttsAutoStart, setTtsAutoStart] = useState<boolean>(current.tts.auto_start);
+  const [ttsCloseWithCompanion, setTtsCloseWithCompanion] = useState<boolean>(current.tts.close_with_companion);
   const [ttsRefAudio, setTtsRefAudio] = useState<string>(current.tts.reference_audio ?? '');
   const [ttsRefText, setTtsRefText] = useState<string>(current.tts.reference_text ?? '');
   const [ttsRefLang, setTtsRefLang] = useState<string>(current.tts.reference_language ?? '');
@@ -649,6 +653,8 @@ function AvatarEditor({
     Math.abs(ttsSpeed - current.tts.speed) > 0.001 ||
     ttsEngine.trim() !== current.tts.engine ||
     ttsLaunchCmd.trim() !== (current.tts.launch_command ?? '') ||
+    ttsAutoStart !== current.tts.auto_start ||
+    ttsCloseWithCompanion !== current.tts.close_with_companion ||
     ttsRefAudio.trim() !== (current.tts.reference_audio ?? '') ||
     ttsRefText.trim() !== (current.tts.reference_text ?? '') ||
     ttsRefLang.trim() !== (current.tts.reference_language ?? '') ||
@@ -665,6 +671,8 @@ function AvatarEditor({
     if (Math.abs(ttsSpeed - current.tts.speed) > 0.001) body.tts_speed = ttsSpeed;
     if (ttsEngine.trim() !== current.tts.engine) body.tts_engine = ttsEngine.trim();
     if (ttsLaunchCmd.trim() !== (current.tts.launch_command ?? '')) body.tts_launch_command = ttsLaunchCmd.trim();
+    if (ttsAutoStart !== current.tts.auto_start) body.tts_auto_start = ttsAutoStart;
+    if (ttsCloseWithCompanion !== current.tts.close_with_companion) body.tts_close_with_companion = ttsCloseWithCompanion;
     if (ttsRefAudio.trim() !== (current.tts.reference_audio ?? '')) body.tts_reference_audio = ttsRefAudio.trim();
     if (ttsRefText.trim() !== (current.tts.reference_text ?? '')) body.tts_reference_text = ttsRefText.trim();
     if (ttsRefLang.trim() !== (current.tts.reference_language ?? '')) body.tts_reference_language = ttsRefLang.trim();
@@ -734,8 +742,23 @@ function AvatarEditor({
         </div>
       </FieldRow>
 
+      <Subsection label="Voice server">
+        <FieldRow
+          label="Start with companion"
+          hint="Launch the voice (TTS) server automatically when the companion opens. Off → the companion expects a server already running at the address below."
+        >
+          <Toggle checked={ttsAutoStart} onChange={setTtsAutoStart} />
+        </FieldRow>
+        <FieldRow
+          label="Stop on close"
+          hint="Shut the voice server down when the companion closes. Off → leave it loaded between sessions: the next launch reuses the still-warm server (instant voice), at the cost of holding GPU memory while the companion is closed."
+        >
+          <Toggle checked={ttsCloseWithCompanion} onChange={setTtsCloseWithCompanion} />
+        </FieldRow>
+      </Subsection>
+
       <Subsection label="Voice engine">
-        <FieldRow label="Voice engine">
+        <FieldRow label="Voice engine" hint={spec.description}>
           <select
             value={isCustomEngine ? '__custom' : ttsEngine}
             onChange={(e) => {
@@ -750,9 +773,6 @@ function AvatarEditor({
             <option value="__custom">Other…</option>
           </select>
         </FieldRow>
-        <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 10, lineHeight: 1.5 }}>
-          {spec.description}
-        </div>
         {isCustomEngine && (
           <FieldRow label="Custom engine name">
             <input
@@ -784,7 +804,17 @@ function AvatarEditor({
                 }}
               />
             </FieldRow>
-            <FieldRow label="Server script">
+            <FieldRow
+              label="Server script"
+              hint={
+                <>
+                  The Python the engine runs under and the wrapper script that
+                  serves <code style={{ color: tokens.textMuted }}>/tts</code>.
+                  The script can be an absolute path or relative to the
+                  workspace root (where companion-server is launched from).
+                </>
+              }
+            >
               <PathPicker
                 value={ttsScript}
                 onChange={setTtsScript}
@@ -801,35 +831,22 @@ function AvatarEditor({
                 }}
               />
             </FieldRow>
-            <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
-              The Python the engine runs under and the wrapper script that
-              serves <code style={{ color: '#888' }}>/tts</code>. The script
-              can be either an absolute path or relative to the workspace
-              root (where companion-server is launched from).
-            </div>
           </>
         )}
 
         {spec.needsModelRoot && (
-          <>
-            <FieldRow label={spec.modelRootLabel ?? 'Engine model folder'}>
-              <PathPicker
-                value={ttsModelPath}
-                onChange={setTtsModelPath}
-                placeholder={spec.modelRootHint ?? 'C:/path/to/engine'}
-                pick={async () => {
-                  const path = await pickFolder({ title: `Pick the ${spec.modelRootLabel ?? 'engine'} folder` });
-                  if (path) setTtsModelPath(path);
-                }}
-                buttonLabel="Browse folder"
-              />
-            </FieldRow>
-            {spec.modelRootHint && (
-              <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
-                {spec.modelRootHint}
-              </div>
-            )}
-          </>
+          <FieldRow label={spec.modelRootLabel ?? 'Engine model folder'} hint={spec.modelRootHint}>
+            <PathPicker
+              value={ttsModelPath}
+              onChange={setTtsModelPath}
+              placeholder={spec.modelRootHint ?? 'C:/path/to/engine'}
+              pick={async () => {
+                const path = await pickFolder({ title: `Pick the ${spec.modelRootLabel ?? 'engine'} folder` });
+                if (path) setTtsModelPath(path);
+              }}
+              buttonLabel="Browse folder"
+            />
+          </FieldRow>
         )}
 
         {spec.needsPresetVoice && (
@@ -898,7 +915,10 @@ function AvatarEditor({
                 style={inputStyle}
               />
             </FieldRow>
-            <FieldRow label="Sample language">
+            <FieldRow
+              label="Sample language"
+              hint="Zero-shot voice cloning: the engine reads the sample on every call to lock in timbre + speaking style. Pick a clean, expressive 3-10 second clip in a single take — different samples give different reading styles from the same trained voice (calm clip → calm narration, bright clip → upbeat)."
+            >
               <select
                 value={ttsRefLang}
                 onChange={(e) => setTtsRefLang(e.target.value)}
@@ -910,18 +930,18 @@ function AvatarEditor({
                 ))}
               </select>
             </FieldRow>
-            <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: 4, lineHeight: 1.5 }}>
-              Zero-shot voice cloning: the engine reads the sample on each
-              call to lock in timbre + speaking style. Pick a clean,
-              expressive 3-10 second clip in a single take. Different
-              samples give different reading styles from the same trained
-              voice — calm clip → calm narration, bright clip → upbeat.
-            </div>
           </div>
         )}
         {spec.needsGpu && (
           <>
-            <FieldRow label="GPU device">
+            <FieldRow
+              label="GPU device"
+              hint={
+                detectedGpus.length === 0
+                  ? 'GPU detection unavailable (nvidia-smi not on PATH). Pick GPU 0 if you have one CUDA card, or CPU.'
+                  : `Detected ${detectedGpus.length} GPU${detectedGpus.length === 1 ? '' : 's'} on this machine.`
+              }
+            >
               <select
                 value={ttsGpu}
                 onChange={(e) => setTtsGpu(parseInt(e.target.value, 10))}
@@ -952,16 +972,11 @@ function AvatarEditor({
                 )}
               </select>
             </FieldRow>
-            <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
-              {detectedGpus.length === 0
-                ? 'GPU detection unavailable (nvidia-smi not on PATH). Pick GPU 0 if you have one CUDA card, or CPU.'
-                : `Detected ${detectedGpus.length} GPU${detectedGpus.length === 1 ? '' : 's'} on this machine.`}
-            </div>
           </>
         )}
-        <div style={{ fontSize: 11, color: '#666', marginTop: 4, lineHeight: 1.5 }}>
+        <div style={{ fontSize: 11.5, color: tokens.textDim, marginTop: 12, lineHeight: 1.5 }}>
           The avatar's Live2D model and default expression are set
-          per-character on the <a href="/" style={{ color: '#7aa9ff' }}>Home page</a>.
+          per-character on the <a href="/" style={{ color: tokens.primary }}>Home page</a>.
         </div>
       </Subsection>
 
@@ -1147,7 +1162,10 @@ function SubagentEditor({
       )}
 
       <Subsection label="Timing & streaming">
-        <FieldRow label="Time limit (seconds)">
+        <FieldRow
+          label="Time limit (seconds)"
+          hint="How long to wait for a translation before giving up. Direct AI usually replies in 1–3 seconds; the main-agent path can take 5–10."
+        >
           <input
             type="number" min={5} max={300}
             value={timeout}
@@ -1155,26 +1173,19 @@ function SubagentEditor({
             style={{ ...inputStyle, maxWidth: 100 }}
           />
         </FieldRow>
-        <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginBottom: 8 }}>
-          How long to wait for a translation before giving up.
-          Direct AI usually replies in 1–3 seconds; the main-agent path
-          can take 5–10.
-        </div>
-        <FieldRow label="Stream while speaking">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Toggle checked={streaming} onChange={setStreaming} />
-            <span style={{ fontSize: 11, color: '#666' }}>
+        <FieldRow
+          label="Stream while speaking"
+          hint={
+            <>
               {streaming
-                ? 'TTS starts on the first sentence (~3s) — faster, uses keyword expressions'
-                : 'wait for the full translation (~15-25s) before speaking — picks richer expressions'}
-            </span>
-          </div>
+                ? 'Voice starts on the first sentence (~3 s) — faster, uses keyword-picked expressions.'
+                : 'Waits for the full translation (~15–25 s) before speaking — picks richer expressions.'}
+              {' '}Streaming requires <strong>Direct AI</strong> mode (above); with "Through main agent" it falls back to the non-streaming path automatically.
+            </>
+          }
+        >
+          <Toggle checked={streaming} onChange={setStreaming} />
         </FieldRow>
-        <div style={{ fontSize: 11, color: '#666', marginLeft: 168 }}>
-          Streaming requires <strong>Direct AI</strong> mode (above).
-          With "Through main agent" it falls back to the non-streaming
-          path automatically.
-        </div>
       </Subsection>
 
       <EditorFooter

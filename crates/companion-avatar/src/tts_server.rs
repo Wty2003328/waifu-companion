@@ -163,7 +163,18 @@ impl AnimeTtsManager {
 
         let mut child_guard = self.child.lock().await;
         if child_guard.is_some() {
-            tracing::warn!("avatar: TTS server already running");
+            tracing::warn!("avatar: TTS server already running (this process)");
+            return Ok(());
+        }
+
+        // A previous companion run with `close_with_companion = false`
+        // may have left a still-warm TTS server at our port. Adopt it
+        // instead of launching a duplicate (which would fail to bind).
+        if self.probe_health().await {
+            tracing::info!(
+                "avatar: adopting already-running TTS server at {} (skipping launch)",
+                self.api_url
+            );
             return Ok(());
         }
 
@@ -403,6 +414,23 @@ impl AnimeTtsManager {
         }
     }
 
+    /// One quick `/health` GET with a short timeout — used at startup to
+    /// detect a still-warm server left by a prior run (`close_with_companion
+    /// = false`) so we adopt it rather than launch a duplicate.
+    async fn probe_health(&self) -> bool {
+        let url = format!("{}/health", self.api_url);
+        match self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
     /// Wait for the TTS server to become healthy.
     async fn wait_for_health(&self) -> Result<()> {
         let start = std::time::Instant::now();
@@ -440,6 +468,7 @@ mod tests {
             port: 9880,
             launch_command: None,
             auto_start: false,
+            close_with_companion: true,
             voice: Some("default".to_string()),
             language: "en".to_string(),
             speed: 1.0,

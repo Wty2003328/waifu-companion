@@ -438,8 +438,18 @@ pub struct AvatarTtsConfig {
     pub port: u16,
     #[serde(default)]
     pub launch_command: Option<String>,
+    /// Spawn the TTS server (via `launch_command`) when the companion
+    /// starts. Off → the companion assumes an externally-managed server
+    /// is already up at `api_url`.
     #[serde(default = "default_true")]
     pub auto_start: bool,
+    /// Shut the spawned TTS server down when the companion exits
+    /// (POST `/shutdown` + CUDA cleanup, then kill if it lingers). Off →
+    /// leave it running between sessions — the next launch adopts the
+    /// still-warm server (instant voice) at the cost of holding GPU
+    /// memory while the companion is closed.
+    #[serde(default = "default_true")]
+    pub close_with_companion: bool,
     #[serde(default)]
     pub voice: Option<String>,
     #[serde(default = "default_tts_language")]
@@ -507,6 +517,7 @@ impl Default for AvatarTtsConfig {
             port: 9880,
             launch_command: None,
             auto_start: true,
+            close_with_companion: true,
             voice: None,
             language: default_tts_language(),
             speed: default_tts_speed(),

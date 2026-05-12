@@ -256,6 +256,14 @@ pub struct AvatarOverride {
     /// for voice characteristics instead.
     #[serde(default)]
     pub tts_voice: Option<String>,
+    /// Spawn the TTS server with the companion (`[avatar.tts] auto_start`).
+    #[serde(default)]
+    pub tts_auto_start: Option<bool>,
+    /// Shut the TTS server down when the companion exits
+    /// (`[avatar.tts] close_with_companion`). Off → keep it warm between
+    /// sessions; the next launch adopts the running server.
+    #[serde(default)]
+    pub tts_close_with_companion: Option<bool>,
 }
 
 /// Subagent backend + LLM connection overrides. Anything `Some` replaces
@@ -317,7 +325,9 @@ impl RuntimeOverride {
                 || a.tts_reference_language.is_some()
                 || a.tts_model_path.is_some()
                 || a.tts_gpu_device.is_some()
-                || a.tts_voice.is_some();
+                || a.tts_voice.is_some()
+                || a.tts_auto_start.is_some()
+                || a.tts_close_with_companion.is_some();
             if needs_tts_obj {
                 let tts = avatar_obj.entry("tts").or_insert_with(|| serde_json::json!({}));
                 if !tts.is_object() { *tts = serde_json::json!({}); }
@@ -335,6 +345,12 @@ impl RuntimeOverride {
                 }
                 if let Some(ref v) = a.tts_launch_command {
                     tts_obj.insert("launch_command".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = a.tts_auto_start {
+                    tts_obj.insert("auto_start".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = a.tts_close_with_companion {
+                    tts_obj.insert("close_with_companion".into(), serde_json::Value::Bool(v));
                 }
                 if let Some(ref v) = a.tts_reference_audio {
                     tts_obj.insert("reference_audio".into(), serde_json::Value::String(v.clone()));

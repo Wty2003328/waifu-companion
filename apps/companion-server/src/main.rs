@@ -243,11 +243,19 @@ async fn main() -> Result<()> {
     // up to 8s for clean exit (which runs torch.cuda.empty_cache() +
     // sync), fall back to kill. Without this, leaving the model running
     // leaks fragmented VRAM into whatever graphics workload runs next.
+    // Skipped when `[avatar.tts] close_with_companion = false` — then we
+    // leave the server warm so the next launch adopts it (instant voice).
     if let Some(avatar) = avatar_for_shutdown {
-        tracing::info!("companion: stopping TTS server before exit");
-        let tts_snap = avatar.tts.load_full();
-        if let Err(e) = tts_snap.stop_server().await {
-            tracing::warn!("companion: TTS stop_server returned {e}");
+        if avatar.config.load().tts.close_with_companion {
+            tracing::info!("companion: stopping TTS server before exit");
+            let tts_snap = avatar.tts.load_full();
+            if let Err(e) = tts_snap.stop_server().await {
+                tracing::warn!("companion: TTS stop_server returned {e}");
+            }
+        } else {
+            tracing::info!(
+                "companion: leaving TTS server running (close_with_companion = false)"
+            );
         }
     }
     tracing::info!("companion: bye");
@@ -654,6 +662,8 @@ async fn handle_get_config(
                 "api_url": cfg.tts.api_url,
                 "speed": cfg.tts.speed,
                 "launch_command": cfg.tts.launch_command,
+                "auto_start": cfg.tts.auto_start,
+                "close_with_companion": cfg.tts.close_with_companion,
                 "reference_audio": cfg.tts.reference_audio,
                 "reference_text": cfg.tts.reference_text,
                 "reference_language": cfg.tts.reference_language,
@@ -1099,6 +1109,10 @@ struct AvatarOverrideRequest {
     tts_engine: Option<String>,
     /// Full launch command for the TTS server process.
     tts_launch_command: Option<String>,
+    /// Spawn the TTS server when the companion starts.
+    tts_auto_start: Option<bool>,
+    /// Shut the TTS server down when the companion exits (off → keep warm).
+    tts_close_with_companion: Option<bool>,
     /// Path to the reference audio clip used for voice cloning.
     tts_reference_audio: Option<String>,
     /// Transcript of the reference clip.
@@ -1186,6 +1200,8 @@ async fn handle_post_avatar_override(
     if let Some(v) = req.tts_launch_command {
         av.tts_launch_command = if v.is_empty() { None } else { Some(v) };
     }
+    if let Some(v) = req.tts_auto_start { av.tts_auto_start = Some(v); }
+    if let Some(v) = req.tts_close_with_companion { av.tts_close_with_companion = Some(v); }
     if let Some(v) = req.tts_reference_audio {
         av.tts_reference_audio = if v.is_empty() { None } else { Some(v) };
     }
