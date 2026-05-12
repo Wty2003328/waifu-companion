@@ -64,6 +64,17 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# --- startup-time knobs (set before torch / transformers import) ---
+# CUDA 12+ defaults to LAZY module loading; making it explicit is harmless
+# and shaves a bit off `import torch` + first CUDA op on older toolkits.
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+# All HF model weights live on disk already (GPT-SoVITS ships them) — never
+# let transformers/huggingface_hub do a network round-trip to "check for
+# updates" at `from_pretrained()` time. Saves a few seconds on every start.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 # Whether to disable PyTorch's CUDA caching allocator. When enabled,
 # every tensor `del` returns memory to the driver immediately instead
 # of into PyTorch's per-process pool — preventing VRAM fragmentation
@@ -171,13 +182,25 @@ VOCODER_PATH = str(
     GPT_SOVITS_ROOT / "GPT_SoVITS" / "pretrained_models" / "gsv-v4-pretrained" / "vocoder.pth"
 )
 
-import nltk
+# nltk (English POS tagger + cmudict) is only used by `clean_text(text, "en")`.
+# Importing it + checking/downloading the data costs ~1s at startup that a
+# Japanese-only setup never needs — defer it to the first English request.
+_nltk_ready = False
 
-for pkg in ("averaged_perceptron_tagger_eng", "cmudict", "averaged_perceptron_tagger"):
-    try:
-        nltk.data.find(f"taggers/{pkg}" if "tagger" in pkg else f"corpora/{pkg}")
-    except LookupError:
-        nltk.download(pkg, quiet=True)
+
+def _ensure_nltk() -> None:
+    global _nltk_ready
+    if _nltk_ready:
+        return
+    import nltk
+
+    for pkg in ("averaged_perceptron_tagger_eng", "cmudict", "averaged_perceptron_tagger"):
+        try:
+            nltk.data.find(f"taggers/{pkg}" if "tagger" in pkg else f"corpora/{pkg}")
+        except LookupError:
+            nltk.download(pkg, quiet=True)
+    _nltk_ready = True
+
 
 print("[gpt-sovits-tts] Loading HuBERT...")
 from GPT_SoVITS.feature_extractor import cnhubert  # noqa: E402
@@ -185,11 +208,31 @@ from GPT_SoVITS.feature_extractor import cnhubert  # noqa: E402
 cnhubert.cnhubert_base_path = CNHUBERT_PATH
 hubert = cnhubert.get_model().half().to(DEVICE).eval()
 
-print("[gpt-sovits-tts] Loading BERT...")
-from transformers import AutoModelForMaskedLM, AutoTokenizer  # noqa: E402
+# The Chinese RoBERTa BERT (~650 MB) is only consulted by `_bert_for()` when
+# the text language is "zh" — for ja/en it returns zeros. So skip loading it
+# at startup (and skip `import transformers`, ~1-2 s) and pull it in lazily
+# on the first zh request.
+_bert_lock = threading.Lock()
+_bert_pair = None  # (tokenizer, model) once loaded
 
-tokenizer = AutoTokenizer.from_pretrained(BERT_PATH)
-bert = AutoModelForMaskedLM.from_pretrained(BERT_PATH).half().to(DEVICE).eval()
+
+def _get_bert():
+    global _bert_pair
+    if _bert_pair is None:
+        with _bert_lock:
+            if _bert_pair is None:
+                print("[gpt-sovits-tts] Loading BERT (first zh request)...")
+                from transformers import AutoModelForMaskedLM, AutoTokenizer
+
+                tok = AutoTokenizer.from_pretrained(BERT_PATH, local_files_only=True)
+                mdl = (
+                    AutoModelForMaskedLM.from_pretrained(BERT_PATH, local_files_only=True)
+                    .half()
+                    .to(DEVICE)
+                    .eval()
+                )
+                _bert_pair = (tok, mdl)
+    return _bert_pair
 
 print("[gpt-sovits-tts] Loading SoVITS v4 (DiT + LoRA-merged)...")
 import GPT_SoVITS.utils as utils  # noqa: E402
@@ -371,6 +414,8 @@ def _mel_v4(x):
 
 
 def _phoneme_ids(text, lang):
+    if lang == "en":
+        _ensure_nltk()  # GPT-SoVITS' English cleaner needs the nltk taggers
     phones, w2p, norm = clean_text(text, lang, "v2")
     return cleaned_text_to_sequence(phones, "v2"), w2p, norm
 
@@ -378,6 +423,7 @@ def _phoneme_ids(text, lang):
 def _bert_for(phone_ids, w2p, norm, lang):
     if lang != "zh":
         return torch.zeros((1024, len(phone_ids)), dtype=torch.float32)
+    tokenizer, bert = _get_bert()
     with torch.no_grad():
         inp = {k: v.to(DEVICE) for k, v in tokenizer(norm, return_tensors="pt").items()}
         out = bert(**inp, output_hidden_states=True)
