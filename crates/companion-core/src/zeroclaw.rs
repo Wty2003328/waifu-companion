@@ -367,4 +367,107 @@ mod tests {
         let raw = serde_json::json!({"event": "tool.call", "name": "shell"});
         matches!(classify_event(raw), AgentEvent::Other { .. });
     }
+
+    // ── Additional coverage ────────────────────────────────────────
+
+    #[test]
+    fn classify_uses_type_field_when_event_missing() {
+        // Some forks emit `type` instead of `event`.
+        let raw = serde_json::json!({
+            "type": "agent.reply",
+            "text": "from type",
+            "session_id": "sx",
+        });
+        match classify_event(raw) {
+            AgentEvent::AgentReply { text, session_id } => {
+                assert_eq!(text, "from type");
+                assert_eq!(session_id.as_deref(), Some("sx"));
+            }
+            _ => panic!("expected AgentReply"),
+        }
+    }
+
+    #[test]
+    fn classify_content_field_alternative_to_text() {
+        // The classifier accepts `content` as well as `text`.
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "via content field",
+            "final": true,
+        });
+        match classify_event(raw) {
+            AgentEvent::AgentReply { text, .. } => {
+                assert_eq!(text, "via content field");
+            }
+            _ => panic!("expected AgentReply from content+role+final"),
+        }
+    }
+
+    #[test]
+    fn classify_role_assistant_without_final_becomes_token() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "partial",
+        });
+        match classify_event(raw) {
+            AgentEvent::AgentToken { text, .. } => {
+                assert_eq!(text, "partial");
+            }
+            other => panic!("expected AgentToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_no_text_returns_other() {
+        let raw = serde_json::json!({
+            "event": "agent.reply",
+            "session_id": "abc",
+        });
+        // No text → can't classify as Reply; falls through to Other.
+        matches!(classify_event(raw), AgentEvent::Other { .. });
+    }
+
+    #[test]
+    fn agent_event_serializes_with_kind_tag() {
+        let ev = AgentEvent::AgentReply {
+            text: "hi".into(),
+            session_id: Some("s1".into()),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        // tag: kind, rename_all: snake_case → "agent_reply"
+        assert!(s.contains("\"kind\":\"agent_reply\""), "got {s}");
+    }
+
+    #[test]
+    fn agent_event_deserializes_other_payload() {
+        let s = r#"{"kind":"other","raw":{"event":"x","payload":[1,2,3]}}"#;
+        let ev: AgentEvent = serde_json::from_str(s).unwrap();
+        matches!(ev, AgentEvent::Other { .. });
+    }
+
+    #[test]
+    fn classify_token_via_event_field_keyword() {
+        // The classifier looks for "token" as a substring in event_type.
+        let raw = serde_json::json!({
+            "event": "stream.delta.token",
+            "text": "tok",
+        });
+        match classify_event(raw) {
+            AgentEvent::AgentToken { text, .. } => assert_eq!(text, "tok"),
+            other => panic!("expected AgentToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_reply_via_event_keyword() {
+        // "reply" substring in event_type triggers reply classification.
+        let raw = serde_json::json!({
+            "event": "final.reply",
+            "text": "done",
+        });
+        match classify_event(raw) {
+            AgentEvent::AgentReply { text, .. } => assert_eq!(text, "done"),
+            other => panic!("expected AgentReply, got {other:?}"),
+        }
+    }
 }

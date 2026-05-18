@@ -77,13 +77,12 @@ impl PulseSubsystem {
             )));
         }
         // GitHub releases — repos in toml, no DB plumbing needed.
-        if let Some(gh) = cfg.collectors.github_releases.clone() {
-            if gh.enabled {
+        if let Some(gh) = cfg.collectors.github_releases.clone()
+            && gh.enabled {
                 list.push(Arc::new(
                     collectors::github::GithubReleasesCollector::new(gh),
                 ));
             }
-        }
 
         tracing::info!("pulse: {} collector(s) registered", list.len());
 

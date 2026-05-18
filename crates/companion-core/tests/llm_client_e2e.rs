@@ -49,6 +49,7 @@ async fn chat_round_trip() {
         temperature: 0.5,
         max_tokens: 100,
         timeout_secs: 5,
+        disable_thinking: false,
     };
     let client = LlmClient::new(&cfg).unwrap();
     let reply = client

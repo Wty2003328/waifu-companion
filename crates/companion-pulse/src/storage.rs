@@ -23,12 +23,11 @@ pub struct PulseDatabase {
 impl PulseDatabase {
     /// Open or create the database, run migrations.
     pub async fn new(db_path: &str) -> Result<Self> {
-        if let Some(parent) = Path::new(db_path).parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = Path::new(db_path).parent()
+            && !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create dir {}", parent.display()))?;
             }
-        }
 
         // One-shot bootstrap: WAL + foreign keys.
         let path = db_path.to_string();
@@ -50,6 +49,11 @@ impl PulseDatabase {
         Ok(db)
     }
 
+    // Reserved for future Pulse code paths that want a primed
+    // sqlite handle (with PRAGMA busy_timeout pre-set) without
+    // re-implementing the boilerplate. Not yet called — keeping it
+    // here so the next collector PR doesn't have to re-add it.
+    #[allow(dead_code)]
     fn open(&self) -> Result<Connection> {
         let conn = Connection::open(self.path.as_str())?;
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
@@ -809,5 +813,126 @@ mod tests {
         assert_eq!(n, 1);
         let feed = db.get_feed(10, 0, None, None, false).await.unwrap();
         assert!(feed.is_empty());
+    }
+
+    // ── Additional coverage ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_inserts_dont_corrupt() {
+        // Spawn 8 parallel insert tasks, verify all land and the
+        // database remains queryable.
+        let (_d, db) = fresh_db().await;
+        let mut handles = vec![];
+        for i in 0..8 {
+            let db2 = db.clone();
+            handles.push(tokio::spawn(async move {
+                for j in 0..5 {
+                    let mut r = raw_item(Some(&format!("https://x/{i}/{j}")));
+                    r.title = format!("item-{i}-{j}");
+                    db2.insert_item(&r).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let feed = db.get_feed(100, 0, None, None, false).await.unwrap();
+        assert_eq!(feed.len(), 40, "expected 8×5=40 items, got {}", feed.len());
+    }
+
+    #[tokio::test]
+    async fn settings_kv_round_trip_and_overwrite() {
+        let (_d, db) = fresh_db().await;
+        // Initially unset.
+        assert!(db.get_setting("missing").await.unwrap().is_none());
+        // Set then get.
+        db.set_setting("k1", Some("v1")).await.unwrap();
+        assert_eq!(db.get_setting("k1").await.unwrap().as_deref(), Some("v1"));
+        // Overwrite.
+        db.set_setting("k1", Some("v2")).await.unwrap();
+        assert_eq!(db.get_setting("k1").await.unwrap().as_deref(), Some("v2"));
+        // Set None → stored as NULL; get returns None.
+        db.set_setting("k1", None).await.unwrap();
+        assert!(db.get_setting("k1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn video_channel_crud_idempotent_insert() {
+        let (_d, db) = fresh_db().await;
+        // First insert.
+        db.add_video_channel("youtube", "UCabc", "Alice").await.unwrap();
+        let rows = db.get_video_channels().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        // Duplicate key insert with updated display name — should UPSERT.
+        db.add_video_channel("youtube", "UCabc", "Alice Renamed").await.unwrap();
+        let rows = db.get_video_channels().await.unwrap();
+        assert_eq!(rows.len(), 1, "duplicate key should UPSERT not append");
+        assert_eq!(rows[0].2, "Alice Renamed");
+        // Different platform with same channel_id is a different row.
+        db.add_video_channel("bilibili", "UCabc", "Bob").await.unwrap();
+        let rows = db.get_video_channels().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Remove one.
+        db.remove_video_channel("youtube", "UCabc").await.unwrap();
+        let rows = db.get_video_channels().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "bilibili");
+    }
+
+    #[tokio::test]
+    async fn dedup_url_dedup_with_sql_meta_chars() {
+        let (_d, db) = fresh_db().await;
+        let evil = "https://example.com/feed?q=' OR 1=1--";
+        db.insert_item(&raw_item(Some(evil))).await.unwrap();
+        assert!(db.item_exists_by_url(evil).await.unwrap());
+        assert!(!db.item_exists_by_url("https://other.example/x").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_unknown_item_read_returns_false() {
+        let (_d, db) = fresh_db().await;
+        let changed = db.mark_item_read("never-existed", true).await.unwrap();
+        assert!(!changed, "marking nonexistent should return false");
+    }
+
+    #[tokio::test]
+    async fn user_feed_replace_on_same_url() {
+        // INSERT OR REPLACE → same URL, new name overrides.
+        let (_d, db) = fresh_db().await;
+        db.add_user_feed("First", "https://a.example/feed").await.unwrap();
+        db.add_user_feed("Second", "https://a.example/feed").await.unwrap();
+        let feeds = db.get_user_feeds().await.unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].0, "Second");
+    }
+
+    #[tokio::test]
+    async fn feed_limit_offset_clamps_at_table_end() {
+        let (_d, db) = fresh_db().await;
+        for i in 0..3 {
+            db.insert_item(&raw_item(Some(&format!("https://x/{i}")))).await.unwrap();
+        }
+        // Offset past the end → empty result, not error.
+        let v = db.get_feed(10, 100, None, None, false).await.unwrap();
+        assert!(v.is_empty());
+        // Limit 0 → empty.
+        let v = db.get_feed(0, 0, None, None, false).await.unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collector_status_returns_runs_in_recent_first_order() {
+        let (_d, db) = fresh_db().await;
+        let r1 = db.start_collector_run("rss").await.unwrap();
+        db.finish_collector_run(&r1, 2, None).await.unwrap();
+        // Sleep so collected_at strictly increases.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let r2 = db.start_collector_run("hn").await.unwrap();
+        db.finish_collector_run(&r2, 4, None).await.unwrap();
+        let runs = db.get_collector_status().await.unwrap();
+        assert_eq!(runs.len(), 2);
+        // Most-recent first.
+        assert_eq!(runs[0].collector_id, "hn");
+        assert_eq!(runs[1].collector_id, "rss");
     }
 }

@@ -57,14 +57,12 @@ pub fn read_attachments(toml_path: &Path, char_id: &str) -> Vec<(String, String)
         let path = ent.path();
         if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("md"))
             == Some(true)
-        {
-            if let (Some(name), Ok(body)) = (
+            && let (Some(name), Ok(body)) = (
                 path.file_name().and_then(|s| s.to_str()).map(String::from),
                 std::fs::read_to_string(&path),
             ) {
                 out.push((name, body));
             }
-        }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -122,7 +120,7 @@ pub fn save(path: &Path, file: &CharactersFile) -> std::io::Result<()> {
 
 /// Look up the active character by id. Returns None if no character
 /// is active or the active id doesn't match any entry.
-pub fn active<'a>(file: &'a CharactersFile) -> Option<&'a Character> {
+pub fn active(file: &CharactersFile) -> Option<&Character> {
     if file.active_id.is_empty() {
         return None;
     }

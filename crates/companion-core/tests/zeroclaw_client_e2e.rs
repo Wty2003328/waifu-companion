@@ -60,6 +60,7 @@ async fn boot_mock(events: Vec<&'static str>) -> u16 {
 
 fn config_for(port: u16) -> ZeroclawConfig {
     ZeroclawConfig {
+        kind: companion_core::AgentKind::Zeroclaw,
         url: format!("http://127.0.0.1:{port}"),
         pair_token: None,
         timeout_secs: 10,

@@ -2,17 +2,17 @@
 //!
 //! Mounted at `/api/pulse/*` only when `[pulse] enabled = true`. Routes:
 //! - `GET  /api/pulse/feed`               — recent items
-//!     ?limit=     max rows (clamped to 500, default 50)
-//!     ?offset=    page offset
-//!     ?source=    filter by source/collector_id
-//!     ?search=    case-insensitive substring on title + content
-//!     ?unread=1   only items not yet marked read
+//!   - `?limit=`   max rows (clamped to 500, default 50)
+//!   - `?offset=`  page offset
+//!   - `?source=`  filter by source/collector_id
+//!   - `?search=`  case-insensitive substring on title + content
+//!   - `?unread=1` only items not yet marked read
 //! - `GET  /api/pulse/unread_count`       — number of unread items
 //! - `POST /api/pulse/items/{id}/read`    — mark one item read
 //! - `DELETE /api/pulse/items/{id}/read`  — mark one item unread
 //! - `POST /api/pulse/items/read_all`     — mark every stored item read
 //! - `POST /api/pulse/items/{id}/summarize` — LLM summary (cached)
-//!     ?force=1   re-summarize even if a cached summary exists
+//!   - `?force=1`  re-summarize even if a cached summary exists
 //! - `GET  /api/pulse/status`             — collector run history
 //! - `POST /api/pulse/trigger/{id}`       — manually run a collector by id
 //! - `GET  /api/pulse/feeds`              — user-managed RSS feeds
@@ -194,13 +194,12 @@ async fn handle_summarize(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, format!("item {id} not found")))?;
 
-    if !force {
-        if let Some(ref cached) = item.summary {
+    if !force
+        && let Some(ref cached) = item.summary {
             return Ok(Json(serde_json::json!({
                 "ok": true, "summary": cached, "cached": true,
             })));
         }
-    }
 
     let summarizer = state.summarizer.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,

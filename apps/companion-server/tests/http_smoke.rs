@@ -61,11 +61,10 @@ enabled = false
     let url = format!("http://127.0.0.1:{port}/health");
     let client = reqwest::Client::new();
     for _ in 0..50 {
-        if let Ok(r) = client.get(&url).send().await {
-            if r.status().is_success() {
+        if let Ok(r) = client.get(&url).send().await
+            && r.status().is_success() {
                 return (child, port, dir);
             }
-        }
         sleep(Duration::from_millis(100)).await;
     }
     panic!("companion-server did not become healthy within 5s");
@@ -87,15 +86,23 @@ async fn health_endpoint_returns_ok() {
 #[tokio::test]
 async fn status_endpoint_reports_disabled_subsystems() {
     let (mut child, port, _dir) = boot_companion().await;
-    let json: serde_json::Value =
-        reqwest::get(&format!("http://127.0.0.1:{port}/api/status"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    // AppHealth defaults `agent_up = true` (optimistic) and the
+    // watchdog flips it to false on its first sweep. The interval can
+    // be a few seconds, so poll /api/status until the value settles
+    // (zeroclaw URL is `127.0.0.1:1` — unreachable — so we expect false).
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/api/status");
+    let mut json: serde_json::Value = serde_json::json!({});
+    for _ in 0..30 {
+        json = client.get(&url).send().await.unwrap().json().await.unwrap();
+        if json["zeroclaw_up"] == false {
+            break;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
     assert_eq!(json["ok"], true);
-    assert_eq!(json["zeroclaw_up"], false); // unreachable in this test
+    assert_eq!(json["zeroclaw_up"], false,
+        "watchdog should have flipped zeroclaw_up to false (URL is :1, unreachable)");
     assert_eq!(json["avatar_enabled"], false);
     assert_eq!(json["pulse_enabled"], false);
     let _ = child.kill().await;

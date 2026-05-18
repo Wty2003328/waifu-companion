@@ -276,12 +276,10 @@ impl LlmClient {
                         .and_then(|c| c.get("delta"))
                         .and_then(|d| d.get("content"))
                         .and_then(|t| t.as_str())
-                    {
-                        if !delta.is_empty() {
+                        && !delta.is_empty() {
                             full.push_str(delta);
                             on_chunk(delta);
                         }
-                    }
                 }
             }
         }
@@ -295,18 +293,15 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 }
 
 fn resolve_api_key(cfg: &LlmConfig) -> Option<String> {
-    if let Some(ref key) = cfg.api_key {
-        if !key.is_empty() {
+    if let Some(ref key) = cfg.api_key
+        && !key.is_empty() {
             return Some(key.clone());
         }
-    }
-    if let Some(ref var) = cfg.api_key_env {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
+    if let Some(ref var) = cfg.api_key_env
+        && let Ok(v) = std::env::var(var)
+            && !v.is_empty() {
                 return Some(v);
             }
-        }
-    }
     std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty())
 }
 
@@ -332,5 +327,118 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_api_key(&cfg), Some("inline".into()));
+    }
+
+    // ── Additional coverage ────────────────────────────────────────
+
+    #[test]
+    fn empty_api_key_falls_through_to_env() {
+        // An explicit empty string in the inline field should NOT be
+        // returned — the resolver should treat it as unset and fall
+        // through to the env var path.
+        unsafe {
+            std::env::set_var("LLM_TEST_KEY_PRIORITY", "from-env");
+        }
+        let cfg = LlmConfig {
+            api_key: Some("".into()),
+            api_key_env: Some("LLM_TEST_KEY_PRIORITY".into()),
+            model: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_api_key(&cfg), Some("from-env".into()));
+        unsafe {
+            std::env::remove_var("LLM_TEST_KEY_PRIORITY");
+        }
+    }
+
+    #[test]
+    fn no_keys_returns_none() {
+        // Save and clear OPENAI_API_KEY for the duration of this test.
+        let saved = std::env::var("OPENAI_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let cfg = LlmConfig {
+            api_key: None,
+            api_key_env: None,
+            model: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_api_key(&cfg), None);
+        // Restore
+        if let Some(v) = saved {
+            unsafe {
+                std::env::set_var("OPENAI_API_KEY", v);
+            }
+        }
+    }
+
+    #[test]
+    fn default_disable_thinking_is_true() {
+        // The default keeps z.ai GLM models fast. If a regression flips
+        // this to false, latency on glm-4.5-flash jumps 20×.
+        let cfg = LlmConfig::default();
+        assert!(cfg.disable_thinking);
+    }
+
+    #[test]
+    fn find_double_newline_handles_empty_buffer() {
+        assert_eq!(super::find_double_newline(&[]), None);
+    }
+
+    #[test]
+    fn find_double_newline_finds_at_start() {
+        let buf = b"\n\nrest";
+        assert_eq!(super::find_double_newline(buf), Some(0));
+    }
+
+    #[test]
+    fn find_double_newline_finds_in_middle() {
+        let buf = b"data: foo\n\ndata: bar\n\n";
+        assert_eq!(super::find_double_newline(buf), Some(9));
+    }
+
+    #[test]
+    fn find_double_newline_returns_none_when_absent() {
+        let buf = b"data: incomplete";
+        assert_eq!(super::find_double_newline(buf), None);
+    }
+
+    #[test]
+    fn role_serializes_as_lowercase() {
+        let m = ChatMessage {
+            role: Role::System,
+            content: "hello".into(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"role\":\"system\""), "got {json}");
+    }
+
+    #[test]
+    fn role_deserializes_assistant() {
+        let json = r#"{"role":"assistant","content":"hi"}"#;
+        let m: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(m.role, Role::Assistant);
+    }
+
+    #[test]
+    fn config_round_trips_through_serde_json() {
+        let cfg = LlmConfig {
+            base_url: "https://example.com/v1".into(),
+            api_key: Some("test".into()),
+            api_key_env: None,
+            model: "gpt-test".into(),
+            temperature: 0.42,
+            max_tokens: 123,
+            timeout_secs: 45,
+            disable_thinking: false,
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: LlmConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.base_url, cfg.base_url);
+        assert_eq!(back.api_key, cfg.api_key);
+        assert!((back.temperature - cfg.temperature).abs() < f32::EPSILON);
+        assert_eq!(back.timeout_secs, cfg.timeout_secs);
+        assert_eq!(back.disable_thinking, cfg.disable_thinking);
     }
 }

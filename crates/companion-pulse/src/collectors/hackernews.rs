@@ -117,11 +117,10 @@ impl Collector for HackerNewsCollector {
 
         let mut items = Vec::new();
         for h in handles {
-            if let Ok(Some(it)) = h.await {
-                if let Some(raw) = Self::item_to_raw(&it, self.config.min_score) {
+            if let Ok(Some(it)) = h.await
+                && let Some(raw) = Self::item_to_raw(&it, self.config.min_score) {
                     items.push(raw);
                 }
-            }
         }
         tracing::info!(
             "hackernews: {} items (min_score={})",
