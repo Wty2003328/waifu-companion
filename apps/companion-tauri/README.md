@@ -10,7 +10,7 @@ characters, and a transparent always-on-top "desktop pet" overlay.
 - Same UX whether the user is on a server (web) or a laptop
   (desktop app)
 - One install instead of three processes (zeroclaw + companion-server
-  + GPT-SoVITS) to start manually
+  + TTS sidecar) to start manually
 - Native rodio audio playback (cpal → WASAPI multimedia category)
   so TTS output doesn't get the WebView2 "communications channel"
   AGC + echo cancellation

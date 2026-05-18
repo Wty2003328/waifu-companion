@@ -10,6 +10,13 @@ export interface DebugFrame {
   spoken_text: string;
   expression: string;
   subagent_used: boolean;
+  /// Which translation backend ran for this turn:
+  ///   "llm"  — direct LLM call or zeroclaw webhook proxy
+  ///   "nmt"  — local NMT sidecar (subagent.translator.backend = "http")
+  ///   "none" — chat_language matched tts_language; no translation
+  /// Empty string for back-compat with pre-iter-14 servers; the
+  /// Avatar page falls back to the binary "used / fell back" label.
+  translation_path?: string;
 }
 
 export interface AvatarNotification {
@@ -39,6 +46,7 @@ export interface AvatarNotification {
   spoken_text?: string;
   expression?: string;
   subagent_used?: boolean;
+  translation_path?: string;
   // Error
   message?: string;
 }
@@ -168,6 +176,7 @@ export function useAvatarSocket(url: string, options: UseAvatarSocketOptions = {
                   spoken_text: msg.spoken_text ?? '',
                   expression: msg.expression ?? '',
                   subagent_used: msg.subagent_used ?? false,
+                  translation_path: msg.translation_path ?? '',
                 });
               }
               break;

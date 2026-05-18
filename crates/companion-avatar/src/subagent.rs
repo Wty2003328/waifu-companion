@@ -21,22 +21,13 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// Strip surrounding ```...``` or ```json...``` fences that some
-/// instruction-following models can't help wrapping their output in.
-fn strip_code_fence(s: &str) -> &str {
-    s.trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim()
-}
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AvatarSubagentConfig;
 use crate::expression::Live2DExpression;
+use crate::translator::{build_translator, Translator};
 use companion_core::llm::{ChatMessage, LlmClient, Role};
 use companion_core::zeroclaw::ZeroclawClient;
 
@@ -178,7 +169,15 @@ pub struct SubagentMotion {
 pub struct AvatarSubagent {
     backend: Arc<dyn SubagentBackend>,
     /// Some(client) iff backend is direct LlmClient (streaming-capable).
+    /// Kept on the subagent (not just the translator) because the
+    /// JSON-shaped `analyze()` path is LLM-only and can use the same
+    /// streaming surface where useful.
     stream_client: Option<Arc<LlmClient>>,
+    /// Pluggable translation path. Routes `translate_chunk` and
+    /// `translate_stream` calls to the configured backend (LLM or NMT).
+    /// The `analyze()` path is intentionally NOT routed through this —
+    /// it produces JSON with expression metadata and stays LLM-bound.
+    translator: Arc<dyn Translator>,
     timeout: Duration,
     system_prompt_template: String,
 }
@@ -204,6 +203,13 @@ impl AvatarSubagent {
                 let llm = Arc::new(LlmClient::new(&config.llm)?);
                 (llm.clone(), Some(llm))
             };
+        let timeout = Duration::from_secs(config.timeout_secs);
+        let translator = build_translator(
+            &config.translator,
+            backend.clone(),
+            stream_client.clone(),
+            timeout,
+        )?;
         let system_prompt_template = config
             .system_prompt
             .clone()
@@ -211,7 +217,8 @@ impl AvatarSubagent {
         Ok(Self {
             backend,
             stream_client,
-            timeout: Duration::from_secs(config.timeout_secs),
+            translator,
+            timeout,
             system_prompt_template,
         })
     }
@@ -222,6 +229,14 @@ impl AvatarSubagent {
         backend: Arc<dyn SubagentBackend>,
         config: &AvatarSubagentConfig,
     ) -> Self {
+        let timeout = Duration::from_secs(config.timeout_secs);
+        // Test/injection path keeps the LLM translator regardless of
+        // `config.translator.backend` — callers wanting a stub HTTP
+        // translator should set it on the subagent post-construction
+        // via a future setter, or use the production `::new` path.
+        let translator: Arc<dyn Translator> = Arc::new(
+            crate::translator::LlmTranslator::new(backend.clone(), None, timeout),
+        );
         let system_prompt_template = config
             .system_prompt
             .clone()
@@ -229,7 +244,8 @@ impl AvatarSubagent {
         Self {
             backend,
             stream_client: None, // injected backend is opaque to the streaming path
-            timeout: Duration::from_secs(config.timeout_secs),
+            translator,
+            timeout,
             system_prompt_template,
         }
     }
@@ -251,66 +267,22 @@ impl AvatarSubagent {
     pub async fn translate_stream<F>(
         &self,
         text: &str,
+        source_language: Option<&str>,
         target_language: &str,
-        mut on_chunk: F,
+        on_chunk: F,
     ) -> Option<String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) + Send + 'static,
     {
-        let prompt = format!(
-            "Translate the following text into {target_language}. \
-             Output ONLY the translation — no preamble, no quotation marks, \
-             no markdown decoration, no explanation. Preserve sentence \
-             count. If the text is already in {target_language}, return it \
-             unchanged.\n\nText:\n{text}",
-        );
-        let Some(ref client) = self.stream_client else {
-            // No streaming surface — degrade. Caller still gets a usable
-            // result, just without the per-token callback firing.
-            tracing::debug!("avatar subagent.translate_stream: backend has no streaming; falling back to translate_chunk");
-            let one_shot = self.translate_chunk(text, target_language).await;
-            if let Some(ref t) = one_shot {
-                on_chunk(t);
-            }
-            return one_shot;
-        };
-        let messages = vec![
-            ChatMessage { role: Role::System, content: String::new() },
-            ChatMessage { role: Role::User, content: prompt },
-        ];
         tracing::info!(
-            "avatar subagent.translate_stream: → {} chars → {target_language}: {:?}",
+            "avatar subagent.translate_stream: → {} chars {}→{target_language}: {:?}",
             text.chars().count(),
+            source_language.unwrap_or("?"),
             safe_prefix(text, 100),
         );
-        let started = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            std::cmp::min(self.timeout, Duration::from_secs(60)),
-            client.chat_stream(&messages, |delta| on_chunk(delta)),
-        )
-        .await;
-        match result {
-            Ok(Ok(full)) => {
-                let cleaned = strip_code_fence(full.trim()).trim().to_string();
-                tracing::info!(
-                    "avatar subagent.translate_stream: ← {} chars in {}ms",
-                    cleaned.chars().count(),
-                    started.elapsed().as_millis(),
-                );
-                if cleaned.is_empty() { None } else { Some(cleaned) }
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("avatar subagent.translate_stream: LLM failed: {e}");
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "avatar subagent.translate_stream: timeout after {}s",
-                    self.timeout.as_secs()
-                );
-                None
-            }
-        }
+        self.translator
+            .translate_stream(text, source_language, target_language, Box::new(on_chunk))
+            .await
     }
 
     /// Analyze a main agent reply. Returns `None` on timeout/parse failure.
@@ -348,74 +320,14 @@ impl AvatarSubagent {
     pub async fn translate_chunk(
         &self,
         text: &str,
+        source_language: Option<&str>,
         target_language: &str,
     ) -> Option<String> {
-        let prompt = format!(
-            "Translate the following text into {target_language}. \
-             Output ONLY the translation — no preamble, no quotation marks, \
-             no markdown decoration, no explanation. Preserve sentence \
-             count. If the text is already in {target_language}, return it \
-             unchanged.\n\nText:\n{text}",
-        );
-        // Cap per-attempt to 30s. Translate is meant for ~150c chunks
-        // that should complete in 1-5s; anything past 30s means the
-        // upstream LLM is wedged and burning more wall time on it just
-        // delays the user's audio further. With 2 retries × 30s, worst
-        // case is 60s per failed chunk vs 240s under self.timeout (60s)
-        // × 4 attempts.
-        let attempt_budget = std::cmp::min(self.timeout, Duration::from_secs(30));
-        for attempt in 1..=3 {
-            tracing::info!(
-                "avatar subagent.translate: → attempt={attempt} ({}c → {target_language}): {:?}",
-                text.chars().count(),
-                safe_prefix(text, 100),
-            );
-            let result = tokio::time::timeout(
-                attempt_budget,
-                self.backend.ask("", &prompt),
-            )
-            .await;
-            match result {
-                Ok(Ok(out)) => {
-                    let cleaned = strip_code_fence(out.trim()).trim().to_string();
-                    if cleaned.is_empty() {
-                        tracing::warn!(
-                            "avatar subagent.translate: empty response (attempt {attempt})"
-                        );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    tracing::info!(
-                        "avatar subagent.translate: ← attempt={attempt} ({}c): {:?}",
-                        cleaned.chars().count(),
-                        safe_prefix(&cleaned, 100),
-                    );
-                    return Some(cleaned);
-                }
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
-                    let is_rate_limit = msg.contains("429") || msg.contains("Rate limit");
-                    tracing::warn!(
-                        "avatar subagent.translate: LLM failed (attempt {attempt}): {e}"
-                    );
-                    if attempt < 3 {
-                        // Exponential backoff for 429, brief retry otherwise.
-                        let wait = if is_rate_limit { 1u64 << attempt } else { 1 };
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "avatar subagent.translate: timeout (attempt {attempt}) after {}s",
-                        attempt_budget.as_secs()
-                    );
-                    if attempt < 3 {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        None
+        // Retry / backoff / code-fence stripping all live inside the
+        // translator impl now. The subagent just routes.
+        self.translator
+            .translate(text, source_language, target_language)
+            .await
     }
 
     async fn analyze_once(
@@ -636,5 +548,134 @@ mod tests {
         // template has both markers.
         assert!(DEFAULT_SYSTEM_PROMPT.contains("{chat_lang}"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("{tts_lang}"));
+    }
+
+    // ── Additional coverage for the parsing / safety surface ────────
+
+    #[test]
+    fn safe_prefix_handles_emoji_at_byte_boundary() {
+        // The string is 4 bytes per emoji; asking for byte 3 lands
+        // mid-codepoint. safe_prefix must back off to a boundary.
+        let s = "🌸🌟";  // each emoji is 4 UTF-8 bytes
+        let p = safe_prefix(s, 3);
+        assert!(s.starts_with(p));
+        // The returned slice must be a valid UTF-8 string of length 0
+        // or 4 (a full first emoji) — never 3 (mid-codepoint).
+        assert!(p.is_empty() || p.len() == 4,
+                "expected 0 or 4 bytes, got {}", p.len());
+    }
+
+    #[test]
+    fn safe_prefix_handles_cjk_at_boundary() {
+        // CJK chars are 3 bytes each. Asking for byte 2 lands mid-char.
+        let s = "日本語";
+        let p = safe_prefix(s, 2);
+        assert!(p.is_empty() || p.len() == 3);
+    }
+
+    #[test]
+    fn safe_prefix_short_string_returns_whole() {
+        let s = "abc";
+        let p = safe_prefix(s, 100);
+        assert_eq!(p, "abc");
+    }
+
+    #[test]
+    fn safe_prefix_zero_max_returns_empty() {
+        assert_eq!(safe_prefix("hello", 0), "");
+    }
+
+    #[test]
+    fn parses_response_with_clean_chat_text() {
+        let json = r#"{
+            "expression": "F05",
+            "intensity": 0.7,
+            "motion": null,
+            "clean_chat_text": "Hello there!",
+            "translated_text": "こんにちは！"
+        }"#;
+        let a: SubagentAnalysis = serde_json::from_str(json).unwrap();
+        assert_eq!(a.clean_chat_text.as_deref(), Some("Hello there!"));
+        assert_eq!(a.translated_text.as_deref(), Some("こんにちは！"));
+    }
+
+    #[test]
+    fn parses_response_with_extra_fields_ignored() {
+        // Future-compat: an unknown field shouldn't break deser.
+        let json = r#"{
+            "expression": "F01",
+            "intensity": 0.6,
+            "motion": null,
+            "extra_field_we_added_later": "ignored",
+            "another": 42
+        }"#;
+        let a: SubagentAnalysis = serde_json::from_str(json).unwrap();
+        assert_eq!(a.expression, "F01");
+    }
+
+    #[test]
+    fn parses_motion_with_zero_index() {
+        let json = r#"{
+            "expression": "F01",
+            "intensity": 0.5,
+            "motion": {"group": "Idle", "index": 0}
+        }"#;
+        let a: SubagentAnalysis = serde_json::from_str(json).unwrap();
+        let m = a.motion.unwrap();
+        assert_eq!(m.group, "Idle");
+        assert_eq!(m.index, 0);
+    }
+
+    #[test]
+    fn to_expression_intensity_at_one_passes_through() {
+        // intensity == 1.0 is in range (≤ 1.0), should pass through.
+        let analysis = SubagentAnalysis {
+            expression: "F05".into(),
+            intensity: 1.0,
+            motion: None,
+            translated_text: None,
+            clean_chat_text: None,
+        };
+        let fallback = Live2DExpression {
+            name: "neutral".into(),
+            intensity: 0.5,
+            duration_ms: None,
+        };
+        let out = AvatarSubagent::to_expression(&analysis, &fallback);
+        assert!((out.intensity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn to_expression_intensity_at_zero_falls_back() {
+        // intensity 0.0 → "<= 0.0" branch fires → fallback.
+        let analysis = SubagentAnalysis {
+            expression: "F05".into(),
+            intensity: 0.0,
+            motion: None,
+            translated_text: None,
+            clean_chat_text: None,
+        };
+        let fallback = Live2DExpression {
+            name: "neutral".into(),
+            intensity: 0.42,
+            duration_ms: None,
+        };
+        let out = AvatarSubagent::to_expression(&analysis, &fallback);
+        assert!((out.intensity - 0.42).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parses_response_with_markdown_code_fence_stripped() {
+        // The subagent's analyze() strips ```json ... ``` from LLM
+        // output. Verify the trimming pattern is safe.
+        let raw = "```json\n{\"expression\":\"F01\",\"intensity\":0.5,\"motion\":null}\n```";
+        let cleaned = raw
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        let parsed: SubagentAnalysis = serde_json::from_str(cleaned).unwrap();
+        assert_eq!(parsed.expression, "F01");
     }
 }

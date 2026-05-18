@@ -1,9 +1,10 @@
-//! End-to-end tests for the TTS port wire contract.
+//! End-to-end tests for the TTS port wire contract (TTS-PROVIDER-SPEC v1).
 //!
 //! Spins up a mock TTS server on an ephemeral port and verifies that
 //! `AnimeTtsManager::synthesize_with` speaks the documented contract:
-//! `POST /tts {text, language, voice?, speed?}` → audio bytes with
-//! optional `X-Sample-Rate` / `X-Channels` / `X-Format` headers.
+//! `POST /v1/audio/speech {input, voice, speed, response_format,
+//!   stream_format, x_companion: {language, quality, ...}}` → audio bytes
+//! with optional `X-Sample-Rate` / `X-Channels` / `X-Format` headers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,14 +34,37 @@ struct MockState {
     response_status: u16,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+struct XCompanion {
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    quality: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct MockRequest {
-    text: String,
-    language: String,
-    #[serde(default)]
-    voice: Option<String>,
+    /// Spec v1: text under "input" (was "text" in v0).
+    input: String,
+    /// Spec v1: voice is required.
+    voice: String,
     #[serde(default)]
     speed: Option<f32>,
+    #[serde(default)]
+    response_format: Option<String>,
+    #[serde(default)]
+    stream_format: Option<String>,
+    #[serde(default)]
+    x_companion: XCompanion,
+}
+
+impl MockRequest {
+    /// Convenience accessors mirroring the old test API so existing
+    /// assertions don't need to thread through `x_companion`.
+    fn text(&self) -> &str { &self.input }
+    fn language(&self) -> &str {
+        self.x_companion.language.as_deref().unwrap_or("")
+    }
 }
 
 async fn handle_health() -> &'static str {
@@ -73,8 +97,10 @@ async fn handle_tts(
 async fn boot_mock(state: MockState) -> (u16, Arc<Mutex<Vec<MockRequest>>>) {
     let captured = Arc::clone(&state.requests);
     let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/tts", post(handle_tts))
+        .route("/healthz", get(handle_health))
+        .route("/health", get(handle_health))   // legacy alias
+        .route("/v1/audio/speech", post(handle_tts))
+        .route("/tts", post(handle_tts))         // legacy alias
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -88,21 +114,13 @@ async fn boot_mock(state: MockState) -> (u16, Arc<Mutex<Vec<MockRequest>>>) {
 
 fn config_for(port: u16) -> AvatarTtsConfig {
     AvatarTtsConfig {
-        engine: "mock".into(),
         api_url: Some(format!("http://127.0.0.1:{port}")),
-        model_path: None,
-        reference_audio: None,
-        reference_text: None,
-        reference_language: None,
-        gpu_device: -1,
-        port,
-        launch_command: None,
-        auto_start: false,
         voice: Some("alice".into()),
         language: "en".into(),
         speed: 1.25,
+        quality: None,
         streaming: true,
-        streaming_min_chars: 8,
+        launcher_command: None,
     }
 }
 
@@ -127,10 +145,14 @@ async fn synthesize_speaks_wire_contract() {
 
     let reqs = captured.lock().await;
     assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].text, "hello");
-    assert_eq!(reqs[0].language, "en");
-    assert_eq!(reqs[0].voice.as_deref(), Some("alice"));
+    assert_eq!(reqs[0].text(), "hello");
+    assert_eq!(reqs[0].language(), "en");
+    assert_eq!(reqs[0].voice, "alice");
     assert_eq!(reqs[0].speed, Some(1.25));
+    assert_eq!(reqs[0].response_format.as_deref(), Some("wav"));
+    assert_eq!(reqs[0].stream_format.as_deref(), Some("audio"));
+    // quality defaults to "balanced" when not set in config
+    assert_eq!(reqs[0].x_companion.quality.as_deref(), Some("balanced"));
 }
 
 #[tokio::test]
@@ -149,8 +171,8 @@ async fn synthesize_with_overrides_default_language() {
     mgr.synthesize_with("こんにちは", "ja").await.unwrap();
 
     let reqs = captured.lock().await;
-    assert_eq!(reqs[0].language, "ja");
-    assert_eq!(reqs[0].text, "こんにちは");
+    assert_eq!(reqs[0].language(), "ja");
+    assert_eq!(reqs[0].text(), "こんにちは");
 }
 
 #[tokio::test]
@@ -177,8 +199,8 @@ async fn synthesize_without_metadata_headers_uses_defaults() {
         vec![1, 2, 3]
     }
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/tts", post(raw_handler));
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/audio/speech", post(raw_handler));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {

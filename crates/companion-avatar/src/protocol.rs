@@ -116,6 +116,15 @@ pub enum AvatarNotification {
         /// Whether the subagent ran successfully (true) or fell back
         /// to keyword detection because it failed/was disabled (false).
         subagent_used: bool,
+        /// Which backend produced the spoken text. Lets the UI label
+        /// the analysis path honestly instead of always saying
+        /// "LLM-driven" (which was wrong for local-NMT mode — verified
+        /// by the user iter 14). Values:
+        /// - "llm"  — direct LLM or zeroclaw webhook proxy
+        /// - "nmt"  — local NMT sidecar (translator.backend = "http")
+        /// - "none" — chat_language == tts_language; no translation
+        #[serde(default)]
+        translation_path: String,
     },
 
     /// Idle state — no audio playing, return to neutral pose.
@@ -236,5 +245,132 @@ mod tests {
             }
             other => panic!("expected Touch, got: {other:?}"),
         }
+    }
+
+    // ── Additional coverage ────────────────────────────────────────
+
+    #[test]
+    fn serialize_avatar_notification_text() {
+        let msg = AvatarNotification::Text {
+            content: "subtitle 字幕".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"Text\""));
+        assert!(json.contains("subtitle"));
+        assert!(json.contains("字幕"));
+    }
+
+    #[test]
+    fn serialize_avatar_notification_user_message() {
+        let msg = AvatarNotification::UserMessage {
+            content: "hello from overlay".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"UserMessage\""));
+        assert!(json.contains("hello from overlay"));
+    }
+
+    #[test]
+    fn serialize_avatar_notification_debug() {
+        let msg = AvatarNotification::Debug {
+            chat_text: "Hi".into(),
+            spoken_text: "こんにちは".into(),
+            expression: "F05".into(),
+            subagent_used: true,
+            translation_path: "nmt".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"Debug\""));
+        assert!(json.contains("\"translation_path\":\"nmt\""));
+        assert!(json.contains("\"subagent_used\":true"));
+    }
+
+    #[test]
+    fn serialize_avatar_notification_idle() {
+        let msg = AvatarNotification::Idle;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, "{\"type\":\"Idle\"}");
+    }
+
+    #[test]
+    fn serialize_avatar_notification_error() {
+        let msg = AvatarNotification::Error {
+            message: "TTS dead".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"Error\""));
+        assert!(json.contains("TTS dead"));
+    }
+
+    #[test]
+    fn deserialize_avatar_message_motion_request() {
+        let json = r#"{"type":"MotionRequest","group":"TapBody","name":"motion-1"}"#;
+        let msg: AvatarMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            AvatarMessage::MotionRequest { group, name } => {
+                assert_eq!(group, "TapBody");
+                assert_eq!(name, "motion-1");
+            }
+            other => panic!("expected MotionRequest, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_avatar_message_expression_request() {
+        let json = r#"{"type":"ExpressionRequest","name":"F05"}"#;
+        let msg: AvatarMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            AvatarMessage::ExpressionRequest { name } => {
+                assert_eq!(name, "F05");
+            }
+            other => panic!("expected ExpressionRequest, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_frame_defaults_for_missing_optionals() {
+        // turn_id, seq, last all use #[serde(default)]; deser without them.
+        let json = r#"{
+            "type": "Audio",
+            "audio": "AAAA",
+            "format": "wav",
+            "sample_rate": 22050,
+            "lip_sync": {"frames": [], "frame_duration_ms": 30}
+        }"#;
+        let msg: AvatarNotification = serde_json::from_str(json).unwrap();
+        match msg {
+            AvatarNotification::Audio { turn_id, seq, last, .. } => {
+                assert_eq!(turn_id, "");
+                assert_eq!(seq, 0);
+                assert!(!last);
+            }
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lip_sync_frame_proto_serializes_compact_keys() {
+        // Wire format uses short keys (t, o, s) to keep the per-frame
+        // payload small — verify they're stable.
+        let frame = LipSyncFrameProto {
+            t: 100,
+            o: 0.5,
+            s: -0.2,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"t\":100"), "got {json}");
+        assert!(json.contains("\"o\":0.5"), "got {json}");
+        assert!(json.contains("\"s\":-0.2"), "got {json}");
+    }
+
+    #[test]
+    fn expression_with_no_duration_serializes_as_null() {
+        let msg = AvatarNotification::Expression {
+            name: "smile".into(),
+            intensity: 0.8,
+            duration_ms: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"duration_ms\":null"));
     }
 }

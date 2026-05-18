@@ -83,6 +83,21 @@ export function AppStyles() {
         box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.22);
       }
 
+      /* Radios and checkboxes — the rule above doesn't cover them
+         (radios have no border to color) so they used to focus invisibly
+         under tab navigation. Halo applied directly to the control. */
+      input[type=radio]:focus-visible,
+      input[type=checkbox]:focus-visible {
+        outline: 2px solid ${tokens.primary};
+        outline-offset: 2px;
+      }
+      /* When a radio is inside a labelled card (e.g. the ModeRadio in
+         Settings → Translation), highlight the whole card so the focus
+         target is obvious even from across the panel. */
+      label:has(> input[type=radio]:focus-visible) {
+        box-shadow: 0 0 0 2px ${tokens.primary};
+      }
+
       /* Themed buttons — opt in by setting className="ws-btn" */
       .ws-btn {
         transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 80ms ease;
@@ -128,6 +143,42 @@ export function AppStyles() {
       @keyframes ws-typing-pulse {
         0%, 100% { opacity: 0.3; transform: scale(0.85); }
         50%      { opacity: 1;   transform: scale(1.1); }
+      }
+
+      /* Subtle entrance for chat bubbles. Without this each new turn
+         pops in abruptly. 180 ms slide-up + fade reads as "snappy but
+         present" — long enough for the eye to track the new element,
+         short enough to feel native. iter-14 polish. */
+      .ws-bubble-enter {
+        animation: ws-bubble-in 180ms ease-out both;
+      }
+      @keyframes ws-bubble-in {
+        from { opacity: 0; transform: translateY(6px); }
+        to   { opacity: 1; transform: translateY(0); }
+      }
+
+      /* Exit animation for the "thinking…" bubble. When sending goes
+         from true → false the React component used to unmount the
+         bubble synchronously and mount the reply — abrupt visual swap
+         flagged by user iter 14 as "no transition". Now ThinkingBubble
+         tracks an exiting state, applies this class for 160 ms, and
+         only then unmounts. The reply bubble simultaneously plays its
+         entrance animation; the two motions cross. */
+      .ws-bubble-leave {
+        animation: ws-bubble-out 160ms ease-in both;
+      }
+      @keyframes ws-bubble-out {
+        from { opacity: 1; transform: translateY(0); }
+        to   { opacity: 0; transform: translateY(-4px); }
+      }
+      /* Mic-record pulse — feedback while voice input is capturing.
+         The visual states ride on the button's background color (red
+         when active); this keyframe just adds the breathing motion so
+         the user can tell at a glance that the mic IS recording vs.
+         the button is merely styled red. */
+      @keyframes mic-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.55); }
+        50%      { box-shadow: 0 0 0 6px rgba(220, 38, 38, 0); }
       }
     `;
     document.head.appendChild(style);

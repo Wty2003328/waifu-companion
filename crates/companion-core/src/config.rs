@@ -33,18 +33,15 @@ use serde::{Deserialize, Serialize};
 /// `/webhook` shape so this code can treat them the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AgentKind {
+    #[default]
     Zeroclaw,
     Openclaw,
     Hermes,
     Custom,
 }
 
-impl Default for AgentKind {
-    fn default() -> Self {
-        Self::Zeroclaw
-    }
-}
 
 impl AgentKind {
     /// Default port each agent's gateway binds to. Used by the Settings
@@ -219,51 +216,35 @@ pub struct AvatarOverride {
     /// Trades the LLM-driven expression pick for a faster keyword fallback.
     #[serde(default)]
     pub subagent_streaming: Option<bool>,
+    /// URL of the TTS Provider Spec v1 server. Overrides
+    /// `[avatar.tts] api_url`. Process-affecting: rebuilds the TTS
+    /// manager.
+    #[serde(default)]
+    pub tts_api_url: Option<String>,
     /// TTS speech language code.
     #[serde(default)]
     pub tts_language: Option<String>,
     /// TTS playback speed multiplier (1.0 = normal).
     #[serde(default)]
     pub tts_speed: Option<f64>,
-    /// TTS engine identifier (e.g. "gpt-sovits-v4", "edge-tts").
-    #[serde(default)]
-    pub tts_engine: Option<String>,
-    /// Full launch command for the TTS server process (e.g.
-    /// `"<conda>/python.exe tools/avatar/gptsovits_tts_server.py"`).
-    /// companion-server spawns this with `auto_start = true`.
-    #[serde(default)]
-    pub tts_launch_command: Option<String>,
-    /// Path to the reference audio clip GPT-SoVITS uses for zero-shot
-    /// voice cloning (e.g. a 3–10s sample of the target voice).
-    #[serde(default)]
-    pub tts_reference_audio: Option<String>,
-    /// Transcript of the reference audio clip (in `tts_reference_language`).
-    #[serde(default)]
-    pub tts_reference_text: Option<String>,
-    /// Language code of the reference clip (e.g. "ja", "en", "zh").
-    #[serde(default)]
-    pub tts_reference_language: Option<String>,
-    /// Filesystem path to the GPT-SoVITS install root (forwarded to
-    /// the wrapper as `TTS_MODEL_PATH`).
-    #[serde(default)]
-    pub tts_model_path: Option<String>,
-    /// CUDA device index for TTS inference. 0 = first GPU; -1 = CPU.
-    #[serde(default)]
-    pub tts_gpu_device: Option<i32>,
-    /// Voice identifier for preset-voice engines (e.g.
-    /// `"ja-JP-NanamiNeural"` for edge-tts, `"JP"` for melotts).
-    /// Ignored by zero-shot engines, which use the reference clip
-    /// for voice characteristics instead.
+    /// Default voice id sent to the TTS server.
     #[serde(default)]
     pub tts_voice: Option<String>,
-    /// Spawn the TTS server with the companion (`[avatar.tts] auto_start`).
+    /// Quality preset (fast | balanced | high). Forwarded as
+    /// `x_companion.quality` on every synth call. Hot-applied.
     #[serde(default)]
-    pub tts_auto_start: Option<bool>,
-    /// Shut the TTS server down when the companion exits
-    /// (`[avatar.tts] close_with_companion`). Off → keep it warm between
-    /// sessions; the next launch adopts the running server.
+    pub tts_quality: Option<String>,
+    /// Paragraph-wise TTS streaming toggle (hot-applied — no TTS-process
+    /// restart). On → synthesize each `\n\n`-delimited paragraph as the
+    /// translator emits it.
     #[serde(default)]
-    pub tts_close_with_companion: Option<bool>,
+    pub tts_streaming: Option<bool>,
+    /// Opaque launcher command. If non-empty, companion spawns it at
+    /// startup and tears it down on shutdown per the lifecycle protocol.
+    /// Empty/None → externally-managed server. Process-affecting.
+    /// Accepts `tts_launch_command` as a legacy alias.
+    #[serde(default, alias = "tts_launch_command")]
+    pub tts_launcher_command: Option<String>,
 }
 
 /// Subagent backend + LLM connection overrides. Anything `Some` replaces
@@ -294,6 +275,75 @@ pub struct SubagentOverride {
     /// `[avatar.subagent.llm] disable_thinking`.
     #[serde(default)]
     pub disable_thinking: Option<bool>,
+    /// Subagent on/off. Canonical location for this toggle as of
+    /// iteration 4; legacy runtime.json files store it as
+    /// `avatar.subagent_enabled` (kept on `AvatarOverride` for
+    /// back-compat — see `apply()` precedence).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Skip the subagent when chat_language matches tts_language.
+    /// Canonical location for this toggle as of iteration 4.
+    #[serde(default)]
+    pub only_when_translating: Option<bool>,
+    /// Stream the translation sentence-by-sentence. Canonical location
+    /// for this toggle as of iteration 4.
+    #[serde(default)]
+    pub streaming: Option<bool>,
+    /// Translator backend overrides. Maps to
+    /// `[avatar.subagent.translator]` — these knobs decide whether the
+    /// subagent's translate path goes through the LLM or through a
+    /// local NMT sidecar, plus the NMT quality/hardware settings.
+    #[serde(default)]
+    pub translator: Option<TranslatorOverride>,
+}
+
+/// `[avatar.subagent.translator]` overrides. All fields optional —
+/// `Some` replaces the companion.toml value, `None` leaves it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranslatorOverride {
+    /// "llm" or "http". `None` keeps companion.toml's value.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// NMT sidecar base URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Per-call HTTP timeout (seconds).
+    #[serde(default)]
+    pub http_timeout_secs: Option<u64>,
+    /// "fast" | "balanced" | "quality" | "custom".
+    #[serde(default)]
+    pub nmt_quality_preset: Option<String>,
+    /// HuggingFace model id override (used when preset = "custom" or
+    /// to override the preset's choice).
+    #[serde(default)]
+    pub nmt_model_id: Option<String>,
+    /// Beam-search width. 1 = greedy; 5-8 = high quality.
+    #[serde(default)]
+    pub nmt_num_beams: Option<u32>,
+    /// "cpu", "cuda", "cuda:N".
+    #[serde(default)]
+    pub nmt_device: Option<String>,
+    /// "auto" | "fp32" | "fp16" | "bf16".
+    #[serde(default)]
+    pub nmt_precision: Option<String>,
+    /// Source language code (ISO-2 or flores-200).
+    #[serde(default)]
+    pub nmt_src_lang: Option<String>,
+    /// Target language code.
+    #[serde(default)]
+    pub nmt_tgt_lang: Option<String>,
+    /// Sidecar launch command.
+    #[serde(default)]
+    pub nmt_launch_command: Option<String>,
+    /// Auto-spawn at companion startup.
+    #[serde(default)]
+    pub nmt_auto_start: Option<bool>,
+    /// Stop the sidecar on companion exit.
+    #[serde(default)]
+    pub nmt_close_with_companion: Option<bool>,
+    /// Sidecar listen port.
+    #[serde(default)]
+    pub nmt_port: Option<u16>,
 }
 
 impl RuntimeOverride {
@@ -316,59 +366,38 @@ impl RuntimeOverride {
                 avatar_obj.insert("chat_language".into(), serde_json::Value::String(v.clone()));
             }
             // TTS nested table (avatar.tts.*).
-            let needs_tts_obj = a.tts_language.is_some()
+            let needs_tts_obj = a.tts_api_url.is_some()
+                || a.tts_language.is_some()
                 || a.tts_speed.is_some()
-                || a.tts_engine.is_some()
-                || a.tts_launch_command.is_some()
-                || a.tts_reference_audio.is_some()
-                || a.tts_reference_text.is_some()
-                || a.tts_reference_language.is_some()
-                || a.tts_model_path.is_some()
-                || a.tts_gpu_device.is_some()
                 || a.tts_voice.is_some()
-                || a.tts_auto_start.is_some()
-                || a.tts_close_with_companion.is_some();
+                || a.tts_quality.is_some()
+                || a.tts_streaming.is_some()
+                || a.tts_launcher_command.is_some();
             if needs_tts_obj {
                 let tts = avatar_obj.entry("tts").or_insert_with(|| serde_json::json!({}));
                 if !tts.is_object() { *tts = serde_json::json!({}); }
                 let tts_obj = tts.as_object_mut().unwrap();
+                if let Some(ref v) = a.tts_api_url {
+                    tts_obj.insert("api_url".into(), serde_json::Value::String(v.clone()));
+                }
                 if let Some(ref v) = a.tts_language {
                     tts_obj.insert("language".into(), serde_json::Value::String(v.clone()));
                 }
-                if let Some(v) = a.tts_speed {
-                    if let Some(n) = serde_json::Number::from_f64(v) {
+                if let Some(v) = a.tts_speed
+                    && let Some(n) = serde_json::Number::from_f64(v) {
                         tts_obj.insert("speed".into(), serde_json::Value::Number(n));
                     }
-                }
-                if let Some(ref v) = a.tts_engine {
-                    tts_obj.insert("engine".into(), serde_json::Value::String(v.clone()));
-                }
-                if let Some(ref v) = a.tts_launch_command {
-                    tts_obj.insert("launch_command".into(), serde_json::Value::String(v.clone()));
-                }
-                if let Some(v) = a.tts_auto_start {
-                    tts_obj.insert("auto_start".into(), serde_json::Value::Bool(v));
-                }
-                if let Some(v) = a.tts_close_with_companion {
-                    tts_obj.insert("close_with_companion".into(), serde_json::Value::Bool(v));
-                }
-                if let Some(ref v) = a.tts_reference_audio {
-                    tts_obj.insert("reference_audio".into(), serde_json::Value::String(v.clone()));
-                }
-                if let Some(ref v) = a.tts_reference_text {
-                    tts_obj.insert("reference_text".into(), serde_json::Value::String(v.clone()));
-                }
-                if let Some(ref v) = a.tts_reference_language {
-                    tts_obj.insert("reference_language".into(), serde_json::Value::String(v.clone()));
-                }
-                if let Some(ref v) = a.tts_model_path {
-                    tts_obj.insert("model_path".into(), serde_json::Value::String(v.clone()));
-                }
-                if let Some(v) = a.tts_gpu_device {
-                    tts_obj.insert("gpu_device".into(), serde_json::Value::Number(v.into()));
-                }
                 if let Some(ref v) = a.tts_voice {
                     tts_obj.insert("voice".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = a.tts_quality {
+                    tts_obj.insert("quality".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = a.tts_streaming {
+                    tts_obj.insert("streaming".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(ref v) = a.tts_launcher_command {
+                    tts_obj.insert("launcher_command".into(), serde_json::Value::String(v.clone()));
                 }
             }
             // Subagent toggles (avatar.subagent.{enabled,only_when_translating}).
@@ -399,6 +428,19 @@ impl RuntimeOverride {
                 *subagent = serde_json::json!({});
             }
             let sub_obj = subagent.as_object_mut().unwrap();
+            // Toggles relocated from AvatarOverride.subagent_* in
+            // iteration 4. Inserted here AFTER the avatar branch so
+            // SubagentOverride is the source of truth when both
+            // locations are populated in a legacy file.
+            if let Some(v) = s.enabled {
+                sub_obj.insert("enabled".into(), serde_json::Value::Bool(v));
+            }
+            if let Some(v) = s.only_when_translating {
+                sub_obj.insert("only_when_translating".into(), serde_json::Value::Bool(v));
+            }
+            if let Some(v) = s.streaming {
+                sub_obj.insert("streaming".into(), serde_json::Value::Bool(v));
+            }
             if let Some(v) = s.use_zeroclaw_webhook {
                 sub_obj.insert("use_zeroclaw_webhook".into(), serde_json::Value::Bool(v));
             }
@@ -434,6 +476,62 @@ impl RuntimeOverride {
                     llm_obj.insert("disable_thinking".into(), serde_json::Value::Bool(v));
                 }
             }
+            // Translator nested table (avatar.subagent.translator.*).
+            if let Some(ref t) = s.translator {
+                let tr = sub_obj
+                    .entry("translator")
+                    .or_insert_with(|| serde_json::json!({}));
+                if !tr.is_object() { *tr = serde_json::json!({}); }
+                let tr_obj = tr.as_object_mut().unwrap();
+                if let Some(ref v) = t.backend {
+                    tr_obj.insert("backend".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = t.url {
+                    tr_obj.insert("url".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = t.http_timeout_secs {
+                    tr_obj.insert("http_timeout_secs".into(), serde_json::Value::Number(v.into()));
+                }
+                if let Some(ref v) = t.nmt_quality_preset {
+                    tr_obj.insert("nmt_quality_preset".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = t.nmt_model_id {
+                    // Empty string → clear the override so the preset
+                    // takes over again.
+                    if v.is_empty() {
+                        tr_obj.remove("nmt_model_id");
+                    } else {
+                        tr_obj.insert("nmt_model_id".into(), serde_json::Value::String(v.clone()));
+                    }
+                }
+                if let Some(v) = t.nmt_num_beams {
+                    tr_obj.insert("nmt_num_beams".into(), serde_json::Value::Number(v.into()));
+                }
+                if let Some(ref v) = t.nmt_device {
+                    tr_obj.insert("nmt_device".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = t.nmt_precision {
+                    tr_obj.insert("nmt_precision".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = t.nmt_src_lang {
+                    tr_obj.insert("nmt_src_lang".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = t.nmt_tgt_lang {
+                    tr_obj.insert("nmt_tgt_lang".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = t.nmt_launch_command {
+                    tr_obj.insert("nmt_launch_command".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = t.nmt_auto_start {
+                    tr_obj.insert("nmt_auto_start".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = t.nmt_close_with_companion {
+                    tr_obj.insert("nmt_close_with_companion".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = t.nmt_port {
+                    tr_obj.insert("nmt_port".into(), serde_json::Value::Number(v.into()));
+                }
+            }
         }
         if let Some(ref z) = self.zeroclaw {
             // Zeroclaw is a typed struct (not a JSON Value like avatar),
@@ -441,11 +539,10 @@ impl RuntimeOverride {
             if let Some(k) = z.kind {
                 cfg.zeroclaw.kind = k;
             }
-            if let Some(ref v) = z.url {
-                if !v.trim().is_empty() {
+            if let Some(ref v) = z.url
+                && !v.trim().is_empty() {
                     cfg.zeroclaw.url = v.trim().trim_end_matches('/').to_string();
                 }
-            }
             if let Some(ref v) = z.pair_token {
                 cfg.zeroclaw.pair_token = if v.is_empty() { None } else { Some(v.clone()) };
             }
@@ -589,6 +686,124 @@ mod tests {
         assert_eq!(AgentKind::Openclaw.default_port(), 18790);
         assert_eq!(AgentKind::Hermes.default_port(), 18791);
         assert_eq!(AgentKind::Custom.default_port(), 42617);
+    }
+
+    #[test]
+    fn override_patches_tts_streaming_toggle() {
+        let mut cfg = CompanionConfig::default();
+        let over = RuntimeOverride {
+            avatar: Some(AvatarOverride {
+                tts_streaming: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        let tts = cfg.avatar.get("tts").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(tts.get("streaming"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    #[test]
+    fn override_ignores_deleted_legacy_fields() {
+        // Older companion.runtime.json files carry deleted keys
+        // (`tts_streaming_min_chars`, `tts_streaming_target_chars`,
+        // `tts_cfm_sample_steps`). serde's default behaviour silently
+        // drops unknown fields, so these stale files must still
+        // deserialize cleanly — startup must not crash.
+        let json = r#"{
+            "avatar": {
+                "tts_streaming_min_chars": 64,
+                "tts_streaming_target_chars": 120,
+                "tts_cfm_sample_steps": 24,
+                "tts_streaming": true
+            }
+        }"#;
+        let over: RuntimeOverride = serde_json::from_str(json)
+            .expect("legacy fields must be tolerated");
+        assert_eq!(over.avatar.unwrap().tts_streaming, Some(true));
+    }
+
+    #[test]
+    fn subagent_override_writes_canonical_toggle_location() {
+        // New writes via SubagentOverride land in avatar.subagent.{...}.
+        let mut cfg = CompanionConfig::default();
+        let over = RuntimeOverride {
+            subagent: Some(SubagentOverride {
+                enabled: Some(true),
+                only_when_translating: Some(false),
+                streaming: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        let sub = cfg
+            .avatar
+            .get("subagent")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(sub.get("enabled"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            sub.get("only_when_translating"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(sub.get("streaming"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn legacy_avatar_subagent_fields_still_apply() {
+        // Existing companion.runtime.json files that wrote toggles under
+        // avatar.subagent_* keep working — back-compat is non-negotiable.
+        let mut cfg = CompanionConfig::default();
+        let over = RuntimeOverride {
+            avatar: Some(AvatarOverride {
+                subagent_enabled: Some(false),
+                subagent_only_when_translating: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        let sub = cfg
+            .avatar
+            .get("subagent")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(sub.get("enabled"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(
+            sub.get("only_when_translating"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn subagent_override_wins_over_legacy_avatar_fields() {
+        // Migration safety: if a runtime.json has both old and new
+        // locations populated (e.g. mid-migration), SubagentOverride is
+        // authoritative — the user's most recent intent lives there.
+        let mut cfg = CompanionConfig::default();
+        let over = RuntimeOverride {
+            avatar: Some(AvatarOverride {
+                subagent_enabled: Some(false), // stale legacy value
+                ..Default::default()
+            }),
+            subagent: Some(SubagentOverride {
+                enabled: Some(true), // new canonical value
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        let sub = cfg
+            .avatar
+            .get("subagent")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            sub.get("enabled"),
+            Some(&serde_json::Value::Bool(true)),
+            "SubagentOverride must override the legacy AvatarOverride field"
+        );
     }
 
     #[test]

@@ -31,7 +31,12 @@ pub struct LipSyncFrame {
 pub struct LipSyncAnalyzer {
     /// Smoothing factor (0.0–1.0). Higher = more smoothing.
     smoothing: f32,
-    /// Mouth open parameter name (for reference, not used in analysis).
+    /// Live2D parameter name the frontend should drive with the
+    /// emitted open-mouth values. The frontend currently hardcodes
+    /// `"ParamMouthOpenY"`; this field is preserved so a future
+    /// emission path can ship it in the protocol frame to support
+    /// models with non-standard mouth parameter names.
+    #[allow(dead_code)]
     mouth_open_param: String,
     /// Analysis frame rate in Hz.
     fps: u32,
@@ -115,14 +120,11 @@ impl LipSyncAnalyzer {
     /// For MP3, returns a single silent frame (actual decoding would need a library).
     fn decode_pcm(&self, bytes: &[u8], format: &str) -> Vec<f32> {
         let pcm_data = match format {
-            "wav" => {
+            "wav"
                 // Skip WAV header (at least 44 bytes for standard PCM WAV)
-                if bytes.len() > 44 {
+                if bytes.len() > 44 => {
                     &bytes[44..]
-                } else {
-                    return Vec::new();
                 }
-            }
             "pcm" => bytes,
             // For formats we can't decode simply, return empty
             // (in production, use a proper decoder or require WAV output from TTS)
@@ -289,6 +291,156 @@ mod tests {
             "expected ~16ms frame, got {}",
             data.frame_duration_ms
         );
+    }
+
+    // ── Additional edge-case coverage ───────────────────────────────
+
+    #[test]
+    fn analyze_very_short_audio_emits_min_frame() {
+        // 5 ms of audio at 22050 Hz = ~110 samples — under one frame.
+        // Must still emit ≥1 frame.
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let tiny: Vec<i16> = vec![1000; 110];
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&tiny),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        assert!(!data.frames.is_empty());
+        // Frame 0 timestamp is always 0.
+        assert_eq!(data.frames[0].timestamp_ms, 0);
+    }
+
+    #[test]
+    fn analyze_pcm_format_decodes_directly() {
+        // Raw PCM (no WAV header) should decode straight from bytes.
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let samples: Vec<i16> = (0..22050).map(|i| {
+            ((i as f32 * 0.3).sin() * 16000.0) as i16
+        }).collect();
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: bytes,
+            sample_rate: 22050,
+            channels: 1,
+            format: "pcm".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        assert!(!data.frames.is_empty());
+        // Mid-volume sine should land mouth_open in (0, 1) somewhere.
+        let max = data.frames.iter().map(|f| f.mouth_open).fold(0.0_f32, f32::max);
+        assert!(max > 0.0, "RMS-driven mouth_open should activate for non-silent signal");
+    }
+
+    #[test]
+    fn analyze_clipped_signal_caps_at_one() {
+        // All samples at i16::MAX → mouth_open should clip at 1.0.
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let clipped: Vec<i16> = vec![i16::MAX; 22050];
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&clipped),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        for f in &data.frames {
+            assert!(
+                f.mouth_open <= 1.0 + f32::EPSILON,
+                "mouth_open {} exceeded 1.0",
+                f.mouth_open,
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_frames_have_monotonic_timestamps() {
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let s: Vec<i16> = vec![1000; 22050];
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&s),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        for w in data.frames.windows(2) {
+            assert!(w[1].timestamp_ms >= w[0].timestamp_ms,
+                    "non-monotonic timestamp: {} → {}",
+                    w[0].timestamp_ms, w[1].timestamp_ms);
+        }
+    }
+
+    #[test]
+    fn analyze_high_fps_emits_more_frames_than_low_fps() {
+        // Same audio at 60fps vs 15fps. 60fps should emit ~4× more frames.
+        let mut cfg = default_config();
+        cfg.fps = 15;
+        let analyzer_lo = LipSyncAnalyzer::new(&cfg);
+        cfg.fps = 60;
+        let analyzer_hi = LipSyncAnalyzer::new(&cfg);
+        let s: Vec<i16> = vec![1000; 22050 * 2]; // 2 seconds
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&s),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let lo = analyzer_lo.analyze(&audio);
+        let hi = analyzer_hi.analyze(&audio);
+        assert!(hi.frames.len() > lo.frames.len() * 2,
+                "60fps={} frames vs 15fps={} frames — expected ≥2× ratio",
+                hi.frames.len(), lo.frames.len());
+    }
+
+    #[test]
+    fn analyze_zero_smoothing_doesnt_inherit_from_prior_frame() {
+        // smoothing = 0 → each frame's mouth_open is independent of prior.
+        // Compare smoothing=0 (sharp transitions retained) vs smoothing=0.95
+        // (heavy averaging): the smoothed series must have *smaller*
+        // variance than the unsmoothed.
+        let mut cfg = default_config();
+        // First half loud, second half silent — a clear step.
+        let mut samples: Vec<i16> = Vec::new();
+        samples.extend(vec![i16::MAX / 4; 22050 / 2]); // 0.5s loud
+        samples.extend(vec![0i16; 22050 / 2]);          // 0.5s silent
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&samples),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+
+        cfg.smoothing = 0.0;
+        let unsmoothed = LipSyncAnalyzer::new(&cfg).analyze(&audio);
+        cfg.smoothing = 0.95;
+        let smoothed = LipSyncAnalyzer::new(&cfg).analyze(&audio);
+
+        fn variance(frames: &[LipSyncFrame]) -> f32 {
+            if frames.len() < 2 {
+                return 0.0;
+            }
+            let mean = frames.iter().map(|f| f.mouth_open).sum::<f32>()
+                / frames.len() as f32;
+            frames.iter()
+                .map(|f| (f.mouth_open - mean).powi(2))
+                .sum::<f32>() / frames.len() as f32
+        }
+
+        let v_unsmoothed = variance(&unsmoothed.frames);
+        let v_smoothed = variance(&smoothed.frames);
+        // Unsmoothed should have higher variance than heavily-smoothed.
+        assert!(v_unsmoothed > v_smoothed,
+                "smoothing should reduce variance; got unsmoothed={v_unsmoothed} smoothed={v_smoothed}");
     }
 
     #[test]

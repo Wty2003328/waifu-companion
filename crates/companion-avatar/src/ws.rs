@@ -81,51 +81,189 @@ fn strip_emoji_and_markdown_for_tts(input: &str) -> String {
     collapsed.trim().to_string()
 }
 
-/// Split a long agent reply into translation-sized chunks.
+/// Strip leading thinking-trace preamble that some upstream agents
+/// (zeroclaw with reasoning models, glm-4.5 without `thinking: disabled`,
+/// etc.) leak into their reply text.
 ///
-/// Used by process_speak when the bulk subagent.analyze() call didn't
-/// produce a translation (long inputs blow past z.ai's 60s connection
-/// budget). Per-paragraph translation keeps each LLM call small enough
-/// to land reliably, and we sequence them to stay under the per-key
-/// rate limit.
+/// Two stripping passes run in tandem per leading sentence; we drop the
+/// sentence if EITHER fires, then re-evaluate the next sentence:
 ///
-/// Strategy:
-/// - Split on blank lines (\n\n) first — most agent replies use them
-///   between bullets / numbered items / paragraphs.
-/// - For paragraphs longer than `MAX`, split further by sentence
-///   terminator so no single LLM call exceeds the safe input size.
-fn split_for_translation(text: &str) -> Vec<String> {
-    const MAX_CHARS_PER_CHUNK: usize = 280;
-    let mut out: Vec<String> = Vec::new();
-    for paragraph in text.split("\n\n") {
-        let p = paragraph.trim();
-        if p.is_empty() {
-            continue;
+/// 1. **Marker prefix match.** Drop sentences that begin with known
+///    thinking-trace markers ("Let me check", "The user is", "Based on
+///    USER.md", "I'll check the weather", "webhook_msg_…", etc.).
+///    Case-insensitive on the leading ASCII portion.
+///
+/// 2. **Mostly-Latin sentence drop (when `prefer_cjk = true`).** Drop
+///    leading sentences whose CJK content ratio is below 20%. Catches
+///    the pattern `"明天" (tomorrow) likely means May 14...` where the
+///    sentence STARTS with a CJK character in quotes but is structurally
+///    English commentary. The previous "leading-Latin-char-count" gate
+///    missed this because the first char was the `"` (Latin) followed
+///    by CJK — only one leading Latin char.
+///
+/// The 20% threshold is the sweet spot: a real CJK reply with a few
+/// English loanwords ("sunny", "14°C") sits well above 50%; a thinking
+/// sentence with one quoted CJK term sits below 10%.
+fn strip_thinking_preamble(text: &str, prefer_cjk: bool) -> String {
+    const MARKERS: &[&str] = &[
+        "the user said",
+        "the user is asking",
+        "the user is",
+        "the user wants",
+        "the user mentioned",
+        "the user needs",
+        "let me check",
+        "let me get",
+        "let me store",
+        "let me respond",
+        "let me look",
+        "let me ",  // catch-all "let me X"
+        "looking at the context",
+        "looking at ",
+        "based on the context",
+        "based on user.md",
+        "based on the user",
+        "based on ",
+        "first, let me",
+        "first let me",
+        "i should ",
+        "i need to ",
+        "i'll check",
+        "i'll look",
+        "webhook_msg_",
+    ];
+
+    /// Boundary chars used by both the lookahead (sentence we're judging)
+    /// and the advance (where we cut to drop it). Includes CJK terminators
+    /// so a thinking sentence ending with 。 still gets a clean cut.
+    fn sentence_end_byte(s: &str) -> Option<usize> {
+        s.char_indices()
+            .find(|(_, c)| matches!(*c, '.' | '!' | '?' | '\n' | '。' | '！' | '？'))
+            .map(|(i, c)| i + c.len_utf8())
+    }
+
+    /// True when the (already-isolated) sentence is well above the noise
+    /// floor in length AND its CJK ratio is below 20%. Short sentences
+    /// (`OK!`, `Yes.`, `はい。`) are too short to judge reliably — we
+    /// preserve them.
+    fn is_mostly_latin(sentence: &str) -> bool {
+        let total = sentence.chars().count();
+        if total < 12 {
+            return false;
         }
-        if p.chars().count() <= MAX_CHARS_PER_CHUNK {
-            out.push(p.to_string());
-            continue;
+        let cjk = sentence.chars().filter(|c| is_cjk(*c)).count();
+        (cjk as f64) / (total as f64) < 0.20
+    }
+
+    let mut current: &str = text.trim_start();
+    loop {
+        // Lookahead: the leading sentence.
+        let first_sentence_end = sentence_end_byte(current);
+        let first_sentence = match first_sentence_end {
+            Some(idx) => &current[..idx],
+            None => current,
+        };
+
+        // Marker check on the leading ASCII portion (CJK passes through
+        // `to_ascii_lowercase` unchanged, which is what we want).
+        let probe: String = first_sentence.chars().take(60).collect();
+        let probe_lc = probe.to_ascii_lowercase();
+        let marker_match = MARKERS.iter().any(|m| probe_lc.starts_with(m));
+
+        // CJK-aware drop. Only fires when the user is targeting a CJK
+        // TTS language; otherwise it'd happily eat legitimate English
+        // chat replies.
+        let latin_drop = prefer_cjk && is_mostly_latin(first_sentence);
+
+        if !marker_match && !latin_drop {
+            break;
         }
-        // Long paragraph: subdivide on sentence terminators.
-        let parts = crate::config::split_sentences(p, 16);
-        if parts.is_empty() {
-            // Hard split if sentence splitter found nothing.
-            let mut buf = String::new();
-            for ch in p.chars() {
-                buf.push(ch);
-                if buf.chars().count() >= MAX_CHARS_PER_CHUNK {
-                    out.push(std::mem::take(&mut buf));
-                }
+
+        // Drop this sentence. If it has no terminator (a runaway one-
+        // sentence "reply" that's just thinking), drop the whole text.
+        match first_sentence_end {
+            Some(idx) if idx < current.len() => {
+                current = current[idx..].trim_start();
             }
-            if !buf.trim().is_empty() {
-                out.push(buf);
+            _ => {
+                current = "";
+                break;
             }
-        } else {
-            out.extend(parts);
         }
     }
-    out
+
+    current.to_string()
 }
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x309F        // hiragana
+        | 0x30A0..=0x30FF      // katakana
+        | 0x3400..=0x4DBF      // CJK ext A
+        | 0x4E00..=0x9FFF      // CJK unified
+        | 0xF900..=0xFAFF      // CJK compat
+        | 0x20000..=0x2FFFF    // CJK ext B-F
+    )
+}
+
+/// Best-effort source-language detection from reply text. The companion's
+/// `chat_language` setting is what the USER types in, but the agent
+/// frequently replies in a different language than the user's input —
+/// the user types Chinese, the agent replies Chinese; the user has
+/// chat_language set to "en" because they originally configured it for
+/// English chat. Without auto-detect, we'd hand NLLB the wrong
+/// `src_lang` and get tokenizer garbage.
+///
+/// Heuristic over codepoint distribution:
+///   - kana ratio ≥ 8%   → "ja" (kana is JA-exclusive; even small amounts disambiguate)
+///   - han  ratio ≥ 30%  → "zh" (no kana → not JA → Chinese)
+///   - cyrillic ratio ≥ 50% → "ru"
+///   - hangul ratio ≥ 30%  → "ko"
+///   - arabic ratio ≥ 50%  → "ar"
+///   - otherwise None → caller falls back to the configured chat_language.
+///
+/// We deliberately don't try to distinguish further (Spanish vs French
+/// vs Italian etc.) — NLLB on `en` source is OK for most Latin-script
+/// languages; the failure mode we're fixing is the dramatic one
+/// (Latin src on CJK input).
+fn detect_source_lang(text: &str) -> Option<&'static str> {
+    let total: usize = text.chars().filter(|c| !c.is_whitespace()).count();
+    if total < 4 {
+        return None;  // too short to judge
+    }
+    let mut kana = 0usize;
+    let mut han = 0usize;
+    let mut cyrillic = 0usize;
+    let mut hangul = 0usize;
+    let mut arabic = 0usize;
+    for c in text.chars() {
+        let cp = c as u32;
+        if (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp) {
+            kana += 1;
+        } else if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp) {
+            han += 1;
+        } else if (0x0400..=0x04FF).contains(&cp) {
+            cyrillic += 1;
+        } else if (0xAC00..=0xD7AF).contains(&cp) {
+            hangul += 1;
+        } else if (0x0600..=0x06FF).contains(&cp) {
+            arabic += 1;
+        }
+    }
+    let t = total as f64;
+    if (kana as f64) / t >= 0.08 { return Some("ja"); }
+    if (han as f64) / t >= 0.30 { return Some("zh"); }
+    if (hangul as f64) / t >= 0.30 { return Some("ko"); }
+    if (cyrillic as f64) / t >= 0.50 { return Some("ru"); }
+    if (arabic as f64) / t >= 0.50 { return Some("ar"); }
+    None
+}
+
+// `split_for_translation` and its test module were removed in 2026-05-14
+// cleanup. They served the per-paragraph LLM fallback path that the
+// bulk `subagent.analyze()` architecture (2026-05) replaced — one
+// big LLM call instead of N small ones. The function was orphaned
+// after that refactor.
 use tokio::sync::broadcast;
 
 use crate::config::AvatarConfig;
@@ -177,6 +315,16 @@ pub struct AvatarWsState {
     pub event_tx: broadcast::Sender<AvatarEvent>,
     pub subagent: ArcSwapOption<AvatarSubagent>,
     pub tts: ArcSwap<AnimeTtsManager>,
+    /// NMT sidecar lifecycle manager. `Some` when
+    /// `[avatar.subagent.translator] backend = "http"`; `None` for the
+    /// LLM-only path. Held here (rather than inside the subagent) so
+    /// shutdown can stop it cleanly in symmetry with the TTS manager.
+    pub translator_mgr: ArcSwapOption<crate::translator::TranslatorManager>,
+    /// Speech (STT) sidecar lifecycle manager. `Some` when
+    /// `[avatar.speech] enabled = true`. Used for voice input and (when
+    /// `[avatar.speech] verify_tts = true`) post-synthesis TTS
+    /// verification. Same shutdown discipline as the other two managers.
+    pub speech_mgr: ArcSwapOption<crate::speech_server::SpeechManager>,
 }
 
 /// Axum handler for `GET /ws/avatar`.
@@ -282,6 +430,27 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let tts_lang = cfg.tts.language.clone();
     let expression_mapper = ExpressionMapper::new(&cfg.expressions);
 
+    // Belt-and-suspenders: strip thinking-trace preamble before any
+    // downstream consumer (keyword detector, subagent.analyze input,
+    // subtitle, translator). analyze()'s LLM prompt also strips, but
+    // we don't want to depend solely on the LLM complying.
+    //
+    // `prefer_cjk` depends only on the TTS target language. The earlier
+    // version also gated on `chat_lang != CJK`, which broke the case
+    // where the user chats in Chinese: the agent's reply mixes English
+    // thinking with Chinese content, and the CJK-aware drop needs to
+    // fire regardless of what language the user types in.
+    let prefer_cjk_pre = matches!(tts_lang.as_str(), "ja" | "zh");
+    let stripped_owned = strip_thinking_preamble(text, prefer_cjk_pre);
+    if stripped_owned.chars().count() != text.chars().count() {
+        tracing::info!(
+            "avatar: process_speak stripped thinking preamble ({} → {} chars)",
+            text.chars().count(),
+            stripped_owned.chars().count(),
+        );
+    }
+    let text: &str = &stripped_owned;
+
     let keyword_expr = expression_mapper.detect(text);
     let mut motion_to_send: Option<AvatarNotification> = None;
     let mut subagent_used = false;
@@ -290,6 +459,22 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     // the fast-path: the "translation" would be a no-op and keyword
     // detection picks a sensible expression. Saves ~5–10s per turn.
     let need_translation = chat_lang != tts_lang;
+
+    // What backend produced the spoken text. Sent on every Debug
+    // frame so the UI can label the analysis path honestly (the iter-13
+    // version hardcoded "LLM-driven" even when the local NMT path
+    // was active — user-reported iter 14). Computed once near the top
+    // so all three emission sites agree.
+    let translation_path: &'static str = if !need_translation {
+        "none"
+    } else if matches!(
+        cfg.subagent.translator.backend,
+        crate::translator::TranslatorBackendKind::Http,
+    ) {
+        "nmt"
+    } else {
+        "llm"
+    };
     let should_run_subagent = subagent_snap.is_some()
         && (need_translation || !cfg.subagent.only_when_translating);
 
@@ -433,56 +618,75 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         let _ = state.event_tx.send(AvatarEvent::Frame(frame));
     };
 
-    bcast(AvatarNotification::Expression {
-        name: expression.name.clone(),
-        intensity: expression.intensity,
-        duration_ms: expression.duration_ms,
-    });
-
-    if let Some(motion) = motion_to_send {
-        bcast(motion);
-    }
-
-    bcast(AvatarNotification::Text {
-        content: subtitle_text.clone(),
-    });
-
-    bcast(AvatarNotification::Debug {
-        chat_text: subtitle_text.clone(),
-        spoken_text: tts_text.clone(),
-        expression: expression.name,
-        subagent_used,
-    });
+    // Intro frames (Expression / Motion / Text / Debug) are deferred
+    // until just before the FIRST Audio frame fires, mirroring the
+    // streaming path's `emit_intro_once!` pattern. Without this, the
+    // chat bubble + facial expression land immediately (when this
+    // function is called) while the audio doesn't arrive for several
+    // seconds — the user sees "she said X" but doesn't hear her
+    // speak it until the TTS finishes. The frontend reads the text
+    // and the audio almost simultaneously this way.
+    let expression_name_for_intro = expression.name.clone();
+    let expression_intensity_for_intro = expression.intensity;
+    let expression_duration_for_intro = expression.duration_ms;
+    let subtitle_for_intro = subtitle_text.clone();
+    let tts_text_for_intro = tts_text.clone();
+    let motion_for_intro = motion_to_send;
+    let mut intro_sent = false;
+    let emit_intro_once = |intro_sent: &mut bool| {
+        if *intro_sent { return; }
+        *intro_sent = true;
+        bcast(AvatarNotification::Expression {
+            name: expression_name_for_intro.clone(),
+            intensity: expression_intensity_for_intro,
+            duration_ms: expression_duration_for_intro,
+        });
+        if let Some(ref m) = motion_for_intro {
+            bcast(m.clone());
+        }
+        bcast(AvatarNotification::Text {
+            content: subtitle_for_intro.clone(),
+        });
+        bcast(AvatarNotification::Debug {
+            chat_text: subtitle_for_intro.clone(),
+            spoken_text: tts_text_for_intro.clone(),
+            expression: expression_name_for_intro.clone(),
+            subagent_used,
+            translation_path: translation_path.to_string(),
+        });
+    };
 
     // Empty tts_text means we deliberately skipped speech for this turn
-    // (cross-language without a translation). Emit Idle and bail out so
-    // the frontend doesn't receive an Audio frame containing zero bytes
-    // synthesized by the TTS server.
+    // (cross-language without a translation). Emit the intro frames so
+    // the chat bubble still appears, then Idle and bail.
     if tts_text.trim().is_empty() {
         tracing::info!("avatar: process_speak skipping TTS (no spoken text)");
+        emit_intro_once(&mut intro_sent);
         bcast(AvatarNotification::Idle);
         return Ok(subtitle_text);
     }
 
-    // Sentence-chunked synthesis when streaming is enabled. All chunks
+    // Paragraph-chunked synthesis when streaming is enabled. All chunks
     // of one turn share `turn_id` so the frontend can queue them
-    // sequentially without confusing them for stale audio. The first
-    // chunk arrives ~1–2s after the agent reply lands instead of
-    // waiting for the full reply to render — the perceived latency
-    // win for long replies.
+    // sequentially without confusing them for stale audio. Most chat
+    // replies fit in a single paragraph → exactly one Audio frame, no
+    // intra-reply cold-start. Multi-paragraph replies stream one
+    // paragraph at a time, with the inter-paragraph cold-start gap
+    // landing at a `\n\n` boundary the listener already expects.
     //
-    // If the per-paragraph translator produced multiple chunks already,
-    // we feed those to TTS directly (each paragraph is its own
-    // synthesis unit). For a single bulk translation we still apply
-    // sentence-level chunking so streaming kicks in on long replies.
+    // If the upstream translator path produced multiple chunks already,
+    // we feed those to TTS directly (each chunk is its own synthesis
+    // unit). For a single bulk translation we split on `\n\n` when
+    // streaming is on; off → single shot the whole reply.
     let turn_id = uuid::Uuid::new_v4().to_string();
     let chunks: Vec<String> = if tts_chunks.len() > 1 {
         tts_chunks
     } else if cfg.tts.streaming {
-        let parts = crate::config::split_sentences(
-            &tts_text,
-            cfg.tts.streaming_min_chars,
-        );
+        let parts: Vec<String> = tts_text
+            .split("\n\n")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         if parts.is_empty() { vec![tts_text.clone()] } else { parts }
     } else {
         vec![tts_text.clone()]
@@ -502,10 +706,23 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             i + 1, total, chunk.chars().count(),
             safe_prefix(chunk, 120)
         );
-        match tts.synthesize_with(chunk, &tts_lang).await {
+        match tts
+            .synthesize_with_opts(
+                chunk,
+                &tts_lang,
+                None,
+                Some(cfg.tts.speed),
+                cfg.tts.voice.as_deref(),
+            )
+            .await
+        {
             Ok(audio) => {
                 use base64::Engine;
                 let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
+                // Emit the chat-bubble + expression intro now — right
+                // before the FIRST audio frame, so the user sees the
+                // text and hears the voice together.
+                emit_intro_once(&mut intro_sent);
                 bcast(AvatarNotification::Audio {
                     audio: audio_b64,
                     format: audio.format,
@@ -525,8 +742,11 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
                     i + 1, total
                 );
                 // Still mark the last chunk so the frontend doesn't
-                // wait forever for audio that won't arrive.
+                // wait forever for audio that won't arrive. Surface the
+                // intro frames if they never made it out (TTS failed
+                // before the first successful chunk).
                 if is_last {
+                    emit_intro_once(&mut intro_sent);
                     bcast(AvatarNotification::Audio {
                         audio: String::new(),
                         format: "wav".into(),
@@ -544,45 +764,12 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         }
     }
 
+    // Safety net: if every TTS call errored before is_last, the intro
+    // would never have fired. Emit it now so the chat bubble at least
+    // shows the reply text.
+    emit_intro_once(&mut intro_sent);
     bcast(AvatarNotification::Idle);
     Ok(subtitle_text)
-}
-
-#[cfg(test)]
-mod split_for_translation_tests {
-    use super::split_for_translation;
-
-    #[test]
-    fn paragraphs_under_max_pass_through() {
-        let v = split_for_translation("First.\n\nSecond.\n\nThird.");
-        assert_eq!(v, vec!["First.", "Second.", "Third."]);
-    }
-
-    #[test]
-    fn long_paragraphs_subdivide_by_sentence() {
-        let p = "Sentence one is here. ".repeat(20); // ~440c, no \n\n
-        let v = split_for_translation(&p);
-        assert!(v.len() > 1, "expected multiple chunks for 440c paragraph");
-        for chunk in &v {
-            assert!(chunk.chars().count() <= 320, "chunk too long: {chunk:?}");
-        }
-    }
-
-    #[test]
-    fn empty_input_yields_empty() {
-        assert!(split_for_translation("").is_empty());
-        assert!(split_for_translation("   \n\n   ").is_empty());
-    }
-
-    #[test]
-    fn mixed_short_and_long_paragraphs() {
-        let long = "X is the case. ".repeat(30);
-        let input = format!("Short.\n\n{long}\n\nAlso short.");
-        let v = split_for_translation(&input);
-        assert_eq!(v.first().map(String::as_str), Some("Short."));
-        assert_eq!(v.last().map(String::as_str), Some("Also short."));
-        assert!(v.len() > 2, "long para should be subdivided");
-    }
 }
 
 fn handle_avatar_message(msg: &AvatarMessage) {
@@ -609,73 +796,58 @@ async fn send_notification(
     Ok(())
 }
 
-/// Pop the first complete sentence(s) from `buf` once at least
-/// `target` chars have accumulated and a *real* sentence terminator
-/// appears. "Real" excludes a `.` that's a decimal (`3.14`) or part
-/// of an ellipsis (`...`) — those would otherwise cut a number or a
-/// trailing-off phrase mid-stride and hand the TTS a fragment with
-/// falling sentence-final intonation. CJK `。！？` and ASCII `!?` are
-/// always real ends. Returns the drained text (trimmed) on success.
-fn pop_first_sentence(buf: &mut String, target: usize) -> Option<String> {
-    let chars: Vec<char> = buf.chars().collect();
-    // Map char index → byte offset of the char *after* that char, so
-    // we can slice `buf` cleanly.
-    let mut byte_after: Vec<usize> = Vec::with_capacity(chars.len());
-    {
-        let mut acc = 0usize;
-        for c in &chars {
-            acc += c.len_utf8();
-            byte_after.push(acc);
-        }
-    }
-    for i in 0..chars.len() {
-        let ch = chars[i];
-        if i + 1 < target {
-            // Not enough text behind this position yet.
-            continue;
-        }
-        let is_real_end = match ch {
-            '。' | '！' | '？' | '!' | '?' => true,
-            '\n' => true,
-            '.' => {
-                let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-                let next = chars.get(i + 1).copied();
-                let decimal = prev.is_some_and(|c| c.is_ascii_digit())
-                    && next.is_some_and(|c| c.is_ascii_digit());
-                let ellipsis = prev == Some('.') || next == Some('.');
-                !(decimal || ellipsis)
-            }
-            _ => false,
-        };
-        if !is_real_end {
-            continue;
-        }
-        // Pull in trailing close-quotes/parens so they ride along.
-        let mut end_char = i + 1;
-        while let Some(&c) = chars.get(end_char) {
-            if matches!(c, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）') {
-                end_char += 1;
-            } else {
-                break;
-            }
-        }
-        let end_byte = byte_after[end_char - 1];
-        let sentence = buf[..end_byte].to_string();
-        let rest = buf[end_byte..].to_string();
+/// Pop the first complete *paragraph* from `buf`. A paragraph boundary
+/// is two consecutive newlines (`\n\n`) — that's the universal "blank
+/// line between paragraphs" marker emitted by every LLM we've seen.
+///
+/// Returns the prefix up to (but not including) the first `\n\n`,
+/// trimmed. Leaves the suffix in `buf`. Returns `None` when no `\n\n`
+/// is present yet (caller should wait for more text). Empty/whitespace-
+/// only paragraphs are skipped silently — `\n\n\n\n` doesn't produce
+/// noise frames.
+///
+/// Paragraph-wise streaming (as opposed to sentence-wise) trades a tiny
+/// bit of TTFA for far better prosody: the TTS plans intonation across
+/// a whole thought, and the inter-paragraph cold-start gap is naturally
+/// large enough (an LLM "double newline" usually signals a topic shift)
+/// that listeners forgive it.
+fn pop_first_paragraph(buf: &mut String) -> Option<String> {
+    loop {
+        let idx = buf.find("\n\n")?;
+        // Split off the prefix; advance past the `\n\n` separator.
+        let prefix = buf[..idx].trim().to_string();
+        let rest = buf[idx + 2..].to_string();
         *buf = rest;
-        return Some(sentence.trim().to_string()).filter(|s| !s.is_empty());
+        if !prefix.is_empty() {
+            // Drain any leading `\n` runs left over from a stacked
+            // separator (`\n\n\n\n` = two separators back-to-back) so
+            // the caller's buffer doesn't carry spurious whitespace into
+            // the next paragraph.
+            *buf = buf.trim_start_matches('\n').to_string();
+            return Some(prefix);
+        }
+        // Empty paragraph (consecutive `\n\n\n...` runs) — keep looping
+        // so we drain all stacked separators in one call instead of
+        // returning Some("") which the caller would have to filter.
     }
-    None
 }
 
 /// Streaming pipeline. Bcasts initial Expression/Text/Debug, then
 /// runs `subagent.translate_stream` while a sidecar task drains
-/// completed sentences and dispatches them to TTS in order. Final
+/// completed *paragraphs* and dispatches them to TTS in order. Final
 /// chunk gets `last=true`; Idle bcasts when the dispatcher exits.
+///
+/// Paragraph-wise streaming (vs the older sentence-wise approach):
+/// most chat replies fit in a single paragraph, so the dispatcher
+/// fires exactly one synth + one Audio frame per reply (effectively
+/// single-shot). Long multi-paragraph replies stream paragraph by
+/// paragraph — the cold-start gap at each `\n\n` boundary is large
+/// enough that listeners forgive it, and intra-paragraph prosody
+/// stays intact because the TTS sees the whole thought.
 ///
 /// Order is preserved because (a) the dispatcher consumes from the
 /// channel sequentially and (b) `synthesize_with` is awaited inline
-/// before the next sentence is taken — so each Audio frame's `seq`
+/// before the next paragraph is taken — so each Audio frame's `seq`
 /// is broadcast in monotonic order.
 async fn run_streaming_speak(
     state: &Arc<AvatarWsState>,
@@ -685,10 +857,57 @@ async fn run_streaming_speak(
     expression_mapper: &ExpressionMapper,
     keyword_expr: crate::expression::Live2DExpression,
 ) -> Result<String> {
-    let raw_subtitle = expression_mapper.strip_tags(text);
+    // Strip thinking-trace preamble BEFORE everything else. The bulk
+    // analyze() path lets the subagent LLM strip via system prompt,
+    // but the streaming path skips analyze() — without this we'd
+    // route the agent's "Let me check the weather…" line through
+    // both the subtitle and the translator. `prefer_cjk` only checks
+    // tts_lang — the agent can leak English thinking regardless of
+    // what language the user chats in.
+    let prefer_cjk = matches!(tts_lang, "ja" | "zh");
+    let stripped = strip_thinking_preamble(text, prefer_cjk);
+    if stripped.chars().count() != text.chars().count() {
+        tracing::info!(
+            "avatar: streaming stripped thinking preamble ({} → {} chars)",
+            text.chars().count(),
+            stripped.chars().count(),
+        );
+    }
+    let raw_subtitle = expression_mapper.strip_tags(&stripped);
     let subtitle_text = raw_subtitle.clone();
+    // Detect the language the agent actually replied in. The companion's
+    // `chat_language` setting reflects what the USER typed, but the
+    // agent may reply in a different language (typed Chinese →
+    // received Chinese, even when chat_language is "en"). Hand the
+    // *detected* language to the translator so NLLB tokenises the
+    // input through the correct vocabulary slice.
+    let detected = detect_source_lang(&subtitle_text);
+    let effective_src_lang: &str = detected.unwrap_or(chat_lang);
+    if let Some(d) = detected
+        && d != chat_lang {
+            tracing::info!(
+                "avatar: detected reply language={d:?} differs from chat_language={chat_lang:?}; \
+                 forwarding {d:?} as NMT src",
+            );
+        }
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let min_len = state.config.load().tts.streaming_min_chars;
+
+    // Translation backend label (iter 14): "llm" / "nmt" / "none".
+    // Captured here from the live config so all Debug emissions in
+    // this turn agree on which path actually ran.
+    let translation_path: &'static str = {
+        let cfg = state.config.load();
+        if chat_lang == tts_lang {
+            "none"
+        } else if matches!(
+            cfg.subagent.translator.backend,
+            crate::translator::TranslatorBackendKind::Http,
+        ) {
+            "nmt"
+        } else {
+            "llm"
+        }
+    };
 
     let bcast = |frame: AvatarNotification| {
         let _ = state.event_tx.send(AvatarEvent::Frame(frame));
@@ -701,9 +920,9 @@ async fn run_streaming_speak(
     // returns long before TTS produces audio). The frontend's HTTP
     // fallback (handleSendChat) still backstops a dropped WS connection.
 
-    // Channel: (sentence_text, is_final). is_final marks the last
-    // sentence so the dispatcher knows to stamp the Audio frame's
-    // last=true. A None sentence with is_final=true is allowed for
+    // Channel: (paragraph_text, is_final). is_final marks the last
+    // paragraph so the dispatcher knows to stamp the Audio frame's
+    // last=true. A None paragraph with is_final=true is allowed for
     // the empty-trailer case.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Option<String>, bool)>();
     let dispatcher_state = state.clone();
@@ -712,15 +931,23 @@ async fn run_streaming_speak(
     let dispatcher_subtitle = subtitle_text.clone();
     let dispatcher_expr_name = keyword_expr.name.clone();
     let dispatcher_expr_intensity = keyword_expr.intensity;
+    let dispatcher_translation_path = translation_path.to_string();
     let dispatcher = tokio::spawn(async move {
         let mut seq: u32 = 0;
+        // The macro below mutates `intro_sent` to track "have I fired
+        // the intro frames yet?"; the LAST assignment is flagged as
+        // "never read" by the lint because the dispatcher exits right
+        // after — but the assignment is load-bearing for the
+        // *intermediate* invocations.
+        #[allow(unused_assignments)]
         let mut intro_sent = false;
         // Expression + chat-bubble text + (empty) debug, exactly once,
         // just before the first Audio frame — keeps text synced to sound.
         macro_rules! emit_intro_once {
             () => {{
                 if !intro_sent {
-                    intro_sent = true;
+                    #[allow(unused_assignments)]  // last-iteration write isn't read
+                    { intro_sent = true; }
                     let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
                         AvatarNotification::Expression {
                             name: dispatcher_expr_name.clone(),
@@ -737,6 +964,7 @@ async fn run_streaming_speak(
                             spoken_text: String::new(),
                             expression: dispatcher_expr_name.clone(),
                             subagent_used: true,
+                            translation_path: dispatcher_translation_path.clone(),
                         },
                     ));
                 }
@@ -784,31 +1012,59 @@ async fn run_streaming_speak(
             );
             // Resnap the TTS each chunk so a hot-swap mid-stream picks
             // up the new manager on the next sentence. Cheap (Arc clone).
+            // Re-read the live config too so a CFM-steps change in UI
+            // applies to the very next sentence — no engine restart.
             let tts_snap = dispatcher_state.tts.load_full();
-            match tts_snap.synthesize_with(&cleaned, &dispatcher_lang).await {
-                Ok(audio) => {
-                    use base64::Engine;
-                    let audio_b64 = base64::engine::general_purpose::STANDARD
-                        .encode(&audio.audio_bytes);
-                    emit_intro_once!(); // text rides just ahead of the first chunk
-                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
-                        AvatarNotification::Audio {
-                            audio: audio_b64,
-                            format: audio.format,
-                            sample_rate: audio.sample_rate,
-                            lip_sync: crate::protocol::LipSyncDataProto {
-                                frames: Vec::new(),
-                                frame_duration_ms: 30,
-                            },
-                            turn_id: dispatcher_turn.clone(),
-                            seq,
-                            last: is_final,
+            let cfg_snap = dispatcher_state.config.load();
+
+            // Helper to broadcast one AudioOutput as a WS frame at a
+            // given seq + last flag. Closes over dispatcher state.
+            // Returns the next seq value to use.
+            let broadcast_chunk = |audio: crate::tts_server::AudioOutput,
+                                   chunk_seq: u32,
+                                   last: bool| {
+                use base64::Engine;
+                let audio_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(&audio.audio_bytes);
+                let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                    AvatarNotification::Audio {
+                        audio: audio_b64,
+                        format: audio.format,
+                        sample_rate: audio.sample_rate,
+                        lip_sync: crate::protocol::LipSyncDataProto {
+                            frames: Vec::new(),
+                            frame_duration_ms: 30,
                         },
-                    ));
+                        turn_id: dispatcher_turn.clone(),
+                        seq: chunk_seq,
+                        last,
+                    },
+                ));
+            };
+
+            // Paragraph-wise synthesis: one blocking synth per paragraph.
+            // No SSE intra-paragraph streaming — paragraphs are large
+            // enough that listeners forgive the cold-start gap at each
+            // `\n\n` boundary, and full-paragraph synthesis keeps the
+            // TTS planning prosody across the whole thought.
+            match tts_snap
+                .synthesize_with_opts(
+                    &cleaned,
+                    &dispatcher_lang,
+                    None,
+                    Some(cfg_snap.tts.speed),
+                    cfg_snap.tts.voice.as_deref(),
+                )
+                .await
+            {
+                Ok(audio) => {
+                    emit_intro_once!();
+                    broadcast_chunk(audio, seq, is_final);
+                    seq += 1;
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "avatar: streaming TTS failed for chunk seq={seq}: {e}"
+                        "avatar: paragraph-streaming TTS failed for chunk seq={seq}: {e}"
                     );
                     if is_final {
                         emit_intro_once!();
@@ -816,14 +1072,13 @@ async fn run_streaming_speak(
                     }
                 }
             }
-            seq += 1;
             if is_final {
                 break;
             }
         }
         // Safety net: if the channel closed without ever delivering a
-        // usable sentence (shouldn't happen), still surface the reply and
-        // close the turn so the frontend doesn't hang in "speaking".
+        // usable paragraph (shouldn't happen), still surface the reply
+        // and close the turn so the frontend doesn't hang in "speaking".
         if !intro_sent {
             emit_intro_once!();
             send_empty_terminator!();
@@ -831,7 +1086,7 @@ async fn run_streaming_speak(
     });
 
     // Drive the streaming translation. Each delta append triggers a
-    // sentence-pop loop; complete sentences flow to the dispatcher.
+    // paragraph-pop loop; complete paragraphs flow to the dispatcher.
     let subagent_snap = state.subagent.load_full();
     let subagent = subagent_snap
         .as_ref()
@@ -840,11 +1095,11 @@ async fn run_streaming_speak(
     let buf_clone = translation_buf.clone();
     let tx_clone = tx.clone();
     let full = subagent
-        .translate_stream(&subtitle_text, tts_lang, move |delta| {
+        .translate_stream(&subtitle_text, Some(effective_src_lang), tts_lang, move |delta| {
             let mut buf = buf_clone.lock().unwrap();
             buf.push_str(delta);
-            while let Some(sentence) = pop_first_sentence(&mut buf, min_len) {
-                let _ = tx_clone.send((Some(sentence), false));
+            while let Some(paragraph) = pop_first_paragraph(&mut buf) {
+                let _ = tx_clone.send((Some(paragraph), false));
             }
         })
         .await;
@@ -875,9 +1130,224 @@ async fn run_streaming_speak(
             spoken_text: spoken_full,
             expression: keyword_expr.name.clone(),
             subagent_used: true,
+            translation_path: translation_path.to_string(),
         });
     }
 
     bcast(AvatarNotification::Idle);
     Ok(subtitle_text)
+}
+
+#[cfg(test)]
+mod strip_thinking_tests {
+    use super::strip_thinking_preamble;
+
+    #[test]
+    fn user_reported_leak_en_thinking_then_zh_reply() {
+        // The exact text shape the user saw: English thinking trace
+        // followed by a CJK reply. cross-lang flag on (tts=ja/zh).
+        let raw = "The user is asking about today's weather and saying they \
+                   feel a bit cold. Let me check the weather for their location. \
+                   Based on USER.md, they're in America/Chicago timezone. \
+                   Let me get the weather.才51度，难怪你觉得冷。都快三更半夜了。";
+        let out = strip_thinking_preamble(raw, true);
+        assert!(
+            out.starts_with("才51度"),
+            "expected leading CJK after strip, got: {out:?}"
+        );
+        assert!(
+            !out.to_lowercase().contains("let me"),
+            "thinking markers should be gone, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cjk_quoted_in_thinking_then_zh_reply() {
+        // 2026-05-14 user-reported leak: thinking sentence STARTS with
+        // a CJK term in quotes (`"明天" (tomorrow) likely means...`).
+        // The previous heuristic missed this because the first char
+        // was CJK and the "leading-latin-char-count" gate never fired.
+        // New sentence-level mostly-Latin drop must catch it.
+        let raw = "\"明天\" (tomorrow) likely means May 14 during the day \
+                   (since it's technically already May 14 but nighttime) or May 15. \
+                   I'll check the weather with a 2-day forecast to cover both.\
+                   明天也就是5月14号，白天挺舒服的～ sunny，最高14°C，不下雨。\
+                   后天（15号）就别想晒太阳了，一整天都在下雨";
+        let out = strip_thinking_preamble(raw, true);
+        assert!(
+            out.starts_with("明天也就是5月14号"),
+            "expected clean Chinese reply, got: {out:?}"
+        );
+        assert!(
+            !out.contains("likely means"),
+            "English commentary should be gone, got: {out:?}"
+        );
+        assert!(
+            !out.contains("I'll check"),
+            "intent statement should be gone, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cjk_reply_with_loanwords_preserved() {
+        // The user's real reply contained " sunny" and "14°C" — Latin
+        // chunks inside a Chinese sentence. The 20% threshold must
+        // tolerate these (sentence is still majority CJK).
+        let raw = "明天也就是5月14号，白天挺舒服的～ sunny，最高14°C，不下雨。";
+        let out = strip_thinking_preamble(raw, true);
+        assert_eq!(out, raw, "loanwords should not trigger the Latin drop");
+    }
+
+    #[test]
+    fn zh_chat_doesnt_break_strip_when_tts_is_ja() {
+        // When the user chats in Chinese and TTS is Japanese, the agent
+        // can still leak English thinking. prefer_cjk only checks tts,
+        // not chat — so the strip must still fire.
+        let raw = "Let me think about this. 今日も元気ですか？";
+        let out = strip_thinking_preamble(raw, true);
+        assert_eq!(out, "今日も元気ですか？");
+    }
+
+    #[test]
+    fn pure_en_thinking_then_en_reply() {
+        // No CJK to fall through to — must catch via marker matching.
+        let raw = "Let me check the weather. It is 51 degrees outside.";
+        let out = strip_thinking_preamble(raw, false);
+        assert_eq!(out, "It is 51 degrees outside.");
+    }
+
+    #[test]
+    fn no_preamble_passes_through_unchanged() {
+        let raw = "Hello there! How are you today?";
+        let out = strip_thinking_preamble(raw, false);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn cjk_only_input_passes_through() {
+        let raw = "こんにちは、元気ですか？今日もいい天気ですね。";
+        let out = strip_thinking_preamble(raw, true);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn empty_input_yields_empty() {
+        assert_eq!(strip_thinking_preamble("", false), "");
+        assert_eq!(strip_thinking_preamble("   \n  ", false), "");
+    }
+
+    #[test]
+    fn multiple_thinking_sentences_all_stripped() {
+        let raw = "Let me check. Looking at the context, this is what I see. \
+                   Based on the user's request, I need to respond. \
+                   The actual reply starts here.";
+        let out = strip_thinking_preamble(raw, false);
+        assert_eq!(out, "The actual reply starts here.");
+    }
+
+    #[test]
+    fn short_latin_prefix_preserved_when_prefer_cjk() {
+        // "OK!" + JA reply — the Latin prefix is too short (3 chars) to
+        // trigger the CJK fallback heuristic (threshold 16). Should pass
+        // through.
+        let raw = "OK! 分かりました。";
+        let out = strip_thinking_preamble(raw, true);
+        assert_eq!(out, raw.trim_start());
+    }
+
+    #[test]
+    fn webhook_msg_marker_stripped() {
+        let raw = "webhook_msg_abc123 was sent. The real reply text.";
+        let out = strip_thinking_preamble(raw, false);
+        assert_eq!(out, "The real reply text.");
+    }
+
+    #[test]
+    fn does_not_split_inside_multibyte_codepoint() {
+        // Regression guard for byte-vs-char-boundary slicing. A CJK
+        // terminator (3-byte 。) at the boundary must not panic.
+        let raw = "Let me try。実際の返答です。";
+        let out = strip_thinking_preamble(raw, false);
+        // The English "Let me try" has no ASCII terminator, so the whole
+        // thing is dropped (treated as one runaway thinking sentence).
+        // Acceptable degradation: we never panic.
+        let _ = out;
+    }
+}
+
+#[cfg(test)]
+mod pop_first_paragraph_tests {
+    use super::pop_first_paragraph;
+
+    #[test]
+    fn empty_buffer_returns_none() {
+        let mut buf = String::new();
+        assert!(pop_first_paragraph(&mut buf).is_none());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn no_double_newline_returns_none() {
+        // Single sentence, single newline — not a paragraph boundary.
+        let mut buf = String::from("Hello there.\nNo paragraph break here yet");
+        assert!(pop_first_paragraph(&mut buf).is_none());
+        // Buffer must be untouched so the next delta can append.
+        assert_eq!(buf, "Hello there.\nNo paragraph break here yet");
+    }
+
+    #[test]
+    fn pops_first_paragraph_leaves_rest() {
+        let mut buf = String::from("First paragraph.\n\nSecond paragraph still going");
+        let p = pop_first_paragraph(&mut buf).expect("paragraph present");
+        assert_eq!(p, "First paragraph.");
+        assert_eq!(buf, "Second paragraph still going");
+    }
+
+    #[test]
+    fn pops_when_buffer_ends_with_double_newline() {
+        // Translator just wrote the separator; nothing after it yet.
+        let mut buf = String::from("Lone paragraph here.\n\n");
+        let p = pop_first_paragraph(&mut buf).expect("paragraph present");
+        assert_eq!(p, "Lone paragraph here.");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn consecutive_separators_handled_cleanly() {
+        // \n\n\n\n is two stacked separators — both should drain in one
+        // call without emitting an empty paragraph.
+        let mut buf = String::from("Para A.\n\n\n\nPara B starts");
+        let p = pop_first_paragraph(&mut buf).expect("paragraph present");
+        assert_eq!(p, "Para A.");
+        // After popping, the remaining `\n\n` separator was already
+        // consumed (drained by the empty-skip loop) and we're left with
+        // the continuation.
+        assert_eq!(buf, "Para B starts");
+    }
+
+    #[test]
+    fn trims_paragraph_whitespace() {
+        let mut buf = String::from("   leading spaces.\n\nnext");
+        let p = pop_first_paragraph(&mut buf).expect("paragraph present");
+        assert_eq!(p, "leading spaces.");
+        assert_eq!(buf, "next");
+    }
+
+    #[test]
+    fn whitespace_only_paragraph_is_skipped() {
+        // `\n\n   \n\n` should drain to "" then pop the next real one.
+        let mut buf = String::from("\n\n   \n\nreal content here\n\nmore");
+        let p = pop_first_paragraph(&mut buf).expect("paragraph present");
+        assert_eq!(p, "real content here");
+        assert_eq!(buf, "more");
+    }
+
+    #[test]
+    fn multibyte_paragraph_safe() {
+        // CJK content + a `\n\n` boundary must not panic on byte slicing.
+        let mut buf = String::from("こんにちは、元気ですか？\n\n今日もいい天気ですね。");
+        let p = pop_first_paragraph(&mut buf).expect("paragraph present");
+        assert_eq!(p, "こんにちは、元気ですか？");
+        assert_eq!(buf, "今日もいい天気ですね。");
+    }
 }

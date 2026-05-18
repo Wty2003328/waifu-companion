@@ -24,8 +24,8 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use companion_avatar::{
-    AnimeTtsManager, AvatarConfig, AvatarEvent, AvatarSubagent, AvatarWsState,
-    handle_ws_avatar,
+    AnimeTtsManager, AvatarConfig, AvatarEvent, AvatarSubagent, AvatarWsState, SpeechManager,
+    TranslatorBackendKind, TranslatorManager, handle_ws_avatar,
 };
 use companion_core::{AgentEvent, AgentKind, CompanionConfig, ZeroclawClient};
 use companion_pulse::{PulseConfig, PulseSubsystem};
@@ -164,11 +164,20 @@ async fn main() -> Result<()> {
             }),
         );
 
-    if app_state.avatar.is_some() {
-        let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
+    if let Some(avatar) = &app_state.avatar {
+        let avatar_state = Arc::clone(avatar);
         router = router.route(
             "/ws/avatar",
-            get(handle_ws_avatar).with_state(avatar_state),
+            get(handle_ws_avatar).with_state(Arc::clone(&avatar_state)),
+        );
+        // Voice input proxy. Frontend posts base64-encoded WAV here;
+        // we forward to the speech sidecar and return the transcript.
+        // 503 when [avatar.speech] enabled = false or the sidecar is
+        // unreachable, so the UI can show a clear "STT unavailable"
+        // state without dropping the user input.
+        router = router.route(
+            "/api/avatar/asr",
+            axum::routing::post(handle_avatar_asr).with_state(avatar_state),
         );
     }
 
@@ -244,24 +253,42 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Graceful TTS shutdown: POST /shutdown to the Python wrapper, wait
-    // up to 8s for clean exit (which runs torch.cuda.empty_cache() +
-    // sync), fall back to kill. Without this, leaving the model running
-    // leaks fragmented VRAM into whatever graphics workload runs next.
-    // Skipped when `[avatar.tts] close_with_companion = false` — then we
-    // leave the server warm so the next launch adopts it (instant voice).
+    // Graceful TTS shutdown per the launch & lifecycle protocol
+    // (docs/TTS-PROVIDER-SPEC.md): POST /shutdown → wait for the spawned
+    // child (if we own one) → SIGKILL fallback. Always runs — close-with-
+    // companion is implicit in the protocol; if the user wants a warm
+    // server between sessions, they manage that server externally
+    // (no launcher_command in companion.toml, server pre-spawned).
     if let Some(avatar) = avatar_for_shutdown {
-        if avatar.config.load().tts.close_with_companion {
-            tracing::info!("companion: stopping TTS server before exit");
-            let tts_snap = avatar.tts.load_full();
-            if let Err(e) = tts_snap.stop_server().await {
-                tracing::warn!("companion: TTS stop_server returned {e}");
-            }
-        } else {
-            tracing::info!(
-                "companion: leaving TTS server running (close_with_companion = false)"
-            );
+        tracing::info!("companion: stopping TTS server before exit");
+        let tts_snap = avatar.tts.load_full();
+        if let Err(e) = tts_snap.stop_server().await {
+            tracing::warn!("companion: TTS stop_server returned {e}");
         }
+        // Symmetric NMT shutdown. Off-by-default close_with_companion=true
+        // (model load is expensive; leaving it pinned just to "save 30s
+        // next launch" defeats the point — same call as TTS).
+        let cfg = avatar.config.load();
+        if cfg.subagent.translator.backend == TranslatorBackendKind::Http
+            && cfg.subagent.translator.nmt_close_with_companion
+            && let Some(mgr) = avatar.translator_mgr.load_full() {
+                tracing::info!("companion: stopping NMT translator before exit");
+                if let Err(e) = mgr.stop_server().await {
+                    tracing::warn!("companion: NMT stop_server returned {e}");
+                }
+            }
+        // Speech sidecar — same close-with-companion discipline as TTS
+        // and NMT. Off → leave warm so the next launch adopts; on → the
+        // POST /shutdown lets Whisper release its model weights cleanly
+        // (matters for GPU compute_types — fragmented VRAM otherwise).
+        if cfg.speech.enabled
+            && cfg.speech.close_with_companion
+            && let Some(mgr) = avatar.speech_mgr.load_full() {
+                tracing::info!("companion: stopping speech sidecar before exit");
+                if let Err(e) = mgr.stop_server().await {
+                    tracing::warn!("companion: speech stop_server returned {e}");
+                }
+            }
     }
     tracing::info!("companion: bye");
     Ok(())
@@ -300,14 +327,13 @@ fn resolve_web_dist(configured: &Option<String>) -> PathBuf {
         return PathBuf::from(p);
     }
     // Look for ./web/dist relative to the binary, then to CWD.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             let candidate = parent.join("web").join("dist");
             if candidate.exists() {
                 return candidate;
             }
         }
-    }
     std::env::current_dir()
         .unwrap_or_default()
         .join("web")
@@ -358,35 +384,105 @@ async fn build_avatar(
         None
     };
 
-    // TTS port. Auto-start the configured server in the background so the
-    // avatar UI can still load if the TTS server is down.
+    // TTS port. Start the configured server in the background so the
+    // avatar UI can still load if the TTS server is down. start_server
+    // is a no-op when there's no launcher_command (externally-managed
+    // server case — just polls /healthz).
     let tts = Arc::new(
         AnimeTtsManager::new(&avatar_cfg.tts).context("companion: avatar TTS init failed")?,
     );
-    if avatar_cfg.tts.auto_start {
+    {
         let tts_clone = Arc::clone(&tts);
         tokio::spawn(async move {
             if let Err(e) = tts_clone.start_server().await {
-                tracing::warn!("companion: TTS auto-start failed: {e}");
+                tracing::warn!("companion: TTS start_server failed: {e}");
             }
         });
     }
 
+    // NMT translator sidecar. Constructed only when the subagent is
+    // configured to call the HTTP translator backend. Auto-start
+    // mirrors the TTS pattern: spawn in the background so the UI can
+    // come up before the sidecar finishes its cold-load.
+    let translator_mgr: Option<Arc<TranslatorManager>> =
+        if avatar_cfg.subagent.translator.backend == TranslatorBackendKind::Http {
+            match TranslatorManager::new(&avatar_cfg.subagent.translator) {
+                Ok(mgr) => {
+                    let mgr = Arc::new(mgr);
+                    if avatar_cfg.subagent.translator.nmt_auto_start {
+                        let mgr_clone = Arc::clone(&mgr);
+                        tokio::spawn(async move {
+                            if let Err(e) = mgr_clone.start_server().await {
+                                tracing::warn!(
+                                    "companion: NMT auto-start failed: {e}"
+                                );
+                            }
+                        });
+                    }
+                    Some(mgr)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "companion: NMT manager init failed; HTTP translator \
+                         calls will fail until you start the sidecar manually: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Speech (STT) sidecar — voice input + TTS verification. Built only
+    // when [avatar.speech] enabled = true. Auto-start spawns in the
+    // background so the UI can load before whisper's cold path
+    // completes.
+    let speech_mgr: Option<Arc<SpeechManager>> = if avatar_cfg.speech.enabled {
+        match SpeechManager::new(&avatar_cfg.speech) {
+            Ok(mgr) => {
+                let mgr = Arc::new(mgr);
+                if avatar_cfg.speech.auto_start {
+                    let mgr_clone = Arc::clone(&mgr);
+                    tokio::spawn(async move {
+                        if let Err(e) = mgr_clone.start_server().await {
+                            tracing::warn!(
+                                "companion: speech sidecar auto-start failed: {e}"
+                            );
+                        }
+                    });
+                }
+                Some(mgr)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "companion: speech sidecar init failed; voice input \
+                     disabled until you start the sidecar manually: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let (event_tx, _event_rx) = broadcast::channel(64);
 
     tracing::info!(
-        "companion: avatar enabled (chat_lang={}, tts_lang={}, engine={})",
+        "companion: avatar enabled (chat_lang={}, tts_lang={}, tts_url={}, speech={})",
         avatar_cfg.chat_language,
         avatar_cfg.tts.language,
-        avatar_cfg.tts.engine,
+        avatar_cfg.tts.api_url.as_deref().unwrap_or("<unset>"),
+        if avatar_cfg.speech.enabled { "on" } else { "off" },
     );
 
     Ok(Some(Arc::new(AvatarWsState {
-        // All three handles wrapped for runtime hot-swap.
+        // All handles wrapped for runtime hot-swap.
         config: arc_swap::ArcSwap::from_pointee(avatar_cfg),
         event_tx,
         subagent: arc_swap::ArcSwapOption::from(subagent),
         tts: arc_swap::ArcSwap::new(tts),
+        translator_mgr: arc_swap::ArcSwapOption::from(translator_mgr),
+        speech_mgr: arc_swap::ArcSwapOption::from(speech_mgr),
     })))
 }
 
@@ -603,7 +699,7 @@ async fn run_health_watchdog(state: AppState) {
                 Ok(true) => state.health.set_tts(true, None),
                 Ok(false) => state
                     .health
-                    .set_tts(false, Some(format!("{} /health returned non-2xx", tts.engine()))),
+                    .set_tts(false, Some("TTS /healthz returned non-2xx".to_string())),
                 Err(e) => state.health.set_tts(false, Some(format!("{e}"))),
             }
         } else {
@@ -661,19 +757,13 @@ async fn handle_get_config(
             "enabled": cfg.enabled,
             "chat_language": cfg.chat_language,
             "tts": {
-                "engine": cfg.tts.engine,
-                "language": cfg.tts.language,
-                "voice": cfg.tts.voice,
                 "api_url": cfg.tts.api_url,
+                "voice": cfg.tts.voice,
+                "language": cfg.tts.language,
                 "speed": cfg.tts.speed,
-                "launch_command": cfg.tts.launch_command,
-                "auto_start": cfg.tts.auto_start,
-                "close_with_companion": cfg.tts.close_with_companion,
-                "reference_audio": cfg.tts.reference_audio,
-                "reference_text": cfg.tts.reference_text,
-                "reference_language": cfg.tts.reference_language,
-                "model_path": cfg.tts.model_path,
-                "gpu_device": cfg.tts.gpu_device,
+                "quality": cfg.tts.quality,
+                "streaming": cfg.tts.streaming,
+                "launcher_command": cfg.tts.launcher_command,
             },
             "subagent": {
                 "enabled": cfg.subagent.enabled,
@@ -687,6 +777,25 @@ async fn handle_get_config(
                 // api_key intentionally redacted
                 "llm_api_key_set": cfg.subagent.llm.api_key.is_some()
                     || cfg.subagent.llm.api_key_env.is_some(),
+                "translator": {
+                    "backend": match cfg.subagent.translator.backend {
+                        companion_avatar::TranslatorBackendKind::Llm => "llm",
+                        companion_avatar::TranslatorBackendKind::Http => "http",
+                    },
+                    "url": cfg.subagent.translator.url,
+                    "http_timeout_secs": cfg.subagent.translator.http_timeout_secs,
+                    "nmt_quality_preset": cfg.subagent.translator.nmt_quality_preset,
+                    "nmt_model_id": cfg.subagent.translator.nmt_model_id,
+                    "nmt_num_beams": cfg.subagent.translator.nmt_num_beams,
+                    "nmt_device": cfg.subagent.translator.nmt_device,
+                    "nmt_precision": cfg.subagent.translator.nmt_precision,
+                    "nmt_src_lang": cfg.subagent.translator.nmt_src_lang,
+                    "nmt_tgt_lang": cfg.subagent.translator.nmt_tgt_lang,
+                    "nmt_launch_command": cfg.subagent.translator.nmt_launch_command,
+                    "nmt_auto_start": cfg.subagent.translator.nmt_auto_start,
+                    "nmt_close_with_companion": cfg.subagent.translator.nmt_close_with_companion,
+                    "nmt_port": cfg.subagent.translator.nmt_port,
+                },
             },
             "model": {
                 "model_dir": cfg.model.model_dir,
@@ -977,6 +1086,27 @@ struct SubagentOverrideRequest {
     /// `true` (default) → send `thinking:{type:disabled}` so GLM-family
     /// models skip chain-of-thought; `false` → let the model reason.
     disable_thinking: Option<bool>,
+    // ----- Translator (NMT sidecar) -----
+    /// "llm" or "http". Picks the subagent translation backend.
+    translator_backend: Option<String>,
+    /// NMT sidecar base URL when backend = "http".
+    translator_url: Option<String>,
+    translator_http_timeout_secs: Option<u64>,
+    /// "fast" | "balanced" | "quality" | "custom".
+    translator_nmt_quality_preset: Option<String>,
+    /// HF model id override. Empty string → clear override and use the preset.
+    translator_nmt_model_id: Option<String>,
+    translator_nmt_num_beams: Option<u32>,
+    /// "cpu" | "cuda" | "cuda:N".
+    translator_nmt_device: Option<String>,
+    /// "auto" | "fp32" | "fp16" | "bf16".
+    translator_nmt_precision: Option<String>,
+    translator_nmt_src_lang: Option<String>,
+    translator_nmt_tgt_lang: Option<String>,
+    translator_nmt_launch_command: Option<String>,
+    translator_nmt_auto_start: Option<bool>,
+    translator_nmt_close_with_companion: Option<bool>,
+    translator_nmt_port: Option<u16>,
 }
 
 /// Persist the user's subagent settings choice to
@@ -999,13 +1129,9 @@ async fn handle_post_subagent_override(
 
     // Load the existing override (if any) so we don't trample unrelated keys.
     let mut over = if path.exists() {
-        match std::fs::read_to_string(&path)
+        std::fs::read_to_string(&path)
             .ok()
-            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok())
-        {
-            Some(v) => v,
-            None => RuntimeOverride::default(),
-        }
+            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok()).unwrap_or_default()
     } else {
         RuntimeOverride::default()
     };
@@ -1032,6 +1158,56 @@ async fn handle_post_subagent_override(
         sub.timeout_secs = Some(v);
     }
 
+    // Translator overrides — only mutate sub.translator if the request
+    // actually touched a translator_* field. Empty strings clear the
+    // individual override (re-falling-through to companion.toml).
+    let any_translator_field = req.translator_backend.is_some()
+        || req.translator_url.is_some()
+        || req.translator_http_timeout_secs.is_some()
+        || req.translator_nmt_quality_preset.is_some()
+        || req.translator_nmt_model_id.is_some()
+        || req.translator_nmt_num_beams.is_some()
+        || req.translator_nmt_device.is_some()
+        || req.translator_nmt_precision.is_some()
+        || req.translator_nmt_src_lang.is_some()
+        || req.translator_nmt_tgt_lang.is_some()
+        || req.translator_nmt_launch_command.is_some()
+        || req.translator_nmt_auto_start.is_some()
+        || req.translator_nmt_close_with_companion.is_some()
+        || req.translator_nmt_port.is_some();
+    if any_translator_field {
+        let mut tr = sub.translator.take().unwrap_or_default();
+        macro_rules! set_str {
+            ($field:ident, $value:expr) => {
+                if let Some(v) = $value {
+                    tr.$field = if v.is_empty() { None } else { Some(v) };
+                }
+            };
+        }
+        macro_rules! set_val {
+            ($field:ident, $value:expr) => {
+                if let Some(v) = $value {
+                    tr.$field = Some(v);
+                }
+            };
+        }
+        set_str!(backend, req.translator_backend);
+        set_str!(url, req.translator_url);
+        set_val!(http_timeout_secs, req.translator_http_timeout_secs);
+        set_str!(nmt_quality_preset, req.translator_nmt_quality_preset);
+        set_str!(nmt_model_id, req.translator_nmt_model_id);
+        set_val!(nmt_num_beams, req.translator_nmt_num_beams);
+        set_str!(nmt_device, req.translator_nmt_device);
+        set_str!(nmt_precision, req.translator_nmt_precision);
+        set_str!(nmt_src_lang, req.translator_nmt_src_lang);
+        set_str!(nmt_tgt_lang, req.translator_nmt_tgt_lang);
+        set_str!(nmt_launch_command, req.translator_nmt_launch_command);
+        set_val!(nmt_auto_start, req.translator_nmt_auto_start);
+        set_val!(nmt_close_with_companion, req.translator_nmt_close_with_companion);
+        set_val!(nmt_port, req.translator_nmt_port);
+        sub.translator = Some(tr);
+    }
+
     over.subagent = Some(sub);
 
     let body = serde_json::to_string_pretty(&over).map_err(|e| {
@@ -1047,14 +1223,25 @@ async fn handle_post_subagent_override(
         )
     })?;
 
-    // Hot-swap the live subagent.
+    // Hot-swap the live subagent + NMT TranslatorManager.
     //
     // Re-parse companion.toml + runtime.json into a CompanionConfig
     // (mirrors startup), pull out the subagent block, rebuild the
     // client, and atomically publish it via the avatar WsState's
     // ArcSwapOption. Skipped when the avatar subsystem itself isn't
     // running (no place to put the client).
+    //
+    // For the NMT TranslatorManager: in addition to rebuilding the
+    // in-process Translator (which the subagent rebuild already does
+    // implicitly), we also respawn the subprocess when its engine-
+    // init fields change (backend, model id, preset, device, precision,
+    // num_beams, tgt_lang, launch_command, port). Without that step
+    // changing the preset in Settings persists to runtime.json but the
+    // running NMT process keeps using the old model — Settings says
+    // "applied live" while the user keeps getting the old translation
+    // engine.
     let mut swapped = false;
+    let mut nmt_swap_summary: Option<String> = None;
     if let Some(ref avatar_state) = state.avatar {
         let new_cfg = CompanionConfig::load(&state.config_path).map_err(|e| {
             (
@@ -1086,15 +1273,114 @@ async fn handle_post_subagent_override(
             avatar_state.subagent.store(None);
             swapped = true;
         }
+
+        // ----- NMT TranslatorManager swap -----
+        let new_tr = avatar_cfg.subagent.translator.clone();
+        let old_mgr = avatar_state.translator_mgr.load_full();
+        let want_http = new_tr.backend
+            == companion_avatar::TranslatorBackendKind::Http;
+        let manager_settings_changed: bool = match old_mgr.as_ref() {
+            None => want_http, // None → Some(http) is a change
+            Some(_existing) if !want_http => true, // Some → None (flipped to llm)
+            Some(existing) => {
+                // Both sides are http; respawn only when a field that's
+                // captured at sidecar init has actually changed.
+                let cur = existing.config_snapshot();
+                cur.url != new_tr.url
+                    || cur.nmt_quality_preset != new_tr.nmt_quality_preset
+                    || cur.nmt_model_id != new_tr.nmt_model_id
+                    || cur.nmt_num_beams != new_tr.nmt_num_beams
+                    || cur.nmt_device != new_tr.nmt_device
+                    || cur.nmt_precision != new_tr.nmt_precision
+                    || cur.nmt_tgt_lang != new_tr.nmt_tgt_lang
+                    || cur.nmt_launch_command != new_tr.nmt_launch_command
+                    || cur.nmt_port != new_tr.nmt_port
+            }
+        };
+
+        if manager_settings_changed {
+            if !want_http {
+                // Translator flipped to LLM. Stop the running NMT
+                // sidecar and clear the slot.
+                let avatar_clone = std::sync::Arc::clone(avatar_state);
+                let old_mgr_for_stop = old_mgr.clone();
+                tokio::spawn(async move {
+                    if let Some(ref m) = old_mgr_for_stop
+                        && let Err(e) = m.stop_server().await {
+                            tracing::warn!(
+                                "companion: NMT stop_server returned {e} during swap"
+                            );
+                        }
+                    avatar_clone.translator_mgr.store(None);
+                    tracing::info!(
+                        "companion: NMT sidecar stopped (translator flipped to LLM)"
+                    );
+                });
+                nmt_swap_summary = Some("stopped (backend → llm)".to_string());
+            } else {
+                // Want http with new settings. Build new manager and
+                // background-spawn a clean handover.
+                match companion_avatar::TranslatorManager::new(&new_tr) {
+                    Ok(new_mgr) => {
+                        let new_mgr = std::sync::Arc::new(new_mgr);
+                        let avatar_clone = std::sync::Arc::clone(avatar_state);
+                        let old_mgr_for_stop = old_mgr.clone();
+                        let auto_start = new_tr.nmt_auto_start;
+                        tokio::spawn(async move {
+                            // 1) Stop the old sidecar (best-effort).
+                            if let Some(ref m) = old_mgr_for_stop
+                                && let Err(e) = m.stop_server().await {
+                                    tracing::warn!(
+                                        "companion: prev NMT stop_server returned {e}"
+                                    );
+                                }
+                            // 2) Publish the new handle so the
+                            //    subagent's HttpTranslator (which will
+                            //    be rebuilt on the next /api/config/subagent
+                            //    or already was just rebuilt above) can
+                            //    point at it.
+                            avatar_clone.translator_mgr.store(Some(new_mgr.clone()));
+                            // 3) Start it.
+                            if auto_start
+                                && let Err(e) = new_mgr.start_server().await {
+                                    tracing::warn!(
+                                        "companion: new NMT start_server failed: {e}"
+                                    );
+                                }
+                            tracing::info!(
+                                "companion: NMT sidecar hot-swap completed"
+                            );
+                        });
+                        nmt_swap_summary = Some(
+                            if old_mgr.is_some() {
+                                "respawned (config changed)".to_string()
+                            } else {
+                                "spawned (backend → http)".to_string()
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "companion: TranslatorManager build failed: {e}; keeping previous sidecar"
+                        );
+                        nmt_swap_summary = Some(format!("build failed: {e}"));
+                    }
+                }
+            }
+        }
     }
 
     tracing::info!(
-        "companion: subagent override saved to {} ({})",
+        "companion: subagent override saved to {} ({}){}",
         path.display(),
         if swapped {
             "applied live, no restart needed"
         } else {
             "restart required — avatar subsystem not active"
+        },
+        match nmt_swap_summary {
+            Some(s) => format!(" — NMT: {s}"),
+            None => String::new(),
         },
     );
     Ok(axum::http::StatusCode::OK)
@@ -1106,30 +1392,23 @@ struct AvatarOverrideRequest {
     enabled: Option<bool>,
     /// Chat language code (e.g. "en", "ja").
     chat_language: Option<String>,
+    /// TTS Provider Spec v1 server URL. Process-affecting.
+    tts_api_url: Option<String>,
     /// TTS speech language code.
     tts_language: Option<String>,
     /// TTS speed multiplier.
     tts_speed: Option<f64>,
-    /// TTS engine identifier (e.g. "gpt-sovits-v4", "edge-tts").
-    tts_engine: Option<String>,
-    /// Full launch command for the TTS server process.
-    tts_launch_command: Option<String>,
-    /// Spawn the TTS server when the companion starts.
-    tts_auto_start: Option<bool>,
-    /// Shut the TTS server down when the companion exits (off → keep warm).
-    tts_close_with_companion: Option<bool>,
-    /// Path to the reference audio clip used for voice cloning.
-    tts_reference_audio: Option<String>,
-    /// Transcript of the reference clip.
-    tts_reference_text: Option<String>,
-    /// Reference clip's language code.
-    tts_reference_language: Option<String>,
-    /// Path to the GPT-SoVITS install root.
-    tts_model_path: Option<String>,
-    /// CUDA device index (0+, or -1 for CPU).
-    tts_gpu_device: Option<i32>,
-    /// Voice id for preset-voice engines (edge-tts, melotts).
+    /// Default voice id sent to the TTS server.
     tts_voice: Option<String>,
+    /// Quality preset for spec v1 sidecars (fast | balanced | high).
+    /// Hot-applied per /v1/audio/speech call — no engine restart.
+    tts_quality: Option<String>,
+    /// Paragraph-wise TTS streaming toggle. Hot-applied.
+    tts_streaming: Option<bool>,
+    /// Opaque launcher command for the TTS sidecar. Process-affecting.
+    /// `tts_launch_command` accepted as a serde alias for legacy clients.
+    #[serde(default, alias = "tts_launch_command")]
+    tts_launcher_command: Option<String>,
     /// Subagent enabled toggle.
     subagent_enabled: Option<bool>,
     /// Skip subagent when chat_lang == tts_lang.
@@ -1164,32 +1443,27 @@ async fn handle_post_avatar_override(
     let path = runtime_override_path(&state.config_path);
 
     let mut over = if path.exists() {
-        match std::fs::read_to_string(&path)
+        std::fs::read_to_string(&path)
             .ok()
-            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok())
-        {
-            Some(v) => v,
-            None => RuntimeOverride::default(),
-        }
+            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok()).unwrap_or_default()
     } else {
         RuntimeOverride::default()
     };
 
-    // Whether anything that affects the TTS child process changed. If
-    // not, we can skip the stop/start dance entirely — most edits are
-    // language/speed/voice and shouldn't churn the GPU.
-    let tts_process_affected = req.tts_engine.is_some()
-        || req.tts_launch_command.is_some()
-        || req.tts_reference_audio.is_some()
-        || req.tts_reference_text.is_some()
-        || req.tts_reference_language.is_some()
-        || req.tts_model_path.is_some()
-        || req.tts_gpu_device.is_some();
+    // Whether anything that affects the TTS child process changed.
+    // Per the lifecycle protocol, only the URL and the opaque launcher
+    // command can force a manager rebuild — synth knobs (language /
+    // speed / voice / quality / streaming) are hot-applied per call.
+    let tts_process_affected =
+        req.tts_api_url.is_some() || req.tts_launcher_command.is_some();
 
     let mut av = over.avatar.unwrap_or_default();
     if let Some(v) = req.enabled { av.enabled = Some(v); }
     if let Some(v) = req.chat_language {
         av.chat_language = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_api_url {
+        av.tts_api_url = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(v) = req.tts_language {
         av.tts_language = if v.is_empty() { None } else { Some(v) };
@@ -1199,37 +1473,48 @@ async fn handle_post_avatar_override(
         let clamped = v.clamp(0.25, 3.0);
         av.tts_speed = Some(clamped);
     }
-    if let Some(v) = req.tts_engine {
-        av.tts_engine = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = req.tts_launch_command {
-        av.tts_launch_command = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = req.tts_auto_start { av.tts_auto_start = Some(v); }
-    if let Some(v) = req.tts_close_with_companion { av.tts_close_with_companion = Some(v); }
-    if let Some(v) = req.tts_reference_audio {
-        av.tts_reference_audio = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = req.tts_reference_text {
-        av.tts_reference_text = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = req.tts_reference_language {
-        av.tts_reference_language = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = req.tts_model_path {
-        av.tts_model_path = if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(v) = req.tts_gpu_device {
-        // Clamp to a sane range. -1 for CPU; 0..=15 for typical multi-GPU.
-        let clamped = v.clamp(-1, 15);
-        av.tts_gpu_device = Some(clamped);
-    }
     if let Some(v) = req.tts_voice {
         av.tts_voice = if v.is_empty() { None } else { Some(v) };
     }
-    if let Some(v) = req.subagent_enabled { av.subagent_enabled = Some(v); }
-    if let Some(v) = req.subagent_only_when_translating { av.subagent_only_when_translating = Some(v); }
-    if let Some(v) = req.subagent_streaming { av.subagent_streaming = Some(v); }
+    if let Some(v) = req.tts_quality {
+        // Validate against the spec'd preset names; ignore unknown values
+        // rather than persisting garbage that the sidecar would reject.
+        let normalized = v.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "fast" | "balanced" | "high") {
+            av.tts_quality = Some(normalized);
+        }
+    }
+    if let Some(v) = req.tts_streaming {
+        av.tts_streaming = Some(v);
+    }
+    if let Some(v) = req.tts_launcher_command {
+        av.tts_launcher_command = if v.is_empty() { None } else { Some(v) };
+    }
+    // Subagent toggles relocated from AvatarOverride to SubagentOverride
+    // in iteration 4. Wire still accepts them on AvatarOverrideRequest
+    // (so the web client doesn't need to fan out across endpoints), but
+    // we persist them under `subagent.{...}` — the canonical location —
+    // and clear any legacy `avatar.subagent_*` values so the file shape
+    // converges to one place over time.
+    let touched_subagent_toggles = req.subagent_enabled.is_some()
+        || req.subagent_only_when_translating.is_some()
+        || req.subagent_streaming.is_some();
+    if touched_subagent_toggles {
+        let mut sub = over.subagent.take().unwrap_or_default();
+        if let Some(v) = req.subagent_enabled {
+            sub.enabled = Some(v);
+            av.subagent_enabled = None;
+        }
+        if let Some(v) = req.subagent_only_when_translating {
+            sub.only_when_translating = Some(v);
+            av.subagent_only_when_translating = None;
+        }
+        if let Some(v) = req.subagent_streaming {
+            sub.streaming = Some(v);
+            av.subagent_streaming = None;
+        }
+        over.subagent = Some(sub);
+    }
 
     over.avatar = Some(av);
 
@@ -1282,18 +1567,16 @@ async fn handle_post_avatar_override(
                     let new_mgr = std::sync::Arc::new(new_mgr);
                     let avatar_clone = std::sync::Arc::clone(avatar_state);
                     let health = state.health.clone();
-                    let auto_start = new_avatar_cfg.tts.auto_start;
                     // Mark the watchdog's `tts_last_error` so the UI
                     // gets an immediate "restart in progress" hint;
                     // the watchdog will clear it on the next probe if
                     // the new TTS comes up successfully.
                     health.set_tts(false, Some("TTS restart in progress…".into()));
                     tokio::spawn(async move {
-                        // 1) Graceful shutdown of the old TTS (CUDA
-                        //    empty_cache + sync inside the Python
-                        //    wrapper). Bounded at the wrapper's
-                        //    /shutdown timeout (~8 s) plus our retry
-                        //    delay.
+                        // 1) Graceful shutdown of the previous TTS via
+                        //    the lifecycle protocol (POST /shutdown →
+                        //    wait → kill). No-op when externally
+                        //    managed.
                         let old_mgr = avatar_clone.tts.load_full();
                         if let Err(e) = old_mgr.stop_server().await {
                             tracing::warn!(
@@ -1303,32 +1586,27 @@ async fn handle_post_avatar_override(
                         // 2) Publish the new manager handle first so
                         //    even if start_server takes a while the
                         //    rest of the app already knows about it
-                        //    (the watchdog can probe its /health url).
+                        //    (the watchdog can probe its /healthz url).
                         avatar_clone.tts.store(new_mgr.clone());
-                        // 3) Start it.
-                        if auto_start {
-                            match new_mgr.start_server().await {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        "companion: TTS hot-swap completed successfully"
-                                    );
-                                    health.set_tts(true, None);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "companion: TTS start_server failed in hot-swap: {e}"
-                                    );
-                                    health.set_tts(
-                                        false,
-                                        Some(format!("TTS start failed: {e}")),
-                                    );
-                                }
+                        // 3) Start it. start_server is a no-op when no
+                        //    launcher_command is configured (assumes
+                        //    externally-managed server).
+                        match new_mgr.start_server().await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "companion: TTS hot-swap completed successfully"
+                                );
+                                health.set_tts(true, None);
                             }
-                        } else {
-                            // auto_start off: the user is responsible
-                            // for running the external TTS process.
-                            // Let the watchdog determine actual status.
-                            health.set_tts(false, Some("TTS auto_start off; managed externally".into()));
+                            Err(e) => {
+                                tracing::warn!(
+                                    "companion: TTS start_server failed in hot-swap: {e}"
+                                );
+                                health.set_tts(
+                                    false,
+                                    Some(format!("TTS start failed: {e}")),
+                                );
+                            }
                         }
                     });
                     tts_restart_pending = true;
@@ -1409,11 +1687,10 @@ async fn handle_post_zeroclaw_override(
     };
 
     let mut zc = over.zeroclaw.unwrap_or_default();
-    if let Some(ref v) = req.kind {
-        if !v.trim().is_empty() {
+    if let Some(ref v) = req.kind
+        && !v.trim().is_empty() {
             zc.kind = Some(AgentKind::from_str_lossy(v));
         }
-    }
     if let Some(v) = req.url {
         let trimmed = v.trim().trim_end_matches('/').to_string();
         zc.url = if trimmed.is_empty() { None } else { Some(trimmed) };
@@ -1459,6 +1736,77 @@ async fn handle_post_zeroclaw_override(
         new_cfg.zeroclaw.url,
     );
     Ok(axum::http::StatusCode::OK)
+}
+
+// ── Voice input (STT) proxy ────────────────────────────────────────
+//
+// The frontend's mic-record path posts `{audio, language?, prompt?}` here
+// (audio = base64-encoded WAV). We forward to the speech sidecar's
+// `/asr` endpoint and surface its response back to the UI verbatim, so
+// the same shape is shared with the in-process TTS-verify caller.
+//
+// Error mapping:
+//   - 503 — speech subsystem disabled OR sidecar unreachable. UI can
+//           show "voice input unavailable" without losing the audio.
+//   - 502 — sidecar returned an error (model load failure etc.).
+//   - 400 — bad request body.
+//
+// Audio payload size cap: 10 MB. 10 MB of 16 kHz mono WAV is ~5 min —
+// way more than a voice-message use case needs, and well under axum's
+// default body limit. Larger should go through a streaming upload.
+
+#[derive(serde::Deserialize)]
+struct AvatarAsrRequest {
+    audio: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+async fn handle_avatar_asr(
+    axum::extract::State(avatar): axum::extract::State<Arc<companion_avatar::AvatarWsState>>,
+    axum::Json(req): axum::Json<AvatarAsrRequest>,
+) -> Result<axum::Json<companion_avatar::AsrResponse>, (axum::http::StatusCode, String)> {
+    if req.audio.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "empty audio".into()));
+    }
+    let cfg = avatar.config.load();
+    if !cfg.speech.enabled {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "speech subsystem disabled in companion.toml ([avatar.speech] enabled = false)"
+                .into(),
+        ));
+    }
+    drop(cfg);
+    let Some(mgr) = avatar.speech_mgr.load_full() else {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "speech sidecar manager not initialised (check companion startup logs)".into(),
+        ));
+    };
+    let asr_req = companion_avatar::AsrRequest {
+        audio: req.audio,
+        language: req.language,
+        prompt: req.prompt,
+    };
+    match mgr.transcribe(&asr_req).await {
+        Ok(resp) => {
+            tracing::info!(
+                "companion: /api/avatar/asr lang={} dur={:.2}s wall={:.0}ms chars={}",
+                resp.language,
+                resp.duration,
+                resp.wall_ms,
+                resp.text.chars().count(),
+            );
+            Ok(axum::Json(resp))
+        }
+        Err(e) => {
+            tracing::warn!("companion: /api/avatar/asr failed: {e}");
+            Err((axum::http::StatusCode::BAD_GATEWAY, e.to_string()))
+        }
+    }
 }
 
 /// Wrapper put in front of the active character's persona text before it's

@@ -22,15 +22,22 @@ pub mod config;
 pub mod expression;
 pub mod lip_sync;
 pub mod protocol;
+pub mod speech_server;
 pub mod subagent;
 pub mod traits;
+pub mod translator;
 pub mod tts_server;
 pub mod ws;
 
-pub use config::AvatarConfig;
+pub use config::{AvatarConfig, AvatarSpeechConfig};
 pub use expression::{ExpressionMapper, Live2DExpression};
 pub use lip_sync::{LipSyncAnalyzer, LipSyncData, LipSyncFrame};
 pub use protocol::{AvatarMessage, AvatarNotification, LipSyncDataProto, LipSyncFrameProto};
+pub use speech_server::{AsrRequest, AsrResponse, AsrSegment, SpeechManager};
 pub use subagent::{AvatarSubagent, SubagentAnalysis, SubagentMotion};
+pub use translator::{
+    HttpTranslator, LlmTranslator, Translator, TranslatorBackendKind, TranslatorConfig,
+    TranslatorManager, build_translator,
+};
 pub use tts_server::{AnimeTtsManager, AudioOutput};
 pub use ws::{AvatarEvent, AvatarWsState, handle_ws_avatar, process_speak};

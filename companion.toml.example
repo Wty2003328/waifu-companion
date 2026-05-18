@@ -29,26 +29,47 @@ enabled = true
 chat_language = "en"   # what the agent reasons / replies in (subtitles)
 
 [avatar.tts]
-# Engine label is informational. The wire contract is the same regardless:
-#   POST {api_url}/tts {text, language, voice?, speed?} -> audio bytes
-#   GET  {api_url}/health -> 200 OK
-engine = "edge-tts"               # or: "gpt-sovits-v4", "fish-speech", etc.
-api_url = "http://127.0.0.1:9880" # where your TTS server listens
-port = 9880
-language = "en"                   # what the avatar SPEAKS (can differ from chat_language!)
-voice = "en-US-AriaNeural"
+# The companion is engine-agnostic — it only knows the URL of a
+# spec-compliant TTS server. Run any server that implements the
+# OpenAI-compatible /v1/audio/speech contract. See docs/TTS-PROVIDER-SPEC.md.
+#
+# Recommended host: glottis (https://github.com/Wty2003328/glottis-engine)
+#   — multi-engine serving system that already speaks this spec and
+#     orchestrates SBV2 / Chatterbox / CosyVoice / Higgs side by side.
+#
+# Other compliant servers also work: real OpenAI TTS via proxy,
+# openedai-speech, kokoro-fastapi, alltalk_tts, or your own.
+
+# Required — URL of the TTS server. Companion assumes it's already
+# running here; start glottis (or your chosen server) separately.
+api_url = "http://127.0.0.1:9891"
+
+# Per-call defaults (all overridable per request).
+language = "en"                   # what the avatar SPEAKS (can differ from chat_language)
+voice = "asuna_v2"                # voice_id registered with the server
 speed = 1.0
-auto_start = false
+# Quality preset — single user-facing knob, each backend maps it to its
+# native sampling params. One of: "fast" | "balanced" | "high".
+# - fast:     low-latency, RTF ≤ 0.7 (conversational)
+# - balanced: default — natural prosody, RTF ≤ 1.2
+# - high:     long-form / important responses, RTF ≤ 2.0
+quality = "balanced"
+
+# Paragraph-wise TTS streaming: synthesize each `\n\n`-delimited
+# paragraph as the translator emits it. Most chat replies are a single
+# paragraph → effectively single-shot synthesis.
+streaming = true
+
+# Optional — opaque command companion runs at startup if you want it
+# to auto-spawn the TTS server. Most users leave this unset and run
+# their TTS server (glottis or other) as a separate service.
+#
+# Legacy / transitional: a one-off launcher script can be used for
+# personal development. Set the absolute path that fits your install:
+# launcher_command = "python /abs/path/to/launcher.py --port 9891"
 
 # When `chat_language` ≠ `language`, the avatar subagent translates each
 # reply into `language` before TTS — subtitles stay in chat_language.
-
-# launch_command = ""                     # leave empty if you start TTS manually
-# model_path = "/path/to/model"           # forwarded as $TTS_MODEL_PATH
-# reference_audio = "/path/to/clip.wav"   # forwarded as $TTS_REFERENCE_AUDIO
-# reference_text = "..."                  # forwarded as $TTS_REFERENCE_TEXT
-# reference_language = "ja"               # forwarded as $TTS_REFERENCE_LANG
-# gpu_device = 0                          # sets $CUDA_VISIBLE_DEVICES (-1 = CPU)
 
 # ─── Avatar subagent (expression analysis + cross-language translation) ─
 [avatar.subagent]
@@ -64,6 +85,12 @@ only_when_translating = true
 # needed in this file). Adds one round trip per agent reply. Recommended
 # when companion + zeroclaw share a host.
 use_zeroclaw_webhook = false
+# Stream the translation sentence-by-sentence: TTS starts on the first
+# complete sentence (~3 s) instead of waiting for the bulk JSON analyze
+# call (~15-25 s). Expression analysis falls back to keyword matching
+# when streaming. Recommended on; turn off for richer LLM-picked
+# expressions at the cost of latency.
+streaming = true
 timeout_secs = 3   # bump to 60+ when use_zeroclaw_webhook = true (zeroclaw's loop is slower)
 # system_prompt = "..."   # optional override; supports {chat_lang}/{tts_lang}
 
@@ -78,6 +105,84 @@ model = "gpt-4o-mini"
 temperature = 0.3
 max_tokens = 400
 timeout_secs = 30
+# Send `thinking: { type: "disabled" }` on the request. The GLM-4.5/4.6/5
+# family drops latency from ~15-25 s to ~1 s when reasoning is off (other
+# providers ignore the field). Turn off if you want the model to reason
+# before responding.
+disable_thinking = true
+
+# Translation backend for the subagent's translate paths. The LLM path
+# (default) prompts the subagent's LLM and produces persona-aware
+# translation but adds ~700-1000 ms per sentence. The HTTP path routes
+# translation through a local NMT sidecar (tools/avatar/nmt_translator_server.py)
+# for ~100-400 ms per sentence at the cost of plain register.
+[avatar.subagent.translator]
+backend = "llm"                      # "llm" | "http"
+url = "http://127.0.0.1:9881"        # NMT sidecar base URL when backend = "http"
+http_timeout_secs = 8
+
+# Quality / hardware knobs for the NMT sidecar (forwarded as env vars
+# when backend = "http"). Presets:
+#   "fast"     → staka/fugumt-en-ja               (~70M, ~100 ms CPU)
+#   "balanced" → facebook/nllb-200-distilled-600M (600M, ~400 ms CPU, default)
+#   "quality"  → facebook/nllb-200-distilled-1.3B (1.3B, ~1-2 s CPU)  — top tier
+#   "custom"   → set nmt_model_id below
+# NLLB-3.3B was dropped: marginal BLEU gain on en→ja for 3-5x latency
+# and 2x VRAM. Pick "custom" + nmt_model_id if you really want it.
+nmt_quality_preset = "balanced"
+# nmt_model_id = "facebook/nllb-200-distilled-600M"    # explicit override
+# nmt_num_beams = 5                                    # 1 (greedy) to 8 (slow)
+nmt_device = "cpu"                                     # "cpu" | "cuda" | "cuda:N"
+nmt_precision = "auto"                                 # "auto" | "fp32" | "fp16" | "bf16"
+nmt_src_lang = "en"                                    # ISO-2 or flores-200 code
+nmt_tgt_lang = "ja"
+
+# NMT sidecar process lifecycle (only used when backend = "http").
+# Adjust the python prefix for your env (e.g. a conda env or `python3`).
+nmt_launch_command = "python tools/avatar/nmt_translator_server.py"
+nmt_auto_start = false                                 # spawn at companion startup
+nmt_close_with_companion = true                        # POST /shutdown on exit
+nmt_port = 9881                                        # must match `url` above
+
+# ─── Voice input / speech recognition (faster-whisper sidecar) ──
+# Native STT — used for two things, sharing ONE running Whisper instance:
+#   1. Voice input — frontend mic → POST /api/avatar/asr → sidecar /asr
+#      → transcript drops into the chat input (you can edit before
+#      sending). Press-and-hold the 🎙 button next to Send.
+#   2. TTS verification — when `verify_tts = true`, the GPT-SoVITS
+#      wrapper ASRs each synthesized clip and re-rolls on AR loops /
+#      early stops / drift. Catches the bug class where duration looks
+#      fine but the audio actually says the wrong thing.
+[avatar.speech]
+enabled = false
+port = 9882
+# model_size: tiny | base | small | medium | large-v3 | distil-large-v3
+#   small (default) — ~1s ASR wall on CPU, well under 500ms on GPU; the
+#   sweet spot for short voice messages. Bump to medium / large-v3 if you
+#   need higher accuracy in noisy environments.
+model_size = "small"
+# device: empty for auto-detect (cuda when available), else "cpu" / "cuda" / "cuda:N"
+device = ""
+# compute_type: empty for auto (int8_float16 on GPU, int8 on CPU), else
+# int8 / int8_float16 / float16 / float32. Lower precision is faster
+# and uses less VRAM with little accuracy loss on short clips.
+compute_type = ""
+# default_language: empty for auto-detect per call, else ISO-2 ("en" / "ja")
+# to skip the language-id pass (~50ms per request).
+default_language = ""
+launch_command = "python tools/avatar/speech_sidecar.py"
+auto_start = false                                     # spawn at companion startup
+close_with_companion = true                            # POST /shutdown on exit
+# warmup: load Whisper at sidecar boot (pay the model-load cost once at
+# startup instead of on the first user mic press; ~1-2s for small).
+warmup = true
+http_timeout_secs = 30
+# verify_tts: also use this Whisper instance to verify TTS output. When
+# the wrapper synthesizes a clip we POST it back through /asr and re-
+# roll on length / Jaccard mismatch. The CUDA-graph AR backend has a
+# stochastic loop bias on certain inputs (digits, "～", long multi-
+# sentence) — this is the safety net that catches it.
+verify_tts = true
 
 # ─── Live2D model placement ──────────────────────────────────────
 [avatar.model]
@@ -128,26 +233,28 @@ repos = [
 
 
 # ───────────────────────────────────────────────────────────────────
-# Example: GPT-SoVITS v4 cloned voice (cross-lingual)
+# Picking a TTS server
 # ───────────────────────────────────────────────────────────────────
-# Chat in English, hear the avatar reply in Japanese (or any pair).
+# The companion is engine-agnostic — see docs/TTS-PROVIDER-SPEC.md.
+# Any server implementing the spec endpoints (synth, voices, healthz)
+# works. You run the server; companion just talks to it.
 #
-# 1. Fine-tune a GPT-SoVITS v4 model for your voice. Guide:
-#    https://github.com/Wty2003328/gpt-sovits-voice-cloning-guide
-# 2. Replace the [avatar.tts] block above with:
+# Recommended:
+#   glottis — https://github.com/Wty2003328/glottis-engine
+#   Multi-engine TTS serving system. One HTTP port, many TTS models
+#   (SBV2/Chatterbox/CosyVoice/Higgs), per-model worker isolation,
+#   hardware-aware defaults. Built to be the canonical TTS host for
+#   clients like this companion.
 #
-# [avatar.tts]
-# engine             = "gpt-sovits-v4"
-# port               = 9880
-# language           = "ja"                                          # speech language
-# voice              = "<your-voice-id>"                             # used as the LoRA-name prefix
-# speed              = 1.0
-# auto_start         = true
-# launch_command     = "python tools/avatar/gptsovits_tts_server.py"
-# model_path         = "/path/to/GPT-SoVITS"                         # repo root
-# reference_audio    = "/path/to/your_reference_clip.wav"            # 3-10 s sample
-# reference_text     = "<exact transcript of the clip>"
-# reference_language = "ja"
-# gpu_device         = 0
+# Other compliant servers also work — point api_url at them:
+#   - real OpenAI TTS (via proxy)
+#   - openedai-speech
+#   - kokoro-fastapi
+#   - alltalk_tts
+#   - any custom OpenAI-compatible TTS service
 #
-# Then enable [avatar.subagent] so cross-language replies get translated.
+# Companion does NOT manage the TTS server's lifecycle by default —
+# run it as a separate service (systemd, docker compose, manual).
+# For personal-dev quick-launch convenience, `launcher_command` can
+# be set to an opaque command companion will run at startup; consider
+# this transitional and prefer a managed external service in prod.

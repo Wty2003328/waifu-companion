@@ -69,15 +69,14 @@ impl ExpressionMapper {
     fn detect_keyword(&self, text: &str) -> Live2DExpression {
         let lower = text.to_lowercase();
         for (keyword, emotion) in &self.keyword_map {
-            if lower.contains(keyword) {
-                if let Some(expr_name) = self.mapping.get(emotion) {
+            if lower.contains(keyword)
+                && let Some(expr_name) = self.mapping.get(emotion) {
                     return Live2DExpression {
                         name: expr_name.clone(),
                         intensity: 0.8,
                         duration_ms: Some(3000),
                     };
                 }
-            }
         }
         Live2DExpression {
             name: self.default_expression.clone(),
@@ -88,8 +87,8 @@ impl ExpressionMapper {
 
     fn detect_llm_tag(&self, text: &str) -> Live2DExpression {
         let re = regex::Regex::new(r"\[emotion:(\w+)\]").unwrap();
-        if let Some(caps) = re.captures(text) {
-            if let Some(emotion) = caps.get(1) {
+        if let Some(caps) = re.captures(text)
+            && let Some(emotion) = caps.get(1) {
                 let emotion = emotion.as_str();
                 if let Some(expr_name) = self.mapping.get(emotion) {
                     return Live2DExpression {
@@ -105,7 +104,6 @@ impl ExpressionMapper {
                     duration_ms: Some(3000),
                 };
             }
-        }
         Live2DExpression {
             name: self.default_expression.clone(),
             intensity: 0.5,
@@ -224,5 +222,75 @@ mod tests {
         let mapper = ExpressionMapper::new(&test_config());
         let expr = mapper.detect("");
         assert_eq!(expr.name, "neutral");
+    }
+
+    // ── Additional edge-case coverage (extended test framework) ─────
+
+    #[test]
+    fn keyword_emoji_only_text_returns_default() {
+        // Emoji-only input — no keyword match should ever fire.
+        let mapper = ExpressionMapper::new(&test_config());
+        let expr = mapper.detect("🌸🌟✨");
+        assert_eq!(expr.name, "neutral");
+    }
+
+    #[test]
+    fn keyword_mixed_language_japanese_english() {
+        // Japanese + English: "happy" in the middle of a JP sentence
+        // should still trip the keyword.
+        let mapper = ExpressionMapper::new(&test_config());
+        let expr = mapper.detect("今日はとてもhappyだよ");
+        assert_eq!(expr.name, "smile");
+    }
+
+    #[test]
+    fn keyword_very_long_input_doesnt_panic() {
+        // 100 KB string with a happy keyword near the end.
+        let mut s = "x".repeat(100_000);
+        s.push_str(" happy ");
+        let mapper = ExpressionMapper::new(&test_config());
+        let expr = mapper.detect(&s);
+        assert_eq!(expr.name, "smile");
+    }
+
+    #[test]
+    fn strip_tags_handles_unicode_around_tag() {
+        let mapper = ExpressionMapper::new(&test_config());
+        let cleaned = mapper.strip_tags("日本語[emotion:happy]の文章");
+        assert!(!cleaned.contains("[emotion:"));
+        assert!(cleaned.contains("日本語"));
+        assert!(cleaned.contains("の文章"));
+    }
+
+    #[test]
+    fn strip_tags_emoji_only_input_unchanged() {
+        // No tags → should return the input verbatim (modulo trim).
+        let mapper = ExpressionMapper::new(&test_config());
+        let cleaned = mapper.strip_tags("🌸🌟✨");
+        assert_eq!(cleaned, "🌸🌟✨");
+    }
+
+    #[test]
+    fn llm_tag_with_uppercase_emotion_falls_through_to_name() {
+        // The mapping is lowercase; an uppercase emotion in a tag
+        // should still go through the fallback path (use the literal
+        // emotion name as the expression).
+        let mut config = test_config();
+        config.detection_mode = "llm_tag".to_string();
+        let mapper = ExpressionMapper::new(&config);
+        let expr = mapper.detect("[emotion:CALM]");
+        // No "CALM" in mapping → emotion name used directly.
+        assert_eq!(expr.name, "CALM");
+    }
+
+    #[test]
+    fn llm_tag_no_tag_returns_default_in_llm_mode() {
+        let mut config = test_config();
+        config.detection_mode = "llm_tag".to_string();
+        let mapper = ExpressionMapper::new(&config);
+        let expr = mapper.detect("just plain text no tags");
+        assert_eq!(expr.name, "neutral");
+        // Default-mode intensity is 0.5 (see detect_llm_tag fallback).
+        assert!((expr.intensity - 0.5).abs() < f32::EPSILON);
     }
 }

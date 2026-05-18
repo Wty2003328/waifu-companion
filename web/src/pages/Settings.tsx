@@ -7,7 +7,7 @@ import {
   setStoredServerUrl,
 } from '../lib/apiBase';
 import { invalidateCache, useCachedJson } from '../lib/fetchCache';
-import { pickFile, pickFolder, listGpus, type DetectedGpu } from '../lib/tauriShell';
+import { listGpus, type DetectedGpu } from '../lib/tauriShell';
 import { tokens, inputStyle, monoInputStyle } from '../lib/theme';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -19,23 +19,38 @@ function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promis
   return typeof inv === 'function' ? inv : null;
 }
 
+/** Build a useful error message for a failed Settings POST. The naked
+ *  `${r.status} ${await r.text()}` pattern produced "Save failed: 500 "
+ *  (trailing space, no context) on empty bodies and dumped multi-KB
+ *  Rust panic traces into the warn banner when the body was huge. This
+ *  normalizes: human-readable status, truncated body, no dangling
+ *  whitespace, and a non-empty fallback when the server says nothing. */
+async function saveErrorMessage(label: string, r: Response): Promise<string> {
+  let body = '';
+  try { body = (await r.text()).trim(); } catch { /* swallow */ }
+  if (body.length > 280) body = body.slice(0, 280) + '… (truncated)';
+  const status = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ''}`;
+  if (!body) return `${label} — ${status}. Server returned no message.`;
+  return `${label} — ${status}: ${body}`;
+}
+
 interface AvatarConfigView {
   enabled: boolean;
   chat_language: string;
+  /** Universal TTS port — companion knows only a URL + synthesis defaults.
+   *  Engine identity, weights, python interpreter etc. live in an external
+   *  launcher (tts_lab/launch_tts.py). See docs/TTS-PROVIDER-SPEC.md. */
   tts: {
-    engine: string;
-    language: string;
-    voice: string | null;
     api_url: string | null;
+    voice: string | null;
+    language: string;
     speed: number;
-    launch_command: string | null;
-    auto_start: boolean;
-    close_with_companion: boolean;
-    reference_audio: string | null;
-    reference_text: string | null;
-    reference_language: string | null;
-    model_path: string | null;
-    gpu_device: number;
+    /** Quality preset (fast | balanced | high). null → sidecar default. */
+    quality: string | null;
+    /** Paragraph-wise streaming toggle. */
+    streaming: boolean;
+    /** Opaque launcher command, run at startup if non-empty. */
+    launcher_command: string | null;
   };
   subagent: {
     enabled: boolean;
@@ -47,6 +62,7 @@ interface AvatarConfigView {
     llm_disable_thinking: boolean;
     llm_api_key_set: boolean;
     timeout_secs: number;
+    translator?: TranslatorConfigView;
   };
   model: {
     model_dir: string | null;
@@ -55,6 +71,106 @@ interface AvatarConfigView {
     anchor: string;
   };
 }
+
+/// Subagent's translation backend + NMT sidecar tuning.
+/// Mirrors `crates/companion-avatar/src/translator.rs::TranslatorConfig`.
+interface TranslatorConfigView {
+  backend: 'llm' | 'http';
+  url: string;
+  http_timeout_secs: number;
+  nmt_quality_preset: string;       // "fast" | "balanced" | "quality" | "custom"
+  nmt_model_id: string | null;
+  nmt_num_beams: number | null;
+  nmt_device: string;                // "cpu" | "cuda" | "cuda:N"
+  nmt_precision: string;             // "auto" | "fp32" | "fp16" | "bf16"
+  nmt_src_lang: string;
+  nmt_tgt_lang: string;
+  nmt_launch_command: string;
+  nmt_auto_start: boolean;
+  nmt_close_with_companion: boolean;
+  nmt_port: number;
+}
+
+/// One supported language for an NMT preset. `code` is the
+/// short code our config files use (ISO-2 for everything except a
+/// few NLLB-specific ones); `name` is the human-readable label.
+interface NmtLanguage {
+  code: string;
+  name: string;
+}
+
+/// Curated NLLB-200 list. The model technically supports 200
+/// languages, but the chat companion realistically needs the
+/// common-use subset. Add a row here when a user actually needs it.
+const NLLB_LANGUAGES: NmtLanguage[] = [
+  { code: 'en', name: 'English' },
+  { code: 'ja', name: 'Japanese' },
+  { code: 'zh', name: 'Chinese (Simplified)' },
+  { code: 'zh-Hant', name: 'Chinese (Traditional)' },
+  { code: 'ko', name: 'Korean' },
+  { code: 'es', name: 'Spanish' },
+  { code: 'fr', name: 'French' },
+  { code: 'de', name: 'German' },
+  { code: 'ru', name: 'Russian' },
+  { code: 'ar', name: 'Arabic' },
+  { code: 'pt', name: 'Portuguese' },
+  { code: 'it', name: 'Italian' },
+  { code: 'vi', name: 'Vietnamese' },
+  { code: 'th', name: 'Thai' },
+  { code: 'hi', name: 'Hindi' },
+];
+
+/// What each preset can translate. Drives the language-pair dropdowns
+/// in the UI. `fixed_pair` locks the dropdowns when the model is
+/// single-direction (Helsinki opus-mt / fugumt are per-pair).
+interface NmtPresetDef {
+  id: string;
+  label: string;
+  blurb: string;
+  /// Languages the model accepts as source. Empty list = the preset
+  /// is single-pair (use `fixed_pair`).
+  src: NmtLanguage[];
+  /// Languages the model can output. Same shape.
+  tgt: NmtLanguage[];
+  /// When set, src/tgt are locked to this exact pair (Marian single-
+  /// direction models). The UI shows the pair as a static label.
+  fixed_pair?: { src: NmtLanguage; tgt: NmtLanguage };
+}
+
+const NMT_PRESETS: NmtPresetDef[] = [
+  {
+    id: 'fast',
+    label: 'Fast (fugumt-en-ja, ~70 M)',
+    blurb: '~100 ms CPU. Specialized en→ja. Decent modern JA but a bit literal.',
+    src: [],
+    tgt: [],
+    fixed_pair: {
+      src: { code: 'en', name: 'English' },
+      tgt: { code: 'ja', name: 'Japanese' },
+    },
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced — recommended (NLLB-200-distilled-600M)',
+    blurb: '~400 ms CPU / ~200 ms GPU. Multilingual, production-grade quality.',
+    src: NLLB_LANGUAGES,
+    tgt: NLLB_LANGUAGES,
+  },
+  {
+    id: 'quality',
+    label: 'Quality (NLLB-200-distilled-1.3B)',
+    blurb: '~1–2 s CPU / ~300 ms GPU. Noticeably better than 600M; GPU recommended. Top tier.',
+    src: NLLB_LANGUAGES,
+    tgt: NLLB_LANGUAGES,
+  },
+  {
+    id: 'custom',
+    label: 'Custom (specify model id)',
+    blurb: 'Any seq2seq HF model. Fill in the "Model ID" field below.',
+    src: [],
+    tgt: [],
+  },
+];
 
 interface ZeroclawConfigView {
   /// "zeroclaw" | "openclaw" | "hermes" | "custom". Drives the chat
@@ -172,14 +288,14 @@ export default function Settings() {
       {error && <ErrorBox message={error} />}
 
       <Section title="Main agent">
-        {!cfg && !error && <Hint tone="muted">loading…</Hint>}
+        {!cfg && !error && <SectionLoading rows={3} />}
         {cfg?.zeroclaw && (
           <ZeroclawEditor current={cfg.zeroclaw} onSaved={reloadCfg} />
         )}
       </Section>
 
       <Section title="Avatar & voice">
-        {!cfg && !error && <Hint tone="muted">loading…</Hint>}
+        {!cfg && !error && <SectionLoading rows={3} />}
         {cfg && !cfg.avatar && (
           <Hint tone="warn">
             Avatar is turned off in the config file. Set{' '}
@@ -257,161 +373,13 @@ const LANGUAGE_CHOICES: { code: string; label: string }[] = [
   { code: 'de', label: 'German (de)' },
 ];
 
-/** Per-engine spec: which fields the form should expose, plus a
- *  one-liner describing what the engine is. Custom engine names get
- *  the "show everything" fallback below — power users typically know
- *  what they need.
- *
- *  Removed: legacy `gpt-sovits` (v1-v3). It still works if a user has
- *  it set in companion.toml — they'll just see the Custom path and
- *  can edit by hand. v4 is the supported zero-shot rig. */
-interface EngineSpec {
-  value: string;
-  label: string;
-  description: string;
-  needsLauncher: boolean;
-  needsModelRoot: boolean;
-  modelRootLabel?: string;
-  modelRootHint?: string;
-  needsGpu: boolean;
-  needsVoiceSample: boolean;
-  needsPresetVoice: boolean;
-  presetVoices?: { value: string; label: string }[];
-}
-
-const ENGINE_SPECS: EngineSpec[] = [
-  {
-    value: 'gpt-sovits-v4',
-    label: 'GPT-SoVITS v4',
-    description: 'High-quality zero-shot voice cloning. Needs GPU + a 3-10s voice sample.',
-    needsLauncher: true,
-    needsModelRoot: true,
-    modelRootLabel: 'GPT-SoVITS install folder',
-    modelRootHint: 'Path to your GPT-SoVITS git checkout (the folder with `tools/`, `GPT_SoVITS/`, etc.)',
-    needsGpu: true,
-    needsVoiceSample: true,
-    needsPresetVoice: false,
-  },
-  {
-    value: 'fish-speech',
-    label: 'fish-speech',
-    description: 'Zero-shot voice cloning. Needs GPU + a voice sample.',
-    needsLauncher: true,
-    needsModelRoot: true,
-    modelRootLabel: 'fish-speech model folder',
-    modelRootHint: 'Path to the fish-speech checkpoint directory',
-    needsGpu: true,
-    needsVoiceSample: true,
-    needsPresetVoice: false,
-  },
-  {
-    value: 'xtts',
-    label: 'XTTS (Coqui)',
-    description: 'Zero-shot multilingual cloning. Needs GPU + a voice sample.',
-    needsLauncher: true,
-    needsModelRoot: true,
-    modelRootLabel: 'XTTS model folder',
-    modelRootHint: 'Path to the Coqui XTTS model directory',
-    needsGpu: true,
-    needsVoiceSample: true,
-    needsPresetVoice: false,
-  },
-  {
-    value: 'f5-tts',
-    label: 'F5-TTS',
-    description: 'Fast zero-shot synthesis. Needs GPU + a voice sample.',
-    needsLauncher: true,
-    needsModelRoot: true,
-    modelRootLabel: 'F5-TTS install folder',
-    modelRootHint: 'Path to the F5-TTS checkout',
-    needsGpu: true,
-    needsVoiceSample: true,
-    needsPresetVoice: false,
-  },
-  {
-    value: 'edge-tts',
-    label: 'edge-tts (Microsoft, free, no GPU)',
-    description: 'Cloud-based preset voices from Microsoft Edge. Free, fast, no GPU. Pick from a fixed voice list.',
-    needsLauncher: true,
-    needsModelRoot: false,
-    needsGpu: false,
-    needsVoiceSample: false,
-    needsPresetVoice: true,
-    presetVoices: [
-      { value: 'ja-JP-NanamiNeural', label: 'ja-JP / Nanami (female)' },
-      { value: 'ja-JP-KeitaNeural',  label: 'ja-JP / Keita (male)' },
-      { value: 'en-US-AriaNeural',   label: 'en-US / Aria (female)' },
-      { value: 'en-US-GuyNeural',    label: 'en-US / Guy (male)' },
-      { value: 'en-US-JennyNeural',  label: 'en-US / Jenny (female)' },
-      { value: 'zh-CN-XiaoxiaoNeural', label: 'zh-CN / Xiaoxiao (female)' },
-      { value: 'zh-CN-YunxiNeural',  label: 'zh-CN / Yunxi (male)' },
-      { value: 'ko-KR-SunHiNeural',  label: 'ko-KR / SunHi (female)' },
-    ],
-  },
-  {
-    value: 'melotts',
-    label: 'MeloTTS',
-    description: 'Lightweight multilingual TTS with preset voices. Runs on CPU or GPU.',
-    needsLauncher: true,
-    needsModelRoot: false,
-    needsGpu: true,
-    needsVoiceSample: false,
-    needsPresetVoice: true,
-    presetVoices: [
-      { value: 'JP',     label: 'Japanese (default)' },
-      { value: 'EN-US',  label: 'English US' },
-      { value: 'EN-BR',  label: 'English UK' },
-      { value: 'ZH',     label: 'Chinese' },
-      { value: 'KR',     label: 'Korean' },
-      { value: 'FR',     label: 'French' },
-      { value: 'ES',     label: 'Spanish' },
-    ],
-  },
-];
-
-/** "Show everything" spec for custom/unknown engines. */
-const CUSTOM_ENGINE_SPEC: EngineSpec = {
-  value: '__custom',
-  label: 'Custom engine',
-  description: "You're bringing your own. We expose every field — pick what your wrapper needs.",
-  needsLauncher: true,
-  needsModelRoot: true,
-  modelRootLabel: 'Engine root folder',
-  modelRootHint: 'Whatever your wrapper expects as TTS_MODEL_PATH',
-  needsGpu: true,
-  needsVoiceSample: true,
-  needsPresetVoice: false,
-};
-
-function engineSpec(engine: string): EngineSpec {
-  return ENGINE_SPECS.find((e) => e.value === engine) ?? CUSTOM_ENGINE_SPEC;
-}
-
-/** Split a launch_command into (python interpreter, server script).
- *  The combined form looks like `C:/path/python.exe tools/x.py`.
- *  Heuristic:
- *    1. Match on `.exe`/`python`/`python3` followed by whitespace —
- *       this handles paths-with-no-spaces cleanly.
- *    2. Otherwise split on the first whitespace.
- *    3. If neither, treat the whole thing as the interpreter.
- *  Doesn't handle Windows paths with embedded spaces — for those the
- *  user can paste the combined string into either field; we re-join
- *  on save with a single space. */
-function splitLaunch(combined: string): { python: string; script: string } {
-  const trimmed = combined.trim();
-  if (!trimmed) return { python: '', script: '' };
-  const m = trimmed.match(/^(.*?(?:\.exe|python\d?))\s+(.+)$/i);
-  if (m) return { python: m[1].trim(), script: m[2].trim() };
-  const ws = trimmed.indexOf(' ');
-  if (ws < 0) return { python: trimmed, script: '' };
-  return { python: trimmed.slice(0, ws), script: trimmed.slice(ws + 1).trim() };
-}
-
-function joinLaunch(python: string, script: string): string {
-  const p = python.trim();
-  const s = script.trim();
-  if (p && s) return `${p} ${s}`;
-  return p || s;
+/** Live state read from the TTS server's /healthz at form load. Used
+ *  read-only — the companion never branches on this; it's UI telemetry
+ *  ("you're talking to <engine_id>"). */
+interface TtsServerInfo {
+  engine_id: string;
+  spec_version: string;
+  model?: string;
 }
 
 /** Edits the connection to the (possibly remote) zeroclaw daemon.
@@ -478,7 +446,7 @@ function ZeroclawEditor({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error(`save: ${r.status} ${await r.text()}`);
+      if (!r.ok) throw new Error(await saveErrorMessage('Agent save failed', r));
       setSavedAt(Date.now());
       setToken(''); // clear once persisted; server redacts on read
       onSaved();
@@ -615,34 +583,48 @@ function AvatarEditor({
 }) {
   const [enabled, setEnabled] = useState<boolean>(current.enabled);
   const [chatLang, setChatLang] = useState<string>(current.chat_language);
+  // Universal TTS port — companion knows only URL + synthesis defaults.
+  // Engine identity, weights, python interpreter, GPU device etc. live
+  // in an external launcher (tts_lab/launch_tts.py).
+  const [ttsApiUrl, setTtsApiUrl] = useState<string>(current.tts.api_url ?? '');
   const [ttsLang, setTtsLang] = useState<string>(current.tts.language);
-  const [ttsSpeed, setTtsSpeed] = useState<number>(current.tts.speed);
-  const [ttsEngine, setTtsEngine] = useState<string>(current.tts.engine);
-  // TTS path / reference settings — used to require editing
-  // companion.toml. Now editable here so a fresh install can be set
-  // up without leaving the app.
-  // Split the combined launch_command (`python.exe tools/x.py`) into
-  // two fields so the user gets a clean "interpreter + script" UI
-  // instead of one merged string that couldn't be properly browsed.
-  const initialLaunch = splitLaunch(current.tts.launch_command ?? '');
-  const [ttsPython, setTtsPython] = useState<string>(initialLaunch.python);
-  const [ttsScript, setTtsScript] = useState<string>(initialLaunch.script);
-  const ttsLaunchCmd = joinLaunch(ttsPython, ttsScript);
-  const [ttsAutoStart, setTtsAutoStart] = useState<boolean>(current.tts.auto_start);
-  const [ttsCloseWithCompanion, setTtsCloseWithCompanion] = useState<boolean>(current.tts.close_with_companion);
-  const [ttsRefAudio, setTtsRefAudio] = useState<string>(current.tts.reference_audio ?? '');
-  const [ttsRefText, setTtsRefText] = useState<string>(current.tts.reference_text ?? '');
-  const [ttsRefLang, setTtsRefLang] = useState<string>(current.tts.reference_language ?? '');
-  const [ttsModelPath, setTtsModelPath] = useState<string>(current.tts.model_path ?? '');
-  const [ttsGpu, setTtsGpu] = useState<number>(current.tts.gpu_device);
   const [ttsVoice, setTtsVoice] = useState<string>(current.tts.voice ?? '');
-  // Detected GPUs from the host (nvidia-smi → WMI fallback).
-  // Empty until the Tauri command resolves; we render a sane fallback
-  // (CPU + "GPU 0") until then.
-  const [detectedGpus, setDetectedGpus] = useState<DetectedGpu[]>([]);
-  useEffect(() => { void listGpus().then(setDetectedGpus); }, []);
-  const spec = engineSpec(ttsEngine);
-  const isCustomEngine = !ENGINE_SPECS.find((e) => e.value === ttsEngine);
+  const [ttsSpeed, setTtsSpeed] = useState<number>(current.tts.speed);
+  const [ttsQuality, setTtsQuality] = useState<string>(current.tts.quality ?? 'balanced');
+  const [ttsLauncherCmd, setTtsLauncherCmd] = useState<string>(current.tts.launcher_command ?? '');
+  // Read-only telemetry from the live server's /healthz. Tells the user
+  // which engine they're actually talking to; companion never uses this
+  // for control flow.
+  const [serverInfo, setServerInfo] = useState<TtsServerInfo | null>(null);
+  // Voice registry from GET /v1/audio/voices. Empty until the fetch
+  // resolves; falls back to a free-text input if the server is offline.
+  const [sidecarVoices, setSidecarVoices] = useState<{ id: string; name: string; language: string | null }[]>([]);
+
+  const effectiveTtsUrl = (ttsApiUrl.trim() || current.tts.api_url || 'http://127.0.0.1:9890').replace(/\/$/, '');
+
+  // Hit /healthz + /v1/audio/voices on the configured server. Both are
+  // best-effort — if the server is down the form still works, the user
+  // just gets a free-text voice input and no engine_id badge.
+  useEffect(() => {
+    const ctrl = new AbortController();
+    fetch(`${effectiveTtsUrl}/healthz`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: TtsServerInfo | null) => setServerInfo(data))
+      .catch(() => setServerInfo(null));
+    fetch(`${effectiveTtsUrl}/v1/audio/voices`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : { voices: [] }))
+      .then((data: { voices?: { id: string; name?: string; language?: string }[] }) => {
+        setSidecarVoices(
+          (data.voices ?? []).map((v) => ({
+            id: v.id,
+            name: v.name || v.id,
+            language: v.language ?? null,
+          })),
+        );
+      })
+      .catch(() => setSidecarVoices([]));
+    return () => ctrl.abort();
+  }, [effectiveTtsUrl]);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -650,43 +632,31 @@ function AvatarEditor({
   const dirty =
     enabled !== current.enabled ||
     chatLang !== current.chat_language ||
+    ttsApiUrl.trim() !== (current.tts.api_url ?? '') ||
     ttsLang !== current.tts.language ||
+    ttsVoice.trim() !== (current.tts.voice ?? '') ||
     Math.abs(ttsSpeed - current.tts.speed) > 0.001 ||
-    ttsEngine.trim() !== current.tts.engine ||
-    ttsLaunchCmd.trim() !== (current.tts.launch_command ?? '') ||
-    ttsAutoStart !== current.tts.auto_start ||
-    ttsCloseWithCompanion !== current.tts.close_with_companion ||
-    ttsRefAudio.trim() !== (current.tts.reference_audio ?? '') ||
-    ttsRefText.trim() !== (current.tts.reference_text ?? '') ||
-    ttsRefLang.trim() !== (current.tts.reference_language ?? '') ||
-    ttsModelPath.trim() !== (current.tts.model_path ?? '') ||
-    ttsGpu !== current.tts.gpu_device ||
-    ttsVoice.trim() !== (current.tts.voice ?? '');
+    ttsQuality !== (current.tts.quality ?? 'balanced') ||
+    ttsLauncherCmd.trim() !== (current.tts.launcher_command ?? '');
 
   const save = async () => {
     setSaving(true); setError(null);
     const body: Record<string, unknown> = {};
     if (enabled !== current.enabled) body.enabled = enabled;
     if (chatLang !== current.chat_language) body.chat_language = chatLang;
+    if (ttsApiUrl.trim() !== (current.tts.api_url ?? '')) body.tts_api_url = ttsApiUrl.trim();
     if (ttsLang !== current.tts.language) body.tts_language = ttsLang;
-    if (Math.abs(ttsSpeed - current.tts.speed) > 0.001) body.tts_speed = ttsSpeed;
-    if (ttsEngine.trim() !== current.tts.engine) body.tts_engine = ttsEngine.trim();
-    if (ttsLaunchCmd.trim() !== (current.tts.launch_command ?? '')) body.tts_launch_command = ttsLaunchCmd.trim();
-    if (ttsAutoStart !== current.tts.auto_start) body.tts_auto_start = ttsAutoStart;
-    if (ttsCloseWithCompanion !== current.tts.close_with_companion) body.tts_close_with_companion = ttsCloseWithCompanion;
-    if (ttsRefAudio.trim() !== (current.tts.reference_audio ?? '')) body.tts_reference_audio = ttsRefAudio.trim();
-    if (ttsRefText.trim() !== (current.tts.reference_text ?? '')) body.tts_reference_text = ttsRefText.trim();
-    if (ttsRefLang.trim() !== (current.tts.reference_language ?? '')) body.tts_reference_language = ttsRefLang.trim();
-    if (ttsModelPath.trim() !== (current.tts.model_path ?? '')) body.tts_model_path = ttsModelPath.trim();
-    if (ttsGpu !== current.tts.gpu_device) body.tts_gpu_device = ttsGpu;
     if (ttsVoice.trim() !== (current.tts.voice ?? '')) body.tts_voice = ttsVoice.trim();
+    if (Math.abs(ttsSpeed - current.tts.speed) > 0.001) body.tts_speed = ttsSpeed;
+    if (ttsQuality !== (current.tts.quality ?? 'balanced')) body.tts_quality = ttsQuality;
+    if (ttsLauncherCmd.trim() !== (current.tts.launcher_command ?? '')) body.tts_launcher_command = ttsLauncherCmd.trim();
     try {
       const r = await fetch(`${HTTP_BASE}/api/config/avatar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error(`save failed: ${r.status} ${await r.text()}`);
+      if (!r.ok) throw new Error(await saveErrorMessage('Avatar save failed', r));
       // Server returns a JSON body describing what got applied live
       // and whether a TTS child-process restart is pending. The
       // restart itself runs on a background task — the watchdog
@@ -706,7 +676,7 @@ function AvatarEditor({
 
   return (
     <>
-      <FieldRow label="Show avatar">
+      <FieldRow label="Enable avatar">
         <Toggle checked={enabled} onChange={setEnabled} />
       </FieldRow>
       <FieldRow label="Chat language">
@@ -745,236 +715,112 @@ function AvatarEditor({
 
       <Subsection label="Voice server">
         <FieldRow
-          label="Start with companion"
-          hint="Launch the voice (TTS) server automatically when the companion opens. Off → the companion expects a server already running at the address below."
+          label="Server URL"
+          hint={
+            serverInfo
+              ? <>Connected — speaking to <code style={{ color: tokens.textMuted }}>{serverInfo.engine_id}</code> (spec v{serverInfo.spec_version}{serverInfo.model ? ` · ${serverInfo.model}` : ''}).</>
+              : <>Where the TTS server listens. Must speak <a href="docs/TTS-PROVIDER-SPEC.md" style={{ color: tokens.primary }}>TTS Provider Spec v1</a>. Server not reachable — voice list and engine info won't load.</>
+          }
         >
-          <Toggle checked={ttsAutoStart} onChange={setTtsAutoStart} />
+          <input
+            type="text"
+            value={ttsApiUrl}
+            onChange={(e) => setTtsApiUrl(e.target.value)}
+            placeholder="http://127.0.0.1:9891"
+            style={inputStyle}
+            spellCheck={false}
+          />
         </FieldRow>
         <FieldRow
-          label="Stop on close"
-          hint="Shut the voice server down when the companion closes. Off → leave it loaded between sessions: the next launch reuses the still-warm server (instant voice), at the cost of holding GPU memory while the companion is closed."
+          label="Launcher command"
+          hint={
+            <>
+              Optional. If set, companion spawns this opaquely at startup
+              and tears it down at exit per the lifecycle protocol. Leave
+              empty if you manage the server yourself. The recommended
+              pattern is to use <code style={{ color: tokens.textMuted }}>tts_lab/launch_tts.py --engine X --port N</code>;
+              run <code style={{ color: tokens.textMuted }}>--list</code> to see known engines.
+            </>
+          }
         >
-          <Toggle checked={ttsCloseWithCompanion} onChange={setTtsCloseWithCompanion} />
+          <input
+            type="text"
+            value={ttsLauncherCmd}
+            onChange={(e) => setTtsLauncherCmd(e.target.value)}
+            placeholder="python /path/to/tts_lab/launch_tts.py --engine sbv2-asuna-v2 --port 9891"
+            style={inputStyle}
+            spellCheck={false}
+          />
         </FieldRow>
       </Subsection>
 
-      <Subsection label="Voice engine">
-        <FieldRow label="Voice engine" hint={spec.description}>
-          <select
-            value={isCustomEngine ? '__custom' : ttsEngine}
-            onChange={(e) => {
-              if (e.target.value === '__custom') return;
-              setTtsEngine(e.target.value);
-            }}
-            style={inputStyle}
-          >
-            {ENGINE_SPECS.map((e) => (
-              <option key={e.value} value={e.value}>{e.label}</option>
-            ))}
-            <option value="__custom">Other…</option>
-          </select>
-        </FieldRow>
-        {isCustomEngine && (
-          <FieldRow label="Custom engine name">
-            <input
-              type="text"
-              value={ttsEngine}
-              onChange={(e) => setTtsEngine(e.target.value)}
-              placeholder="my-engine"
-              style={inputStyle}
-            />
-          </FieldRow>
-        )}
-
-        {spec.needsLauncher && (
-          <>
-            <FieldRow label="Python interpreter">
-              <PathPicker
-                value={ttsPython}
-                onChange={setTtsPython}
-                placeholder="C:/Users/.../envs/<env>/python.exe"
-                pick={async () => {
-                  const path = await pickFile({
-                    title: 'Pick the Python interpreter (python.exe)',
-                    filters: [
-                      { label: 'Python executable', extensions: ['exe'] },
-                      { label: 'All files', extensions: ['*'] },
-                    ],
-                  });
-                  if (path) setTtsPython(path);
-                }}
-              />
-            </FieldRow>
-            <FieldRow
-              label="Server script"
-              hint={
-                <>
-                  The Python the engine runs under and the wrapper script that
-                  serves <code style={{ color: tokens.textMuted }}>/tts</code>.
-                  The script can be an absolute path or relative to the
-                  workspace root (where companion-server is launched from).
-                </>
-              }
-            >
-              <PathPicker
-                value={ttsScript}
-                onChange={setTtsScript}
-                placeholder="tools/avatar/gptsovits_tts_server.py"
-                pick={async () => {
-                  const path = await pickFile({
-                    title: 'Pick the TTS server script',
-                    filters: [
-                      { label: 'Python script', extensions: ['py'] },
-                      { label: 'All files', extensions: ['*'] },
-                    ],
-                  });
-                  if (path) setTtsScript(path);
-                }}
-              />
-            </FieldRow>
-          </>
-        )}
-
-        {spec.needsModelRoot && (
-          <FieldRow label={spec.modelRootLabel ?? 'Engine model folder'} hint={spec.modelRootHint}>
-            <PathPicker
-              value={ttsModelPath}
-              onChange={setTtsModelPath}
-              placeholder={spec.modelRootHint ?? 'C:/path/to/engine'}
-              pick={async () => {
-                const path = await pickFolder({ title: `Pick the ${spec.modelRootLabel ?? 'engine'} folder` });
-                if (path) setTtsModelPath(path);
-              }}
-              buttonLabel="Browse folder"
-            />
-          </FieldRow>
-        )}
-
-        {spec.needsPresetVoice && (
-          <FieldRow label="Voice">
+      <Subsection label="Voice">
+        <FieldRow
+          label="Voice"
+          hint={
+            sidecarVoices.length > 0
+              ? <>Loaded from <code style={{ color: tokens.textMuted }}>{effectiveTtsUrl}/v1/audio/voices</code>.</>
+              : <>Server's voice registry isn't reachable. Type the <code style={{ color: tokens.textMuted }}>voice_id</code> manually.</>
+          }
+        >
+          {sidecarVoices.length > 0 ? (
             <select
-              value={spec.presetVoices?.find((v) => v.value === ttsVoice) ? ttsVoice : '__custom'}
+              value={sidecarVoices.find((v) => v.id === ttsVoice) ? ttsVoice : '__custom'}
               onChange={(e) => {
                 if (e.target.value === '__custom') return;
                 setTtsVoice(e.target.value);
               }}
               style={inputStyle}
             >
-              {spec.presetVoices?.map((v) => (
-                <option key={v.value} value={v.value}>{v.label}</option>
+              {sidecarVoices.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}{v.language ? ` (${v.language})` : ''}
+                </option>
               ))}
-              <option value="__custom">Other…</option>
+              <option value="__custom">Other voice_id…</option>
             </select>
-          </FieldRow>
-        )}
-        {spec.needsPresetVoice && !spec.presetVoices?.find((v) => v.value === ttsVoice) && (
-          <FieldRow label="Custom voice id">
+          ) : (
             <input
               type="text"
               value={ttsVoice}
               onChange={(e) => setTtsVoice(e.target.value)}
-              placeholder="e.g. ja-JP-SomeOtherNeural"
+              placeholder="asuna_v2"
+              style={inputStyle}
+            />
+          )}
+        </FieldRow>
+        {sidecarVoices.length > 0 && !sidecarVoices.find((v) => v.id === ttsVoice) && (
+          <FieldRow label="Custom voice_id">
+            <input
+              type="text"
+              value={ttsVoice}
+              onChange={(e) => setTtsVoice(e.target.value)}
+              placeholder="my_voice"
               style={inputStyle}
             />
           </FieldRow>
         )}
 
-        {spec.needsVoiceSample && (
-          <div style={{
-            marginTop: 8, paddingTop: 12, paddingBottom: 4,
-            borderTop: '1px solid #1f2227',
-          }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
-              <strong style={{ fontSize: 12, color: '#cbd5e1' }}>Voice sample</strong>
-              <span style={{ fontSize: 11, color: '#666' }}>
-                — short clip the engine uses as a prosody prompt on every line it speaks
-              </span>
-            </div>
-            <FieldRow label="Sample audio">
-              <PathPicker
-                value={ttsRefAudio}
-                onChange={setTtsRefAudio}
-                placeholder="C:/Users/.../0003.wav  (a 3-10s clip of the target voice)"
-                pick={async () => {
-                  const path = await pickFile({
-                    title: 'Pick a 3-10s voice sample clip',
-                    filters: [
-                      { label: 'Audio', extensions: ['wav', 'mp3', 'flac', 'ogg', 'm4a'] },
-                      { label: 'All files', extensions: ['*'] },
-                    ],
-                  });
-                  if (path) setTtsRefAudio(path);
-                }}
-              />
-            </FieldRow>
-            <FieldRow label="Sample transcript">
-              <input
-                type="text"
-                value={ttsRefText}
-                onChange={(e) => setTtsRefText(e.target.value)}
-                placeholder="Exact words spoken in the sample audio"
-                style={inputStyle}
-              />
-            </FieldRow>
-            <FieldRow
-              label="Sample language"
-              hint="Zero-shot voice cloning: the engine reads the sample on every call to lock in timbre + speaking style. Pick a clean, expressive 3-10 second clip in a single take — different samples give different reading styles from the same trained voice (calm clip → calm narration, bright clip → upbeat)."
-            >
-              <select
-                value={ttsRefLang}
-                onChange={(e) => setTtsRefLang(e.target.value)}
-                style={inputStyle}
-              >
-                <option value="">(use voice language)</option>
-                {LANGUAGE_CHOICES.map((l) => (
-                  <option key={l.code} value={l.code}>{l.label}</option>
-                ))}
-              </select>
-            </FieldRow>
-          </div>
-        )}
-        {spec.needsGpu && (
-          <>
-            <FieldRow
-              label="GPU device"
-              hint={
-                detectedGpus.length === 0
-                  ? 'GPU detection unavailable (nvidia-smi not on PATH). Pick GPU 0 if you have one CUDA card, or CPU.'
-                  : `Detected ${detectedGpus.length} GPU${detectedGpus.length === 1 ? '' : 's'} on this machine.`
-              }
-            >
-              <select
-                value={ttsGpu}
-                onChange={(e) => setTtsGpu(parseInt(e.target.value, 10))}
-                style={{ ...inputStyle, maxWidth: 480 }}
-              >
-                <option value={-1}>CPU only (slow)</option>
-                {detectedGpus.length > 0 ? (
-                  detectedGpus.map((g) => (
-                    <option key={g.index} value={g.index}>
-                      GPU {g.index}: {g.name}
-                      {g.vram_total_mb != null
-                        ? ` (${(g.vram_total_mb / 1024).toFixed(1)} GB)`
-                        : ''}
-                    </option>
-                  ))
-                ) : (
-                  // Fallback when detection failed — keep the form usable
-                  // and let advanced users still pick GPU 0 manually.
-                  <option value={0}>GPU 0 (auto-detect failed; pick manually)</option>
-                )}
-                {/* If user has saved an index outside the detected
-                    range (e.g. detection returned only GPU 0 but
-                    config saved GPU 2 from a previous setup), keep
-                    that value selectable so saving doesn't silently
-                    coerce. */}
-                {ttsGpu >= 0 && !detectedGpus.find((g) => g.index === ttsGpu) && detectedGpus.length > 0 && (
-                  <option value={ttsGpu}>GPU {ttsGpu} (saved; not detected on this machine)</option>
-                )}
-              </select>
-            </FieldRow>
-          </>
-        )}
+        <FieldRow
+          label="Quality preset"
+          hint={
+            ttsQuality === 'fast'
+              ? 'Fast — real-time conversation, snappier first audio. Lower voice fidelity.'
+              : ttsQuality === 'high'
+              ? 'High — long-form / important responses. Stricter to the reference voice; slower.'
+              : 'Balanced — default. Natural prosody + acceptable speed.'
+          }
+        >
+          <select
+            value={ttsQuality}
+            onChange={(e) => setTtsQuality(e.target.value)}
+            style={{ ...inputStyle, maxWidth: 360 }}
+          >
+            <option value="fast">Fast</option>
+            <option value="balanced">Balanced — recommended</option>
+            <option value="high">High</option>
+          </select>
+        </FieldRow>
         <div style={{ fontSize: 11.5, color: tokens.textDim, marginTop: 12, lineHeight: 1.5 }}>
           The avatar's Live2D model and default expression are set
           per-character on the <a href="/" style={{ color: tokens.primary }}>Home page</a>.
@@ -1000,9 +846,20 @@ function AvatarEditor({
   );
 }
 
-// ── Subagent editor ──────────────────────────────────────────────
+// ── Translation editor ───────────────────────────────────────────
 
-type Backend = 'direct' | 'webhook';
+/// Three mutually-exclusive translation engines. The companion's
+/// internal config has two axes (subagent backend + translator
+/// backend) but the meaningful product surface is one choice:
+///   - direct : the user's own AI service (translate + expression via LLM)
+///   - webhook: zeroclaw acts as the AI proxy (no API key on this machine)
+///   - local  : bundled NMT model + keyword expressions (no LLM at all)
+type TranslationMode = 'direct' | 'webhook' | 'local';
+
+function deriveMode(c: AvatarConfigView['subagent']): TranslationMode {
+  if (c.translator?.backend === 'http') return 'local';
+  return c.use_zeroclaw_webhook ? 'webhook' : 'direct';
+}
 
 function SubagentEditor({
   current, onSaved, tomlHintDismissed, onDismissHint,
@@ -1016,27 +873,108 @@ function SubagentEditor({
   const [onlyXlate, setOnlyXlate] = useState<boolean>(current.only_when_translating);
   const [streaming, setStreaming] = useState<boolean>(current.streaming);
   const [timeout, setTimeout_] = useState<number>(current.timeout_secs);
-  const [backend, setBackend] = useState<Backend>(current.use_zeroclaw_webhook ? 'webhook' : 'direct');
+  const [mode, setMode] = useState<TranslationMode>(deriveMode(current));
   const [apiKey, setApiKey] = useState<string>('');
   const [model, setModel] = useState<string>(current.llm_model || '');
   const [baseUrl, setBaseUrl] = useState<string>(current.llm_base_url || '');
   // `current.llm_disable_thinking` may be undefined on older server
   // builds — default to true (the historical hardcoded behavior).
   const [disableThinking, setDisableThinking] = useState<boolean>(current.llm_disable_thinking ?? true);
+
+  // Local mode requires streaming: the non-streaming path issues an
+  // LLM-only `analyze()` JSON call for expression metadata, which has
+  // no LLM available in local mode. Snap streaming on whenever the
+  // user picks Local; let them toggle it off again only after switching
+  // back to one of the LLM modes.
+  useEffect(() => {
+    if (mode === 'local' && !streaming) setStreaming(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  // ----- Translator state -----
+  // The translator subobject can be absent on older server builds —
+  // null-safe pulls with sensible fallbacks. `null` for nullable
+  // overrides is normalized to '' in the input so the form is
+  // controlled. The backend is NOT a separate state var here — it's
+  // derived from `mode` ('local' ↔ 'http', everything else ↔ 'llm').
+  const tr = current.translator;
+  const [trPreset, setTrPreset] = useState<string>(tr?.nmt_quality_preset ?? 'balanced');
+  const [trDevice, setTrDevice] = useState<string>(tr?.nmt_device ?? 'cpu');
+  const [trPrecision, setTrPrecision] = useState<string>(tr?.nmt_precision ?? 'auto');
+  const [trModelId, setTrModelId] = useState<string>(tr?.nmt_model_id ?? '');
+  const [trSrcLang, setTrSrcLang] = useState<string>(tr?.nmt_src_lang ?? 'en');
+  const [trTgtLang, setTrTgtLang] = useState<string>(tr?.nmt_tgt_lang ?? 'ja');
+  const [trNumBeams, setTrNumBeams] = useState<number | ''>(tr?.nmt_num_beams ?? '');
+  const [trUrl, setTrUrl] = useState<string>(tr?.url ?? 'http://127.0.0.1:9881');
+  const [trAutoStart, setTrAutoStart] = useState<boolean>(tr?.nmt_auto_start ?? false);
+  const [trShowAdvanced, setTrShowAdvanced] = useState<boolean>(false);
+  // Detected GPUs for the NMT device dropdown. Same Tauri command the
+  // TTS editor uses, so the two surfaces stay in sync (one detection
+  // result, two consumers). Empty until resolved; we render a CPU+
+  // fallback so the form is always usable.
+  const [trDetectedGpus, setTrDetectedGpus] = useState<DetectedGpu[]>([]);
+  useEffect(() => { void listGpus().then(setTrDetectedGpus); }, []);
+
+  // When the preset changes, snap src/tgt into a configuration the
+  // selected model actually supports. Without this, switching from
+  // "balanced" (NLLB, where the user picked fr→de) to "fast"
+  // (fugumt-en-ja, fixed) would leave the form state as fr→de and
+  // we'd POST garbage to the backend.
+  useEffect(() => {
+    const preset = NMT_PRESETS.find((p) => p.id === trPreset);
+    if (!preset) return;
+    if (preset.fixed_pair) {
+      if (trSrcLang !== preset.fixed_pair.src.code) setTrSrcLang(preset.fixed_pair.src.code);
+      if (trTgtLang !== preset.fixed_pair.tgt.code) setTrTgtLang(preset.fixed_pair.tgt.code);
+      return;
+    }
+    if (preset.src.length > 0 && !preset.src.some((l) => l.code === trSrcLang)) {
+      setTrSrcLang(preset.src[0].code);
+    }
+    if (preset.tgt.length > 0 && !preset.tgt.some((l) => l.code === trTgtLang)) {
+      // Avoid src === tgt when possible.
+      const fallback = preset.tgt.find((l) => l.code !== trSrcLang)
+        ?? preset.tgt[0];
+      setTrTgtLang(fallback.code);
+    }
+    // We intentionally only react to preset changes here; reading
+    // trSrcLang/trTgtLang would create a loop with the setters above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trPreset]);
+
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Translator details only matter when local mode is active. Gating
+  // dirty on `mode === 'local'` avoids enabling Apply for translator
+  // edits the user made and then moved away from (the save body
+  // wouldn't have sent them anyway).
+  const trDirty =
+    mode === 'local' && (
+      trPreset !== (tr?.nmt_quality_preset ?? 'balanced') ||
+      trDevice !== (tr?.nmt_device ?? 'cpu') ||
+      trPrecision !== (tr?.nmt_precision ?? 'auto') ||
+      trModelId !== (tr?.nmt_model_id ?? '') ||
+      trSrcLang !== (tr?.nmt_src_lang ?? 'en') ||
+      trTgtLang !== (tr?.nmt_tgt_lang ?? 'ja') ||
+      (trNumBeams === '' ? (tr?.nmt_num_beams ?? null) !== null
+                         : trNumBeams !== (tr?.nmt_num_beams ?? -1)) ||
+      trUrl !== (tr?.url ?? 'http://127.0.0.1:9881') ||
+      trAutoStart !== (tr?.nmt_auto_start ?? false)
+    );
 
   const dirty =
     enabled !== current.enabled ||
     onlyXlate !== current.only_when_translating ||
     streaming !== current.streaming ||
     timeout !== current.timeout_secs ||
-    backend !== (current.use_zeroclaw_webhook ? 'webhook' : 'direct') ||
+    mode !== deriveMode(current) ||
     apiKey.length > 0 ||
     model.trim() !== (current.llm_model || '') ||
     baseUrl.trim() !== (current.llm_base_url || '') ||
-    disableThinking !== (current.llm_disable_thinking ?? true);
+    disableThinking !== (current.llm_disable_thinking ?? true) ||
+    trDirty;
 
   const save = async () => {
     setSaving(true); setError(null);
@@ -1055,25 +993,52 @@ function SubagentEditor({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(avatarBody),
         });
-        if (!r.ok) throw new Error(`avatar save: ${r.status} ${await r.text()}`);
+        if (!r.ok) throw new Error(await saveErrorMessage('Avatar save failed', r));
+        // Re-sync `current` so a later subagent-save failure doesn't
+        // make the just-applied avatar fields look "dirty" — they're
+        // already on disk, the user shouldn't see them queued again.
+        onSaved();
       }
-      // Backend + LLM connection → /api/config/subagent.
+      // Map the three-way mode back onto the two internal axes:
+      //   direct  → use_zeroclaw_webhook=false, translator.backend=llm
+      //   webhook → use_zeroclaw_webhook=true,  translator.backend=llm
+      //   local   → use_zeroclaw_webhook=false, translator.backend=http
       const subBody: Record<string, unknown> = {};
-      if (backend !== (current.use_zeroclaw_webhook ? 'webhook' : 'direct')) {
-        subBody.use_zeroclaw_webhook = backend === 'webhook';
+      const priorMode = deriveMode(current);
+      if (mode !== priorMode) {
+        subBody.use_zeroclaw_webhook = mode === 'webhook';
+        subBody.translator_backend = mode === 'local' ? 'http' : 'llm';
       }
       if (apiKey.length > 0) subBody.api_key = apiKey;
       if (model.trim() !== (current.llm_model || '')) subBody.model = model.trim();
       if (baseUrl.trim() !== (current.llm_base_url || '')) subBody.base_url = baseUrl.trim();
       if (disableThinking !== (current.llm_disable_thinking ?? true)) subBody.disable_thinking = disableThinking;
       if (timeout !== current.timeout_secs) subBody.timeout_secs = timeout;
+
+      // Translator detail overrides — only send when local mode is the
+      // current intent. Outside of local mode the NMT sidecar config
+      // has no effect; sending edits there pollutes companion.runtime.json
+      // with intent the user no longer has.
+      if (mode === 'local') {
+        if (trUrl !== (tr?.url ?? 'http://127.0.0.1:9881')) subBody.translator_url = trUrl;
+        if (trPreset !== (tr?.nmt_quality_preset ?? 'balanced')) subBody.translator_nmt_quality_preset = trPreset;
+        if (trDevice !== (tr?.nmt_device ?? 'cpu')) subBody.translator_nmt_device = trDevice;
+        if (trPrecision !== (tr?.nmt_precision ?? 'auto')) subBody.translator_nmt_precision = trPrecision;
+        if (trModelId !== (tr?.nmt_model_id ?? '')) subBody.translator_nmt_model_id = trModelId;
+        if (trSrcLang !== (tr?.nmt_src_lang ?? 'en')) subBody.translator_nmt_src_lang = trSrcLang;
+        if (trTgtLang !== (tr?.nmt_tgt_lang ?? 'ja')) subBody.translator_nmt_tgt_lang = trTgtLang;
+        if (trAutoStart !== (tr?.nmt_auto_start ?? false)) subBody.translator_nmt_auto_start = trAutoStart;
+        if (trNumBeams !== '' && trNumBeams !== (tr?.nmt_num_beams ?? -1)) {
+          subBody.translator_nmt_num_beams = trNumBeams;
+        }
+      }
       if (Object.keys(subBody).length) {
         const r = await fetch(`${HTTP_BASE}/api/config/subagent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(subBody),
         });
-        if (!r.ok) throw new Error(`subagent save: ${r.status} ${await r.text()}`);
+        if (!r.ok) throw new Error(await saveErrorMessage('Translation save failed', r));
       }
       setSavedAt(Date.now());
       setApiKey('');
@@ -1091,87 +1056,371 @@ function SubagentEditor({
 
   return (
     <>
-      <div style={{ fontSize: 12, color: '#888', marginBottom: 12, lineHeight: 1.5 }}>
-        When your chat language doesn't match the voice language, this
-        translates replies before speaking. It also picks the right facial
-        expression for each line.
+      <div style={{ fontSize: 12, color: tokens.textMuted, marginBottom: 12, lineHeight: 1.5 }}>
+        When your chat language differs from the voice language, replies
+        are translated before speech synthesis. Translation also feeds
+        expression and motion selection.
       </div>
-      <FieldRow label="Translate replies">
+      <FieldRow label="Enable translation">
         <Toggle checked={enabled} onChange={setEnabled} />
       </FieldRow>
-      <FieldRow label="Only when needed">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Toggle checked={onlyXlate} onChange={setOnlyXlate} />
-          <span style={{ fontSize: 11, color: '#666' }}>
-            {onlyXlate
-              ? 'skip when chat & voice are the same language'
-              : 'always run, even for same-language chats'}
-          </span>
-        </div>
+      <FieldRow
+        label="Only when languages differ"
+        hint={onlyXlate
+          ? "Skip the translator when chat and voice share a language."
+          : "Run the translator on every reply, even same-language."}
+      >
+        <Toggle checked={onlyXlate} onChange={setOnlyXlate} />
       </FieldRow>
 
       <div style={{
-        display: 'flex', gap: 12, padding: '10px 0', borderBottom: '1px solid #1f2227',
-        fontSize: 13, alignItems: 'center', flexWrap: 'wrap',
+        display: 'flex', flexDirection: 'column', gap: 6,
+        padding: '12px 0', borderBottom: `1px solid ${tokens.border}`,
+        fontSize: 13,
       }}>
-        <span style={{ minWidth: 160, color: '#888' }}>How it runs</span>
-        <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
-          <input type="radio" name="backend" checked={backend === 'direct'} onChange={() => setBackend('direct')} />
-          <span style={{ color: backend === 'direct' ? '#10b981' : '#cbd5e1' }}>
-            Direct AI <span style={{ color: '#666' }}>(fast — needs an API key)</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ minWidth: 160, color: tokens.textMuted, fontWeight: 500 }}>
+            Translation engine
           </span>
-        </label>
-        <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
-          <input type="radio" name="backend" checked={backend === 'webhook'} onChange={() => setBackend('webhook')} />
-          <span style={{ color: backend === 'webhook' ? '#f59e0b' : '#cbd5e1' }}>
-            Through main agent <span style={{ color: '#666' }}>(slower, no key needed)</span>
-          </span>
-        </label>
+        </div>
+        <ModeRadio
+          checked={mode === 'direct'}
+          onSelect={() => setMode('direct')}
+          name="Direct AI service"
+          blurb="Use your own AI service (OpenAI, z.ai, OpenRouter, …). Highest quality — persona-aware translation and expression analysis. Requires an API key."
+        />
+        <ModeRadio
+          checked={mode === 'webhook'}
+          onSelect={() => setMode('webhook')}
+          name="Main agent (proxy)"
+          blurb="Route translation requests through the upstream agent (zeroclaw). Reuses the agent's API key — none stored on this machine. Slower (extra hop)."
+        />
+        <ModeRadio
+          checked={mode === 'local'}
+          onSelect={() => setMode('local')}
+          name="Local model"
+          blurb="Run a bundled neural translation model on this machine. No API key, no network. Plain register (no persona). Streaming-only — expression detection uses keyword matching."
+        />
       </div>
 
-      {backend === 'direct' && (
-        <Subsection label="AI service">
+      {mode === 'direct' && (
+        <Subsection label="Service configuration">
           <FieldRow label="API endpoint">
             <input type="text" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
               placeholder="https://api.openai.com/v1" style={monoInputStyle} />
           </FieldRow>
-          <FieldRow label="Model name">
+          <FieldRow label="Model">
             <input type="text" value={model} onChange={(e) => setModel(e.target.value)}
               placeholder="gpt-4o-mini" style={monoInputStyle} />
           </FieldRow>
           <FieldRow
             label="API key"
-            hint="Saved on this computer only (companion.runtime.json). Keep that file out of git."
+            hint="Stored locally in companion.runtime.json (gitignored). Not transmitted to any third party."
           >
             <input
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder={current.llm_api_key_set ? '••• saved (paste to replace)' : 'paste your OpenAI / z.ai / etc. key'}
+              placeholder={current.llm_api_key_set ? '••• saved (paste to replace)' : 'paste API key'}
               style={monoInputStyle}
               autoComplete="off"
             />
           </FieldRow>
           <FieldRow
-            label="Model reasoning"
+            label="Chain-of-thought"
             hint={disableThinking
-              ? 'Off — sends thinking:{type:disabled}. GLM-4.5/4.6/5 family skip chain-of-thought (~1 s vs ~15–25 s). Other endpoints ignore the flag.'
-              : 'On — the model reasons before answering. Slower, but better translation/expression picks on tricky inputs.'}
+              ? "Disabled — sends thinking:{type:disabled}. GLM-4.5/4.6/5 family skip reasoning (~1 s vs ~15–25 s). Other providers ignore the flag."
+              : "Enabled — the model reasons before responding. Slower, but better translation and expression picks on ambiguous inputs."}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Toggle checked={!disableThinking} onChange={(on) => setDisableThinking(!on)} />
-              <span style={{ fontSize: 12, color: tokens.textMuted }}>
-                {disableThinking ? 'off (fast)' : 'on (slower, richer)'}
-              </span>
-            </div>
+            <Toggle checked={!disableThinking} onChange={(on) => setDisableThinking(!on)} />
           </FieldRow>
         </Subsection>
       )}
 
-      <Subsection label="Timing & streaming">
+      {mode === 'webhook' && (
+        <div style={{
+          marginTop: 14,
+          padding: '10px 12px',
+          background: tokens.bgPanelHi,
+          border: `1px solid ${tokens.border}`,
+          borderRadius: tokens.radiusSm,
+          fontSize: tokens.fontHint,
+          color: tokens.textMuted,
+          lineHeight: 1.55,
+        }}>
+          Translation requests are forwarded to the upstream agent's
+          <code>/webhook</code> endpoint. The agent's API key and model
+          selection apply — no additional configuration needed.
+        </div>
+      )}
+
+      {mode === 'local' && (
+        <Subsection label="Local model configuration">
+          <>
+            <FieldRow
+              label="Quality preset"
+              hint={
+                NMT_PRESETS.find((p) => p.id === trPreset)?.blurb
+                ?? 'Presets trade speed for quality — smaller models render faster but produce blunter translations.'
+              }
+            >
+              <select
+                value={trPreset}
+                onChange={(e) => setTrPreset(e.target.value)}
+                style={{ ...inputStyle, maxWidth: 360 }}
+              >
+                {NMT_PRESETS.map((p) => (
+                  <option key={p.id} value={p.id}>{p.label}</option>
+                ))}
+              </select>
+            </FieldRow>
+
+            {trPreset === 'custom' && (
+              <FieldRow
+                label="Model ID"
+                hint="HuggingFace repo id, e.g. `facebook/nllb-200-distilled-1.3B` or `staka/fugumt-en-ja`. Empty falls back to the preset."
+              >
+                <input
+                  type="text"
+                  value={trModelId}
+                  onChange={(e) => setTrModelId(e.target.value)}
+                  placeholder="org/model-name"
+                  style={monoInputStyle}
+                />
+              </FieldRow>
+            )}
+
+            {(() => {
+              // Pick the language UI for the currently-selected preset.
+              // Three shapes:
+              //   - fixed_pair (Marian single-direction): show static label.
+              //   - non-empty src/tgt arrays (NLLB): two dropdowns.
+              //   - custom preset (empty arrays, no fixed_pair): free text
+              //     since we don't know what the user's HF model supports.
+              const preset = NMT_PRESETS.find((p) => p.id === trPreset);
+              if (!preset) return null;
+              if (preset.fixed_pair) {
+                return (
+                  <FieldRow
+                    label="Languages"
+                    hint="This model is single-direction — the pair is fixed. Pick a different preset to change languages."
+                  >
+                    <div style={{
+                      padding: '4px 10px',
+                      background: '#1f2937',
+                      borderRadius: 4,
+                      fontSize: 13,
+                      color: '#cbd5e1',
+                    }}>
+                      {preset.fixed_pair.src.name}
+                      <span style={{ color: tokens.textMuted, margin: '0 8px' }}>→</span>
+                      {preset.fixed_pair.tgt.name}
+                    </div>
+                  </FieldRow>
+                );
+              }
+              if (preset.src.length > 0 && preset.tgt.length > 0) {
+                return (
+                  <FieldRow
+                    label="Languages"
+                    hint="Pick the chat→voice translation direction. Add more rows in NLLB_LANGUAGES (Settings.tsx) if your language isn't listed — NLLB-200 supports 200 of them."
+                  >
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <select
+                        value={trSrcLang}
+                        onChange={(e) => setTrSrcLang(e.target.value)}
+                        style={{ ...inputStyle, minWidth: 160 }}
+                      >
+                        {preset.src.map((l) => (
+                          <option key={l.code} value={l.code}>{l.name}</option>
+                        ))}
+                      </select>
+                      <span style={{ color: tokens.textMuted }}>→</span>
+                      <select
+                        value={trTgtLang}
+                        onChange={(e) => setTrTgtLang(e.target.value)}
+                        style={{ ...inputStyle, minWidth: 160 }}
+                      >
+                        {preset.tgt
+                          .filter((l) => l.code !== trSrcLang)
+                          .map((l) => (
+                            <option key={l.code} value={l.code}>{l.name}</option>
+                          ))}
+                      </select>
+                    </div>
+                  </FieldRow>
+                );
+              }
+              // Custom preset: we don't know what languages the user's
+              // model supports — fall back to free text.
+              return (
+                <FieldRow
+                  label="Languages"
+                  hint="Your custom model determines what's supported. Use ISO-2 (en, ja, zh) or flores-200 codes (eng_Latn, jpn_Jpan)."
+                >
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <input
+                      type="text" value={trSrcLang}
+                      onChange={(e) => setTrSrcLang(e.target.value.trim())}
+                      placeholder="en"
+                      style={{ ...monoInputStyle, maxWidth: 100 }}
+                    />
+                    <span style={{ color: tokens.textMuted }}>→</span>
+                    <input
+                      type="text" value={trTgtLang}
+                      onChange={(e) => setTrTgtLang(e.target.value.trim())}
+                      placeholder="ja"
+                      style={{ ...monoInputStyle, maxWidth: 100 }}
+                    />
+                  </div>
+                </FieldRow>
+              );
+            })()}
+
+            <FieldRow
+              label="Device"
+              hint={
+                trDetectedGpus.length === 0
+                  ? 'GPU detection unavailable (nvidia-smi not on PATH). CPU is the safe default; GPU 0 works for single-CUDA setups. Quality/Best presets really benefit from a GPU.'
+                  : `Detected ${trDetectedGpus.length} GPU${trDetectedGpus.length === 1 ? '' : 's'}. CPU is the safe default — it won't fight the TTS for VRAM. A GPU is worth it only with spare headroom; Quality/Best presets benefit most.`
+              }
+            >
+              <select
+                value={trDevice}
+                onChange={(e) => setTrDevice(e.target.value)}
+                style={{ ...inputStyle, maxWidth: 480 }}
+              >
+                <option value="cpu">CPU only (safe, no VRAM use)</option>
+                {trDetectedGpus.length > 0 ? (
+                  trDetectedGpus.map((g) => (
+                    <option key={g.index} value={`cuda:${g.index}`}>
+                      GPU {g.index}: {g.name}
+                      {g.vram_total_mb != null
+                        ? ` (${(g.vram_total_mb / 1024).toFixed(1)} GB)`
+                        : ''}
+                    </option>
+                  ))
+                ) : (
+                  <option value="cuda:0">GPU 0 (auto-detect failed; pick manually)</option>
+                )}
+                {/* Preserve a saved index we don't currently detect
+                    (mirrors the TTS dropdown's behavior). */}
+                {trDevice.startsWith('cuda:')
+                  && !trDetectedGpus.find((g) => `cuda:${g.index}` === trDevice)
+                  && trDetectedGpus.length > 0 && (
+                  <option value={trDevice}>
+                    {trDevice} (saved; not detected on this machine)
+                  </option>
+                )}
+                {/* Legacy 'cuda' value (no index) — keep it selectable
+                    if someone has it saved from an earlier build, but
+                    don't surface it as a fresh choice. */}
+                {trDevice === 'cuda' && (
+                  <option value="cuda">CUDA (default index — pick a specific GPU above)</option>
+                )}
+              </select>
+            </FieldRow>
+
+            <FieldRow
+              label="Launch with companion"
+              hint={trAutoStart
+                ? "Spawns the NMT sidecar at companion launch (first run downloads weights — model size shown in the preset blurb above)."
+                : "Off — tools/avatar/nmt_translator_server.py must be started manually before the first translation."}
+            >
+              <Toggle checked={trAutoStart} onChange={setTrAutoStart} />
+            </FieldRow>
+
+            <div style={{ marginTop: 8 }}>
+              <button
+                type="button"
+                onClick={() => setTrShowAdvanced((v) => !v)}
+                style={{
+                  background: 'transparent',
+                  color: tokens.textMuted,
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: 11,
+                  padding: '4px 0',
+                }}
+              >
+                {trShowAdvanced ? '▾ hide advanced' : '▸ show advanced'}
+              </button>
+            </div>
+            {trShowAdvanced && (
+              <>
+                <FieldRow
+                  label="Precision"
+                  hint="auto = fp16 on GPU, fp32 on CPU (CPU fp16 is usually slower than fp32 without AVX half-precision support)."
+                >
+                  <select
+                    value={trPrecision}
+                    onChange={(e) => setTrPrecision(e.target.value)}
+                    style={{ ...inputStyle, maxWidth: 160 }}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="fp32">fp32</option>
+                    <option value="fp16">fp16</option>
+                    <option value="bf16">bf16</option>
+                  </select>
+                </FieldRow>
+                <FieldRow
+                  label="Beam width"
+                  hint="1 = greedy (fastest, worst). 5–8 = high quality. Leave blank for the preset's default."
+                >
+                  <input
+                    type="number" min={1} max={12}
+                    value={trNumBeams}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      if (raw === '') setTrNumBeams('');
+                      else {
+                        const n = Math.max(1, Math.min(12, parseInt(raw, 10) || 0));
+                        setTrNumBeams(n);
+                      }
+                    }}
+                    style={{ ...inputStyle, maxWidth: 100 }}
+                    placeholder="preset default"
+                  />
+                </FieldRow>
+                <FieldRow
+                  label="Sidecar URL"
+                  hint="Localhost in normal use. Change only if you're running the NMT server on another machine or port."
+                >
+                  <input
+                    type="text"
+                    value={trUrl}
+                    onChange={(e) => setTrUrl(e.target.value.trim())}
+                    placeholder="http://127.0.0.1:9881"
+                    style={monoInputStyle}
+                  />
+                </FieldRow>
+              </>
+            )}
+            {!trAutoStart && (
+              <div style={{
+                marginTop: 8,
+                padding: '6px 10px',
+                background: '#1f2937',
+                borderLeft: '3px solid #f59e0b',
+                fontSize: 11,
+                color: '#cbd5e1',
+                lineHeight: 1.5,
+              }}>
+                The sidecar must be running for translation to work.
+                With auto-start off, launch it manually:{' '}
+                <code style={{ color: tokens.warn, padding: '0 4px' }}>
+                  python tools/avatar/nmt_translator_server.py
+                </code>
+              </div>
+            )}
+          </>
+        </Subsection>
+      )}
+
+      <Subsection label="Performance">
         <FieldRow
-          label="Time limit (seconds)"
-          hint="How long to wait for a translation before giving up. Direct AI usually replies in 1–3 seconds; the main-agent path can take 5–10."
+          label="Request timeout (s)"
+          hint="Maximum wait for a translation response before falling back. Direct AI: 1–3 s typical. Main agent: 5–10 s. Local model: 1–2 s."
         >
           <input
             type="number" min={5} max={300}
@@ -1181,17 +1430,20 @@ function SubagentEditor({
           />
         </FieldRow>
         <FieldRow
-          label="Stream while speaking"
+          label="Streaming output"
           hint={
-            <>
-              {streaming
-                ? 'Voice starts on the first sentence (~3 s) — faster, uses keyword-picked expressions.'
-                : 'Waits for the full translation (~15–25 s) before speaking — picks richer expressions.'}
-              {' '}Streaming requires <strong>Direct AI</strong> mode (above); with "Through main agent" it falls back to the non-streaming path automatically.
-            </>
+            mode === 'local'
+              ? 'Required for Local model — expression detection runs from keywords on the streamed sentences; the non-streaming JSON path needs an LLM.'
+              : streaming
+                ? 'Speech starts on the first sentence (~1–3 s). Faster perceived latency; expressions chosen by keyword match.'
+                : 'Wait for the full translation before any speech (~15–25 s). Slower start; richer per-reply expression analysis.'
           }
         >
-          <Toggle checked={streaming} onChange={setStreaming} />
+          <Toggle
+            checked={streaming}
+            onChange={setStreaming}
+            disabled={mode === 'local'}
+          />
         </FieldRow>
       </Subsection>
 
@@ -1209,7 +1461,7 @@ function SubagentEditor({
         </Button>
       </EditorFooter>
 
-      {backend === 'webhook' && !tomlHintDismissed && (
+      {mode === 'webhook' && !tomlHintDismissed && (
         <SubagentSpeedupHint onDismiss={onDismissHint} />
       )}
     </>
@@ -1218,19 +1470,78 @@ function SubagentEditor({
 
 // ── Toggle / generic widgets ────────────────────────────────────
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+/// A single row in a stacked radio-list with title + description.
+/// Used by the Translation engine selector — the three modes need
+/// more explanation than fits on one line, so each option gets its
+/// own block of help text below the label.
+function ModeRadio({
+  checked, onSelect, name, blurb,
+}: {
+  checked: boolean;
+  onSelect: () => void;
+  name: string;
+  blurb: string;
+}) {
+  return (
+    <label
+      onClick={onSelect}
+      style={{
+        display: 'flex', alignItems: 'flex-start', gap: 10,
+        padding: '8px 10px',
+        background: checked ? tokens.bgPanelHi : 'transparent',
+        borderRadius: 6,
+        cursor: 'pointer',
+        border: checked ? `1px solid ${tokens.primary}` : '1px solid transparent',
+      }}
+    >
+      <input
+        type="radio"
+        name="translation-mode"
+        checked={checked}
+        onChange={onSelect}
+        style={{ marginTop: 3, accentColor: tokens.primary }}
+      />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <span style={{
+          color: checked ? tokens.primary : tokens.text,
+          fontWeight: 500,
+          fontSize: 13,
+        }}>
+          {name}
+        </span>
+        <span style={{ color: tokens.textMuted, fontSize: 11.5, lineHeight: 1.4 }}>
+          {blurb}
+        </span>
+      </div>
+    </label>
+  );
+}
+
+function Toggle({
+  checked, onChange, disabled,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  /// When true, the toggle is non-interactive and visually muted.
+  /// Used when a parent setting forces a fixed value (e.g. Local
+  /// model mode forces Streaming on).
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
-      onClick={() => onChange(!checked)}
+      onClick={() => { if (!disabled) onChange(!checked); }}
       role="switch"
       aria-checked={checked}
+      aria-disabled={disabled || undefined}
       className="ws-btn"
       style={{
         width: 38, height: 22,
         background: checked ? tokens.primary : '#2a2f3a',
         borderRadius: 11, border: 'none', position: 'relative',
-        cursor: 'pointer', flexShrink: 0, padding: 0,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        flexShrink: 0, padding: 0,
+        opacity: disabled ? 0.5 : 1,
         transition: 'background 120ms ease',
       }}
     >
@@ -1247,46 +1558,6 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
 
 /** Inline path field with a Browse button. Wraps the native file
  *  picker so the user doesn't have to type or paste OS paths by hand. */
-function PathPicker({
-  value, onChange, placeholder, pick, buttonLabel,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  placeholder?: string;
-  pick: () => Promise<void>;
-  buttonLabel?: string;
-}) {
-  const [picking, setPicking] = useState(false);
-  return (
-    <div style={{ display: 'flex', gap: 6, flex: 1, minWidth: 0 }}>
-      <input
-        type="text"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        style={{ ...inputStyle, flex: 1, minWidth: 0 }}
-      />
-      <button
-        type="button"
-        disabled={picking}
-        onClick={async () => {
-          setPicking(true);
-          try { await pick(); }
-          finally { setPicking(false); }
-        }}
-        style={{
-          padding: '8px 14px', background: 'transparent', color: '#888',
-          border: '1px solid #2a2d33', borderRadius: 6, fontSize: 13,
-          cursor: picking ? 'not-allowed' : 'pointer', opacity: picking ? 0.5 : 1,
-          flexShrink: 0,
-        }}
-      >
-        {picking ? '…' : (buttonLabel ?? 'Browse')}
-      </button>
-    </div>
-  );
-}
-
 function FieldRow({
   label, hint, children,
 }: {
@@ -1329,22 +1600,35 @@ function FieldRow({
 function SubagentSpeedupHint({ onDismiss }: { onDismiss: () => void }) {
   return (
     <div style={{
-      marginTop: 12, padding: 14, background: '#1e2433',
-      border: '1px solid #2d3a55', borderRadius: 8,
-      fontSize: 12, color: '#cbd5e1', lineHeight: 1.55, position: 'relative',
+      marginTop: 12, padding: 14,
+      background: tokens.bgPanelHi,
+      border: `1px solid ${tokens.border}`,
+      borderRadius: tokens.radius,
+      fontSize: tokens.fontBody, color: tokens.text, lineHeight: 1.55,
+      position: 'relative',
     }}>
-      <button type="button" onClick={onDismiss} title="Dismiss" style={{
-        position: 'absolute', top: 8, right: 8, background: 'transparent',
-        border: 'none', color: '#888', cursor: 'pointer', fontSize: 14,
-      }}>✕</button>
-      <div style={{ fontWeight: 600, color: '#fff', marginBottom: 6 }}>💡 Make this faster</div>
+      <button
+        type="button"
+        onClick={onDismiss}
+        title="Dismiss"
+        className="ws-btn"
+        style={{
+          position: 'absolute', top: 6, right: 6,
+          background: 'transparent', border: 'none',
+          color: tokens.textMuted, cursor: 'pointer',
+          fontSize: 14, padding: '2px 6px', borderRadius: tokens.radiusXs,
+        }}
+      >✕</button>
+      <div style={{ fontWeight: 600, color: tokens.text, marginBottom: 6 }}>
+        Faster replies available
+      </div>
       Routing through the main agent adds 5–10 seconds per reply. If you
-      have an OpenAI / z.ai / similar API key, switch the option above to
-      <strong> Direct AI</strong> for ~1–3 second replies.
-      <div style={{ marginTop: 6, color: '#94a3b8' }}>
+      have an OpenAI / z.ai / similar API key, switch the mode above to
+      <strong> Direct AI</strong> for ~1–3 second replies. The change applies
+      live on <strong>Apply</strong> — no restart needed.
+      <div style={{ marginTop: 6, color: tokens.textMuted }}>
         Cheap fast options: gpt-4o-mini, Groq Llama-3.3-70B, Z.ai GLM-4-Flash.
         Or run Ollama locally for free at <code>localhost:11434/v1</code>.
-        Hit <strong>Save</strong> then <strong>Restart</strong> after you change it.
       </div>
     </div>
   );
@@ -1465,6 +1749,42 @@ function ReadonlyRow({
       <span style={{ color, fontFamily: 'ui-monospace, monospace', fontSize: 12, wordBreak: 'break-all' }}>
         {value}
       </span>
+    </div>
+  );
+}
+
+/** Skeleton placeholder for a section whose data is still loading.
+ *  Reserves vertical space matching the editor's rough layout (a few
+ *  FieldRow-sized bars) so the page doesn't visibly shift when the
+ *  fetch lands. The pulsing dot from `.ws-typing-dot` cues "active". */
+function SectionLoading({ rows = 3 }: { rows?: number }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: '6px 0' }}
+    >
+      <div style={{
+        display: 'inline-flex', alignItems: 'center', gap: 8,
+        fontSize: 12, color: tokens.textDim,
+      }}>
+        <span className="ws-typing-dot" />
+        Loading current settings…
+      </div>
+      {Array.from({ length: rows }).map((_, i) => (
+        <div
+          key={i}
+          style={{
+            height: 32,
+            background: tokens.bgPanelHi,
+            borderRadius: tokens.radiusSm,
+            opacity: 0.55,
+            // Stagger the rows visually so the skeleton doesn't read
+            // as a uniform block — gives the eye something to land on.
+            width: `${100 - i * 6}%`,
+          }}
+        />
+      ))}
     </div>
   );
 }

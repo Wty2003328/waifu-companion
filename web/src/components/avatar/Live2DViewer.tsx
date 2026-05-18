@@ -329,14 +329,30 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
         // can be re-applied without reloading the model. The second
         // useEffect below reads `model.userData.autoFit` to recompute
         // the live transform.
+        //
+        // **Captures unscaledW/H at load time** — `model.width` /
+        // `model.height` return the SCALED bbox in PIXI. At first
+        // fit (scale=1) they equal the model's intrinsic dimensions,
+        // but if we later resize the window and try to recompute fit
+        // by reading `model.width` again, we get the SCALED bbox
+        // (already multiplied by the prior fitScale) → the new
+        // fitScale would compound on the old one and the model would
+        // explode in size. iter-14 user reported this: "Live 2D model
+        // sizing bug when I resize the whole app". Storing unscaled
+        // dims here once means every later recompute can divide
+        // app.screen by the TRUE intrinsic size.
         const fitModel = () => {
           const appW = appRef.current!.screen.width;
           const appH = appRef.current!.screen.height;
-          const scaleX = appW / model.width;
-          const scaleY = appH / model.height;
+          const unscaledW = model.width;   // scale is 1.0 at this point
+          const unscaledH = model.height;
+          const scaleX = appW / unscaledW;
+          const scaleY = appH / unscaledH;
           const fitScale = Math.min(scaleX, scaleY) * 0.9;
           model.userData = model.userData || {};
-          model.userData.autoFit = { fitScale, appW, appH };
+          model.userData.autoFit = {
+            fitScale, appW, appH, unscaledW, unscaledH,
+          };
         };
         fitModel();
 
@@ -430,9 +446,14 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
       const fit = model.userData?.autoFit;
       if (!fit) return;
       // Recompute fit if app size changed (window resize, panel toggle).
+      // CRITICAL: divide by `fit.unscaledW` / `fit.unscaledH` (captured
+      // at load time when scale=1.0), NOT by `model.width` / `model.height`
+      // — the latter return the SCALED bbox and would compound the
+      // previous fitScale onto the new computation. iter-14 fix for
+      // user-reported "model sizing bug when I resize the whole app".
       if (fit.appW !== app.screen.width || fit.appH !== app.screen.height) {
-        const scaleX = app.screen.width / model.width;
-        const scaleY = app.screen.height / model.height;
+        const scaleX = app.screen.width / fit.unscaledW;
+        const scaleY = app.screen.height / fit.unscaledH;
         fit.fitScale = Math.min(scaleX, scaleY) * 0.9;
         fit.appW = app.screen.width;
         fit.appH = app.screen.height;
@@ -453,10 +474,30 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
       model.rotation = (rotation * Math.PI) / 180;
     };
     applyTransform();
-    // Cheap re-check loop — handles "model just loaded" and "canvas resized"
-    // without setting up a ResizeObserver.
+    // Cheap re-check loop catches "model just loaded" + post-mount
+    // settling. Window/parent resize is handled SEPARATELY by the
+    // ResizeObserver below — the 250 ms interval alone produced a
+    // visible lag where the canvas resized synchronously but the
+    // model stayed in its old position for up to 250 ms before
+    // jumping (user-reported iter-14 — "model sizing problem when we
+    // resize the whole app").
     const id = setInterval(applyTransform, 250);
-    return () => clearInterval(id);
+
+    // ResizeObserver fires synchronously after the browser paints a
+    // new size, so the model re-centers in the same frame the canvas
+    // does. Watches the canvas's own parent — that's what PIXI's
+    // resizeTo follows, so the two stay in lockstep.
+    const parent = canvasRef.current?.parentElement;
+    let ro: ResizeObserver | null = null;
+    if (parent && typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => applyTransform());
+      ro.observe(parent);
+    }
+
+    return () => {
+      clearInterval(id);
+      ro?.disconnect();
+    };
   }, [scaleMultiplier, offsetX, offsetY, rotation, mirrorX, loaded]);
 
   // Idle motion auto-play.
@@ -730,7 +771,10 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-full text-red-400">
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        height: '100%', color: '#f87171',
+      }}>
         <p>{error}</p>
       </div>
     );
@@ -741,18 +785,38 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   // user clicks ON the avatar. Without it on the canvas, PIXI's
   // pointer pipeline swallows mousedown before Tauri's drag handler
   // sees it — that was the "pet window not repositionable" bug.
+  //
+  // iter-14: the wrappers used to read `className="relative w-full h-full"`
+  // and `className="w-full h-full"` — Tailwind-style classes the app
+  // doesn't actually load Tailwind for. They were no-ops, so the
+  // wrapper sized to its content (the canvas's intrinsic ~641px),
+  // and the canvas in turn sized to its empty wrapper. Net effect:
+  // the avatar viewport never grew vertically with the window, leaving
+  // empty space at the bottom of the page on tall windows and clipping
+  // the avatar on short ones. Real inline styles now.
   const dragAttrs = dragRegion ? { 'data-tauri-drag-region': '' } : {};
   return (
-    <div className="relative w-full h-full" {...dragAttrs}>
+    <div
+      style={{ position: 'relative', width: '100%', height: '100%' }}
+      {...dragAttrs}
+    >
       <canvas
         ref={canvasRef}
-        className="w-full h-full"
-        style={{ imageRendering: 'auto' }}
+        style={{
+          width: '100%', height: '100%', display: 'block',
+          imageRendering: 'auto',
+        }}
         {...dragAttrs}
       />
       {!loaded && !error && (
-        <div className="absolute inset-0 flex items-center justify-center text-gray-400">
-          <p className="animate-pulse">Loading Live2D model...</p>
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: '#9ca3af',
+        }}>
+          <p style={{ animation: 'ws-typing-pulse 1.6s ease-in-out infinite' }}>
+            Loading Live2D model...
+          </p>
         </div>
       )}
     </div>

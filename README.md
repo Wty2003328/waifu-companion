@@ -38,23 +38,36 @@ multi-monitor aware, position persists across restarts. A compact
 chat bar fades in on hover so you can talk to the avatar without
 opening the main window.
 
-**Voice synthesis.** Any TTS engine that speaks a small wire contract
-(`POST /tts` + `GET /health`) works — GPT-SoVITS, Fish-Speech,
-MeloTTS, XTTS, F5-TTS, edge-tts. The reference wrapper at
-`tools/avatar/gptsovits_tts_server.py` is a GPT-SoVITS launcher. Audio
-plays through native rodio (cpal → WASAPI multimedia on Windows) so
-the voice isn't subject to WebView2's communications-channel DSP.
+**Voice synthesis.** Pluggable TTS backend via the
+[TTS Provider Spec v1](docs/TTS-PROVIDER-SPEC.md) — an
+OpenAI-compatible HTTP contract (`POST /v1/audio/speech` + voices +
+clone + healthz). Default backend is **Qwen3-TTS-1.7B** (Apache-2.0,
+zero-shot voice cloning, ja/en/zh from a single reference clip); the
+same wire format also plugs into real OpenAI TTS, openedai-speech,
+kokoro-fastapi, alltalk, and GPT-SoVITS for users who prefer
+fine-tuned character voices. Reference Python sidecars at
+`tools/avatar/qwen3_tts_sidecar.py` and
+`tools/avatar/openai_proxy_sidecar.py`. Audio plays through native
+rodio (cpal → WASAPI multimedia on Windows) so the voice isn't
+subject to WebView2's communications-channel DSP.
 
 **Streaming synthesis.** Replies are sentence-chunked so first audio
 plays roughly one second after the agent answers, instead of waiting
 for the full reply.
 
-**Translation + expression subagent.** A small LLM call per reply
+**Translation + expression subagent.** Per-reply pipeline that
 produces clean chat-language text, translated TTS-language text, and
-the matching Live2D expression. Chat in English, hear the avatar
-reply in Japanese (or any pair). Two backends: direct
-OpenAI-compatible, or routed through your agent's webhook so the
-agent's already-configured provider key is reused.
+a matching Live2D expression. Chat in English, hear the avatar reply
+in Japanese (or any pair). Three backends:
+
+- **Direct AI** — your own OpenAI-compatible endpoint (best quality,
+  needs an API key; ~1–3 s/reply on a fast provider).
+- **Main agent (webhook)** — routes through your upstream agent's
+  `/webhook`, reusing its already-configured provider key. No key on
+  this machine; adds one hop per reply.
+- **Local model** — bundled NLLB / fugumt NMT sidecar (no LLM, no
+  API key, no network). Streaming-only with keyword-based expression
+  detection.
 
 **Character management.** Bundled `{name, model_id, system_prompt}`
 profiles. Switching the active character swaps the Live2D model and
@@ -213,44 +226,87 @@ The bridge reads `HERMES_BRIDGE_PORT` (default 18791),
 ## TTS setup
 
 The companion launches an external TTS server defined by
-`[avatar.tts]` in `companion.toml` and POSTs synthesis requests
-against it. The wire contract is small:
+`[avatar.tts]` in `companion.toml` and posts synthesis requests
+against the OpenAI-compatible **TTS Provider Spec v1** (see
+[docs/TTS-PROVIDER-SPEC.md](docs/TTS-PROVIDER-SPEC.md)):
 
 ```
-POST {api_url}/tts    {"text": "...", "language": "ja",
-                       "voice": "...", "speed": 1.0}
-                      → audio bytes
-                        (X-Sample-Rate / X-Channels / X-Format headers)
-GET  {api_url}/health → 200 OK once the model is loaded
+POST {api_url}/v1/audio/speech    Content-Type: application/json
+    {
+      "input": "...", "voice": "asuna", "speed": 1.0,
+      "response_format": "wav", "stream_format": "audio",
+      "x_companion": { "language": "ja", "quality": "balanced" }
+    }
+    → audio bytes  (X-Sample-Rate / X-Channels / X-Format headers)
+
+GET  {api_url}/v1/audio/voices       → list registered voices
+POST {api_url}/v1/audio/voices/clone → register a reference (multipart)
+GET  {api_url}/healthz               → 200 OK once the model is loaded
 ```
 
-### GPT-SoVITS (recommended for character voices)
+Any spec-compliant backend works. Three reference implementations
+ship in this repo:
 
-```bash
-git clone https://github.com/RVC-Boss/GPT-SoVITS
-# Install the conda env + download base weights per the GPT-SoVITS README.
-# For training your own character voice, see:
-#   https://github.com/Wty2003328/gpt-sovits-voice-cloning-guide
-```
+### Qwen3-TTS-1.7B — default, zero-shot multilingual
+
+Apache-2.0, ~4 GB VRAM at bf16. Clones any voice from a 3–32 s
+reference clip and speaks Japanese / English / Chinese (plus 7
+other major languages) with no fine-tuning. Recommended for most users.
+See [docs/TTS-MULTILINGUAL-GUIDE.md](docs/TTS-MULTILINGUAL-GUIDE.md)
+for the picking rationale.
 
 ```toml
 [avatar.tts]
-engine             = "gpt-sovits-v4"
-api_url            = "http://127.0.0.1:9880"
-launch_command     = "<conda-env>/python.exe tools/avatar/gptsovits_tts_server.py"
-auto_start         = true
-language           = "ja"
-voice              = "<your-voice-id>"            # used as the LoRA-name prefix
-reference_audio    = "<GPT-SoVITS root>/logs/<voice>/0_sliced/0001.wav"
-reference_text     = "<exact transcript of the clip>"
-reference_language = "ja"
-model_path         = "<GPT-SoVITS root>"
-gpu_device         = 0
+engine         = "qwen3-tts-1.7b"
+api_url        = "http://127.0.0.1:9890"
+port           = 9890
+language       = "ja"
+voice          = "asuna"                       # voice_id in voices.toml
+quality        = "balanced"                    # fast | balanced | high
+speed          = 1.0
+auto_start     = true
+launch_command = '<conda-env>/python.exe tools/avatar/qwen3_tts_sidecar.py'
+# Also export these to the launch_command env:
+#   TTS_PORT, TTS_MODEL_DIR, TTS_VOICES_CONFIG, TTS_ATTN_IMPL, TTS_DTYPE
 ```
 
-Zero-shot voice cloning uses a 3–10 second reference clip plus its
-transcript on every synthesis call. Typical latency on an RTX 3060
-12GB is ~1.5× real-time per chunk.
+A `voices.toml` lists the voices registered at sidecar startup.
+Reference clips are looked up by path; transcripts accompany them.
+See `tools/avatar/qwen3_tts_sidecar.py` for the full launch
+contract and `tts_lab/voices.toml` for an example.
+
+Typical latency on an RTX 5080 16 GB at `quality = "balanced"` is
+~1.5× real-time per chunk. SDPA attention works out of the box;
+flash-attn 2 (if installable) pushes RTF to ~0.5.
+
+### OpenAI TTS proxy — cloud fallback, no GPU
+
+```toml
+[avatar.tts]
+engine         = "openai"
+api_url        = "http://127.0.0.1:9890"
+voice          = "alloy"                       # alloy/echo/fable/onyx/nova/shimmer
+quality        = "balanced"                    # → tts-1; "high" → tts-1-hd
+auto_start     = true
+launch_command = "python tools/avatar/openai_proxy_sidecar.py"
+# OPENAI_API_KEY in env
+```
+
+Translates the universal request to OpenAI's `/v1/audio/speech` and
+back. No voice cloning (returns 501 on `/voices/clone`); use one of
+the six preset voices.
+
+### GPT-SoVITS — for custom character voice fine-tuning
+
+When you want a voice you can't get zero-shot — your own original
+character, a model that needs domain-specific prosody, or a very
+specific timbre — GPT-SoVITS fine-tunes a small LoRA on ~10–20
+minutes of audio of your target voice. See the comprehensive
+[voice-cloning-guide](https://github.com/Wty2003328/gpt-sovits-voice-cloning-guide)
+for the full workflow. The legacy sidecar at
+`tools/avatar/gptsovits_tts_server.py` still works and can be wired
+in by setting `engine = "gpt-sovits-v4"` and the GPT-SoVITS-specific
+config in `[avatar.tts]` (see comments in `companion.toml.example`).
 
 ### edge-tts
 
@@ -264,12 +320,12 @@ api_url   = "http://127.0.0.1:9880"
 
 Free, no GPU, lower quality. Useful for a quick demo.
 
-### Custom engine
+### Other backends
 
-Anything that speaks the `/tts` + `/health` contract works:
-fish-speech, melotts, xtts, F5-TTS. Set `engine` to a label for logs,
-`launch_command` to whatever spawns your server, and `api_url` to
-wherever it listens.
+Anything that speaks the [TTS Provider Spec v1](docs/TTS-PROVIDER-SPEC.md)
+works: openedai-speech, kokoro-fastapi, alltalk, fish-speech, F5-TTS,
+ChatterBox. Set `engine` to a label for logs, `launch_command` to
+whatever spawns your server, and `api_url` to wherever it listens.
 
 ## Configuration reference
 
@@ -293,20 +349,26 @@ chat_language = "en"            # what the user types
                                 # subagent translates per reply.
 
 [avatar.tts]
-engine          = "gpt-sovits-v4"
-api_url         = "http://127.0.0.1:9880"
-language        = "ja"          # what the avatar speaks
-voice           = "<your-voice-id>"
-auto_start      = true
-launch_command  = "python tools/avatar/gptsovits_tts_server.py"
-model_path      = "/path/to/GPT-SoVITS"
-gpu_device      = 0
-streaming       = true
+engine                 = "qwen3-tts-1.7b"
+api_url                = "http://127.0.0.1:9890"
+port                   = 9890
+language               = "ja"          # what the avatar speaks
+voice                  = "asuna"       # must match a voices.toml entry
+quality                = "balanced"    # fast | balanced | high
+auto_start             = true
+close_with_companion   = true
+launch_command         = "<conda-env>/python.exe tools/avatar/qwen3_tts_sidecar.py"
+streaming              = true          # chunk-stream synthesis
+streaming_target_chars = 80            # ~couple of short sentences
 
 [avatar.subagent]
 enabled               = true
 use_zeroclaw_webhook  = true    # or false for a direct LLM call
 only_when_translating = true
+streaming             = true    # sentence-by-sentence; keyword expressions
+
+[avatar.subagent.llm]
+disable_thinking      = true    # GLM-4.x: ~1 s vs ~15-25 s with reasoning
 
 [avatar.model]
 model_dir          = "/live2d/models/<your-model>/model.json"
@@ -389,9 +451,11 @@ python scripts/e2e_characters_test.py
 
 Pull requests welcome. Entry points worth knowing:
 
-- **New TTS engine** — write a wrapper that speaks the `/tts` + `/health`
-  contract documented in `crates/companion-avatar/src/tts_server.rs`,
-  then point `[avatar.tts] launch_command` at it.
+- **New TTS engine** — write a wrapper that implements the
+  [TTS Provider Spec v1](docs/TTS-PROVIDER-SPEC.md) (4 HTTP endpoints),
+  then point `[avatar.tts] launch_command` at it. The two reference
+  sidecars in `tools/avatar/` (Qwen3-TTS local, OpenAI cloud proxy)
+  are working examples.
 - **New Live2D model** — drop the directory under
   `web/public/live2d/models/`; it will appear in the model picker.
 - **New Pulse collector** — implement `Collector` in

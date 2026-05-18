@@ -30,6 +30,7 @@ import {
 } from '../lib/models';
 import { fetchCharacters } from '../lib/characters';
 import { startWebcamTracking, stopWebcamTracking } from '../lib/webcamTracker';
+import { useVoiceInput, type VoiceInputHandle } from '../lib/useVoiceInput';
 
 interface ModelInfo {
   modelUrl: string;
@@ -316,6 +317,27 @@ export default function Avatar() {
   // corner buttons — the avatar floats chromeless on the desktop and
   // the controls fade in only on demand. No effect in main window.
   const [overlayHover, setOverlayHover] = useState(false);
+
+  // Voice input — POSTs the captured mic clip to /api/avatar/asr and
+  // drops the transcript into the chat input so the user can edit
+  // before sending. Language hint defaults to the avatar's chat_language
+  // (so a JA-only setup doesn't have to language-id every utterance).
+  const chatLanguage: string | undefined = (() => {
+    if (!cfg || typeof cfg !== 'object') return undefined;
+    const avatar = (cfg as { avatar?: unknown }).avatar;
+    if (!avatar || typeof avatar !== 'object') return undefined;
+    const lang = (avatar as { chat_language?: unknown }).chat_language;
+    return typeof lang === 'string' ? lang : undefined;
+  })();
+  const voice: VoiceInputHandle = useVoiceInput({
+    apiBase: HTTP_BASE,
+    language: chatLanguage,
+    onTranscript: (text) => {
+      // Append to whatever the user already typed (don't replace —
+      // some flows mix voice + keyboard).
+      setChatInput((prev) => (prev ? `${prev} ${text}` : text));
+    },
+  });
 
   // User-selected Live2D model (overrides the server's WS ModelInfo).
   // Settings page writes localStorage; we listen for storage events
@@ -930,14 +952,17 @@ export default function Avatar() {
           const body: { reply?: string } = await resp.json();
           if (body.reply) {
             const candidate = body.reply;
-            // The WS Text frame is the preferred source — it's now
-            // emitted *with the first audio chunk* (so the bubble +
-            // subtitle land in sync with the voice, not ~10-20s ahead).
-            // That means we must wait through the translate + first-chunk
-            // synth before assuming the WS missed it. This timeout is a
-            // last-resort backstop for a genuinely dropped WS connection;
-            // onText clears pendingHttpReplyRef the moment the real frame
-            // arrives, cancelling it.
+            // The WS Text frame is the *preferred* source — it carries
+            // the subagent-cleaned text + arrives in sync with the first
+            // audio chunk. But that path takes 10-30s on a slow agent,
+            // and a silent chat panel for that long looks broken. So we
+            // show the HTTP body's reply after a short backstop window;
+            // when WS Text arrives later, onText replaces our fallback
+            // with the WS-cleaned version (transparent to the user).
+            //
+            // Was 30s — felt unresponsive. 5s is short enough to feel
+            // alive on slow agents but long enough that fast paths
+            // (WS first) still take priority.
             pendingHttpReplyRef.current = candidate;
             setTimeout(() => {
               if (pendingHttpReplyRef.current !== candidate) {
@@ -945,9 +970,9 @@ export default function Avatar() {
               }
               pendingHttpReplyRef.current = null;
               httpFallbackFiredRef.current = candidate;
-              console.log('[chat] +assistant (HTTP fallback — WS missed)');
+              console.log('[chat] +assistant (HTTP fallback — WS slow)');
               appendTurn({ role: 'assistant', text: candidate, ts: Date.now() });
-            }, 30000);
+            }, 5000);
           }
         } catch { /* not JSON or already consumed; non-fatal */ }
       }
@@ -1361,28 +1386,18 @@ export default function Avatar() {
           }}
         >
           {history.length === 0 && !sending && (
-            <div style={{ color: '#666', fontSize: 13, textAlign: 'center', marginTop: 32 }}>
-              No messages yet. Type below to start{activeCharacterName ? ` chatting with ${activeCharacterName}` : ''}.
+            <div style={{
+              color: tokens.textDim, fontSize: 13,
+              textAlign: 'center', marginTop: 32, lineHeight: 1.6,
+            }}>
+              No messages yet. Type below to start
+              {activeCharacterName ? ` chatting with ${activeCharacterName}` : ''}.
             </div>
           )}
           {history.map((turn, i) => (
             <ChatBubble key={`${turn.ts}-${i}`} turn={turn} speakerName={activeCharacterName} />
           ))}
-          {sending && (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2, contain: 'content' }}>
-              <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>
-                {activeCharacterName ?? 'companion'}
-              </div>
-              <div style={{
-                background: '#1a1d22', borderRadius: 12, padding: '10px 14px',
-                color: '#888', fontSize: 13, fontStyle: 'italic',
-                display: 'inline-flex', alignItems: 'center', gap: 8,
-              }}>
-                <span className="ws-typing-dot" />
-                {activeCharacterName ?? 'Asuna'} is thinking…
-              </div>
-            </div>
-          )}
+          <ThinkingBubble visible={sending} speakerName={activeCharacterName} />
         </div>
 
         <div style={{ padding: 12, borderTop: '1px solid #1f2227' }}>
@@ -1392,22 +1407,25 @@ export default function Avatar() {
               value={chatInput}
               onChange={(e) => setChatInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSendChat()}
-              placeholder="Send a message…"
+              placeholder={voice.state === 'recording' ? 'Listening… release mic to transcribe' : 'Send a message…'}
               style={{
                 flex: 1,
                 background: '#0b0d10',
                 color: '#fff',
                 padding: '10px 14px',
                 borderRadius: 8,
-                border: '1px solid #2a2d33',
+                border: voice.state === 'recording' ? '1px solid #ef4444' : '1px solid #2a2d33',
                 fontSize: 14,
                 outline: 'none',
               }}
+              data-testid="chat-input"
             />
+            <MicButton voice={voice} disabled={sending} testId="mic-button-main" />
             <button
               type="button"
               onClick={handleSendChat}
               disabled={!chatInput.trim() || sending}
+              data-testid="send-button"
               style={{
                 padding: '10px 18px',
                 background: chatInput.trim() && !sending ? '#3b82f6' : '#1f2937',
@@ -1421,6 +1439,27 @@ export default function Avatar() {
               {sending ? '…' : 'Send'}
             </button>
           </div>
+          {voice.error && (
+            <div
+              data-testid="voice-error"
+              style={{
+                marginTop: 6,
+                fontSize: 11,
+                color: '#fca5a5',
+                wordBreak: 'break-word',
+              }}
+            >
+              {voice.error}
+            </div>
+          )}
+          {voice.state === 'transcribing' && (
+            <div
+              data-testid="voice-transcribing"
+              style={{ marginTop: 6, fontSize: 11, color: '#93c5fd' }}
+            >
+              Transcribing…
+            </div>
+          )}
           <div
             style={{
               marginTop: 8,
@@ -1510,6 +1549,7 @@ export default function Avatar() {
               outline: 'none',
             }}
           />
+          <MicButton voice={voice} disabled={sending} compact testId="mic-button-overlay" />
           <button
             type="submit"
             disabled={!chatInput.trim() || sending}
@@ -1533,6 +1573,150 @@ export default function Avatar() {
   );
 }
 
+/** Mic button — press-and-hold semantics on pointerdown/up.
+ *
+ *  Hardened against ghost clicks: any pointerdown enters recording, but
+ *  release ANYWHERE on the document ends it (so dragging off the
+ *  button still finalises instead of leaving the mic stuck open). The
+ *  recording badge stays visible while the user holds — disables click-
+ *  through to the parent form (overlay window) so we don't start a
+ *  Tauri drag during a voice press.
+ *
+ *  Visual states:
+ *    idle         🎙  neutral
+ *    permission   🎙  blue   (waiting on user to allow mic)
+ *    recording    ●   red    + pulse animation
+ *    transcribing …   blue
+ *    error        ⚠   red (button retains 🎙 so the user can retry)
+ *
+ *  `compact = true` shrinks padding for the overlay chat bar.
+ */
+function MicButton({
+  voice,
+  disabled,
+  compact,
+  testId,
+}: {
+  voice: VoiceInputHandle;
+  disabled: boolean;
+  compact?: boolean;
+  testId?: string;
+}) {
+  const active = voice.state === 'recording' || voice.state === 'permission';
+  const busy = voice.state === 'transcribing';
+  const inert = disabled || busy || !voice.supported;
+  const pad = compact ? '6px 10px' : '10px 14px';
+
+  // Document-level pointerup so dragging off the button still finalises.
+  // Without this, releasing outside leaves the recorder open until the
+  // safety-net maxSeconds timeout.
+  useEffect(() => {
+    if (voice.state !== 'recording') return;
+    const onUp = () => { void voice.stop(); };
+    window.addEventListener('pointerup', onUp, { once: true });
+    return () => window.removeEventListener('pointerup', onUp);
+  }, [voice]);
+
+  const label = busy ? '…' : active ? '●' : '🎙';
+  const bg = active ? '#dc2626' : busy ? '#3b82f6' : '#1f2937';
+  const title = !voice.supported
+    ? 'Voice input is not supported in this browser'
+    : voice.state === 'recording'
+    ? 'Release to transcribe'
+    : 'Press and hold to dictate';
+
+  return (
+    <button
+      type="button"
+      data-testid={testId ?? 'mic-button'}
+      data-state={voice.state}
+      title={title}
+      aria-label={title}
+      disabled={inert}
+      onPointerDown={(e) => {
+        // Prevent Tauri drag start when used inside the overlay form.
+        e.stopPropagation();
+        if (inert) return;
+        void voice.start();
+      }}
+      style={{
+        padding: pad,
+        background: inert ? '#374151' : bg,
+        color: '#fff',
+        border: 'none',
+        borderRadius: 8,
+        fontSize: compact ? 13 : 14,
+        cursor: inert ? 'not-allowed' : 'pointer',
+        minWidth: compact ? 36 : 44,
+        userSelect: 'none',
+        // Subtle pulse while recording so the user knows the press is live.
+        animation: voice.state === 'recording' ? 'mic-pulse 1.1s ease-in-out infinite' : undefined,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+/** "<character> is thinking…" indicator with proper enter/exit animation.
+ *
+ *  React unmounts components synchronously when their parent's
+ *  conditional flips off, which makes the obvious
+ *  `{sending && <Bubble/>}` pattern produce a hard visual cut. This
+ *  wrapper keeps the bubble mounted for 160 ms after `visible` flips
+ *  false, applying `ws-bubble-leave` (slide-up + fade-out) before
+ *  unmounting. The next ChatBubble's `ws-bubble-enter` plays
+ *  simultaneously, so the visual swap is a cross-fade instead of an
+ *  abrupt cut. iter-14 polish in response to user feedback. */
+function ThinkingBubble({ visible, speakerName }: {
+  visible: boolean;
+  speakerName: string | null | undefined;
+}) {
+  // Two-phase state: mounted? + leaving?. Going from
+  // visible=true → false enters the leaving phase for ~160ms before
+  // unmounting. Going from false → true cancels any pending leave.
+  const [mounted, setMounted] = useState(visible);
+  const [leaving, setLeaving] = useState(false);
+
+  useEffect(() => {
+    if (visible) {
+      setMounted(true);
+      setLeaving(false);
+      return;
+    }
+    if (!mounted) return;
+    setLeaving(true);
+    const t = window.setTimeout(() => {
+      setMounted(false);
+      setLeaving(false);
+    }, 160); // matches the ws-bubble-leave keyframe duration
+    return () => window.clearTimeout(t);
+  }, [visible, mounted]);
+
+  if (!mounted) return null;
+  return (
+    <div
+      className={leaving ? 'ws-bubble-leave' : 'ws-bubble-enter'}
+      style={{
+        display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+        gap: 2, contain: 'content',
+      }}
+    >
+      <div style={{ fontSize: 10, color: tokens.textDim, padding: '0 4px' }}>
+        {speakerName ?? 'companion'}
+      </div>
+      <div style={{
+        background: tokens.bgPanelHi, borderRadius: 12, padding: '10px 14px',
+        color: tokens.textMuted, fontSize: 13, fontStyle: 'italic',
+        display: 'inline-flex', alignItems: 'center', gap: 8,
+      }}>
+        <span className="ws-typing-dot" />
+        {speakerName ?? 'Asuna'} is thinking…
+      </div>
+    </div>
+  );
+}
+
 function ChatBubble({ turn, speakerName }: { turn: ChatTurn; speakerName?: string | null }) {
   const isUser = turn.role === 'user';
   const [showDetails, setShowDetails] = useState(false);
@@ -1540,6 +1724,7 @@ function ChatBubble({ turn, speakerName }: { turn: ChatTurn; speakerName?: strin
 
   return (
     <div
+      className="ws-bubble-enter"
       style={{
         display: 'flex',
         flexDirection: 'column',
@@ -1551,7 +1736,7 @@ function ChatBubble({ turn, speakerName }: { turn: ChatTurn; speakerName?: strin
         contain: 'content',
       }}
     >
-      <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>
+      <div style={{ fontSize: 10, color: tokens.textDim, padding: '0 4px' }}>
         {isUser ? 'you' : (speakerName ?? 'companion')} · {fmtTime(turn.ts)}
         {hasDetails && (
           <button
@@ -1561,7 +1746,7 @@ function ChatBubble({ turn, speakerName }: { turn: ChatTurn; speakerName?: strin
               marginLeft: 6,
               background: 'transparent',
               border: 'none',
-              color: '#3b82f6',
+              color: tokens.primary,
               fontSize: 10,
               cursor: 'pointer',
               padding: 0,
@@ -1687,7 +1872,15 @@ function ChatBubble({ turn, speakerName }: { turn: ChatTurn; speakerName?: strin
           <DebugRow label="expression" value={turn.debug.expression} />
           <DebugRow
             label="subagent"
-            value={turn.debug.subagent_used ? '✓ used (LLM-driven)' : '✗ fell back to keyword detection'}
+            value={(() => {
+              if (!turn.debug.subagent_used) return '✗ fell back to keyword detection';
+              switch (turn.debug.translation_path) {
+                case 'llm':  return '✓ used (translation: LLM)';
+                case 'nmt':  return '✓ used (translation: local NMT)';
+                case 'none': return '✓ used (no translation needed)';
+                default:     return '✓ used'; // pre-iter-14 server or empty field
+              }
+            })()}
             tone={turn.debug.subagent_used ? '#10b981' : '#f59e0b'}
           />
           <DebugRow label="chat text" value={turn.debug.chat_text} mono />

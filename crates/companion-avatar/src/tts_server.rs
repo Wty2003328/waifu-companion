@@ -1,21 +1,26 @@
 //! Generic, model-agnostic TTS port.
 //!
-//! The companion speaks a single HTTP contract to any TTS server. The wire
-//! protocol is identical regardless of the backing model — GPT-SoVITS,
-//! Fish-Speech, MeloTTS, XTTS, F5-TTS, edge-tts, or anything else.
-//! Users plug in a new model by writing a thin Python (or Rust, Go, …)
-//! wrapper that conforms to this contract and pointing
-//! `[avatar.tts] launch_command = "..."` at it.
+//! The companion speaks a single HTTP contract — the OpenAI-compatible
+//! TTS Provider Spec v1 (see `docs/TTS-PROVIDER-SPEC.md`). It knows
+//! NOTHING about the engine on the other end: not its name, its weights,
+//! its python interpreter, its reference audio, or its GPU device. Any
+//! spec-compliant server plugs in by URL.
 //!
-//! # Wire contract
+//! # Wire contract (v1)
 //!
 //! ```text
-//! POST {api_url}/tts            Content-Type: application/json
+//! POST {api_url}/v1/audio/speech   Content-Type: application/json
 //!     {
-//!       "text":     "<utterance>",
-//!       "language": "<bcp47-ish, e.g. ja>",
-//!       "voice":    "<id>",          // optional
-//!       "speed":    1.0              // optional, default 1.0
+//!       "input":           "<utterance>",
+//!       "voice":           "<voice_id>",
+//!       "speed":           1.0,
+//!       "response_format": "wav",
+//!       "stream_format":   "audio",
+//!       "x_companion": {
+//!         "language": "ja",
+//!         "quality":  "balanced",            // fast | balanced | high
+//!         "advanced": { /* server-specific */ }
+//!       }
 //!     }
 //! → 200 OK
 //!     body:    raw audio bytes
@@ -23,19 +28,27 @@
 //!              X-Channels    (default 1)
 //!              X-Format      (default "wav" — "wav"|"mp3"|"pcm")
 //!
-//! GET {api_url}/health
-//! → 200 OK when ready (body ignored)
+//! GET {api_url}/healthz
+//! → 200 OK when ready (JSON body with engine_id + spec_version)
+//!
+//! POST {api_url}/shutdown
+//! → 200 OK (server exits within 8s)
 //! ```
+//!
+//! Only the blocking `stream_format = "audio"` path is implemented —
+//! paragraph-wise streaming higher up in `ws::run_streaming_speak` calls
+//! this port once per paragraph.
 //!
 //! # Lifecycle
 //!
-//! 1. `start_server()` — spawn `launch_command` (if set), wait for `/health`.
-//! 2. `synthesize()`   — POST `/tts`, return [`AudioOutput`].
-//! 3. `stop_server()`  — kill the spawned subprocess.
+//! The companion implements the supervisor side of the launch & lifecycle
+//! protocol (see spec doc):
 //!
-//! Engine-specific knobs (`model_path`, `reference_audio`, …) are forwarded
-//! to the spawned wrapper as environment variables; the Rust side never
-//! branches on engine identity.
+//!   start_server() — if `launcher_command` is set: spawn it as a child;
+//!                    always poll `/healthz` until 200 (240s budget).
+//!   synthesize()   — POST `/v1/audio/speech`, return [`AudioOutput`].
+//!   stop_server()  — POST `/shutdown`; wait for child to exit (8s);
+//!                    SIGTERM (5s); SIGKILL. No-ops when we didn't spawn.
 
 use std::sync::Arc;
 
@@ -48,20 +61,22 @@ use crate::config::AvatarTtsConfig;
 /// HTTP timeout for TTS synthesis requests.
 const TTS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Maximum time to wait for TTS server to become healthy after start.
-// Cold-start budget for the spawned TTS subprocess. GPT-SoVITS v4 with
-// LoRA-merged weights loads in ~30 s on a warm cache + RTX 30/50-class
-// GPU, but the first run on a fresh checkout downloads NLTK corpora,
-// instantiates BERT + HuBERT + vocoder, and JIT-compiles cuDNN kernels.
-// 240 s leaves headroom without making "real" failures take forever
-// to surface; the watchdog continues to monitor `/health` after this
-// budget expires.
+/// Maximum time to wait for the TTS server to become healthy after start.
+/// Cold-start budget covers framework init + BERT/codec load + JIT
+/// kernel compile on a fresh checkout.
 const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Interval between health check polls during startup.
 const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Output from anime TTS synthesis.
+/// How long /shutdown gets to drain the engine cleanly before we
+/// escalate to a signal. Matches the spec's 8s contract.
+const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long the spec gives a server to honour SIGTERM before we SIGKILL.
+const SIGNAL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Output from TTS synthesis.
 #[derive(Debug, Clone)]
 pub struct AudioOutput {
     /// Raw audio bytes.
@@ -74,33 +89,25 @@ pub struct AudioOutput {
     pub format: String,
 }
 
-/// Manages a TTS server subprocess and speaks the generic `/tts` contract.
+/// Speaks the universal TTS port and optionally manages an opaque child
+/// launcher.
 pub struct AnimeTtsManager {
-    /// Engine label (informational only).
-    engine: String,
     /// API base URL for the TTS server.
     api_url: String,
-    /// Port the TTS server listens on.
-    port: u16,
-    /// Voice/character identifier sent to the server in the request body.
+    /// Voice/character identifier sent in the request body.
     voice: Option<String>,
     /// Default speech language. Per-call override via `synthesize_with`.
     default_language: String,
     /// Speech speed multiplier.
     speed: f32,
-    /// Reference audio path (forwarded to subprocess via env).
-    reference_audio: Option<String>,
-    /// Reference transcript matching `reference_audio`.
-    reference_text: Option<String>,
-    /// Reference language.
-    reference_language: Option<String>,
-    /// GPU device index (-1 for CPU).
-    gpu_device: i32,
-    /// Custom launch command (if None, server is assumed externally managed).
-    launch_command: Option<String>,
-    /// Model path forwarded to subprocess via env.
-    model_path: Option<String>,
-    /// The managed subprocess (if running).
+    /// Default quality preset ("fast" | "balanced" | "high") forwarded
+    /// as `x_companion.quality`. None → sidecar default ("balanced").
+    default_quality: Option<String>,
+    /// Opaque launcher command. When Some(non-empty), `start_server`
+    /// spawns it via the OS shell and waits for /healthz. When None,
+    /// `start_server` only polls.
+    launcher_command: Option<String>,
+    /// The managed subprocess (if we spawned one).
     child: Arc<Mutex<Option<Child>>>,
     /// HTTP client for API calls.
     client: reqwest::Client,
@@ -109,25 +116,23 @@ pub struct AnimeTtsManager {
 impl AnimeTtsManager {
     /// Build from config. Does not start the server.
     pub fn new(config: &AvatarTtsConfig) -> Result<Self> {
-        let port = if config.port > 0 { config.port } else { 9880 };
         let api_url = config
             .api_url
             .clone()
-            .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+            .unwrap_or_else(|| "http://127.0.0.1:9890".to_string());
+
+        let launcher_command = config
+            .launcher_command
+            .clone()
+            .filter(|s| !s.trim().is_empty());
 
         Ok(Self {
-            engine: config.engine.clone(),
             api_url,
-            port,
             voice: config.voice.clone(),
             default_language: config.language.clone(),
             speed: config.speed,
-            reference_audio: config.reference_audio.clone(),
-            reference_text: config.reference_text.clone(),
-            reference_language: config.reference_language.clone(),
-            gpu_device: config.gpu_device,
-            launch_command: config.launch_command.clone(),
-            model_path: config.model_path.clone(),
+            default_quality: config.quality.clone(),
+            launcher_command,
             child: Arc::new(Mutex::new(None)),
             client: reqwest::Client::builder()
                 .timeout(TTS_REQUEST_TIMEOUT)
@@ -136,40 +141,20 @@ impl AnimeTtsManager {
         })
     }
 
-    /// Engine label (informational).
-    pub fn engine(&self) -> &str {
-        &self.engine
-    }
-
     /// Default speech language configured for this manager.
     pub fn default_language(&self) -> &str {
         &self.default_language
     }
 
-    /// Start the TTS server subprocess.
+    /// Start the TTS server.
     ///
-    /// If `launch_command` is unset, assumes the server is already running
-    /// externally and just polls `/health`.
+    /// If `launcher_command` is set: spawn it as an opaque shell child,
+    /// then poll `/healthz`. If not set: only poll (assume external
+    /// supervision).
+    ///
+    /// Adopting a still-warm server from a prior launch: if `/healthz`
+    /// already returns 200 before we spawn, skip the spawn and reuse it.
     pub async fn start_server(&self) -> Result<()> {
-        if self.launch_command.is_none() {
-            tracing::info!(
-                "avatar: no launch_command for engine={}, assuming external server at {}",
-                self.engine,
-                self.api_url,
-            );
-            self.wait_for_health().await?;
-            return Ok(());
-        }
-
-        let mut child_guard = self.child.lock().await;
-        if child_guard.is_some() {
-            tracing::warn!("avatar: TTS server already running (this process)");
-            return Ok(());
-        }
-
-        // A previous companion run with `close_with_companion = false`
-        // may have left a still-warm TTS server at our port. Adopt it
-        // instead of launching a duplicate (which would fail to bind).
         if self.probe_health().await {
             tracing::info!(
                 "avatar: adopting already-running TTS server at {} (skipping launch)",
@@ -178,72 +163,58 @@ impl AnimeTtsManager {
             return Ok(());
         }
 
-        let command_str = self.launch_command.as_ref().unwrap();
+        let Some(command_str) = self.launcher_command.clone() else {
+            tracing::info!(
+                "avatar: no launcher_command; assuming externally-managed TTS at {}",
+                self.api_url,
+            );
+            self.wait_for_health().await?;
+            return Ok(());
+        };
+
+        let mut child_guard = self.child.lock().await;
+        if child_guard.is_some() {
+            tracing::warn!("avatar: TTS launcher already spawned by this process");
+            return Ok(());
+        }
+
+        // Opaque shell spawn. The companion does not inspect or template
+        // the command — what the user (or `tts_lab/launch_tts.py`) puts
+        // here is run verbatim.
         let mut cmd = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
-            c.arg("/C").arg(command_str);
+            c.arg("/C").arg(&command_str);
             c
         } else {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(command_str);
+            c.arg("-c").arg(&command_str);
             c
         };
 
-        // Forward engine-specific knobs to the wrapper via env vars. The
-        // Rust side never branches on engine identity; the wrapper reads
-        // whatever it needs.
-        if self.gpu_device >= 0 {
-            cmd.env("CUDA_VISIBLE_DEVICES", self.gpu_device.to_string());
-        }
-        cmd.env("TTS_PORT", self.port.to_string());
-        cmd.env("TTS_ENGINE", &self.engine);
-        cmd.env("TTS_LANGUAGE", &self.default_language);
-        if let Some(ref model_path) = self.model_path {
-            cmd.env("TTS_MODEL_PATH", model_path);
-        }
-        if let Some(ref ref_audio) = self.reference_audio {
-            cmd.env("TTS_REFERENCE_AUDIO", ref_audio);
-        }
-        if let Some(ref ref_text) = self.reference_text {
-            cmd.env("TTS_REFERENCE_TEXT", ref_text);
-        }
-        if let Some(ref ref_lang) = self.reference_language {
-            cmd.env("TTS_REFERENCE_LANG", ref_lang);
-        }
-        if let Some(ref voice) = self.voice {
-            cmd.env("TTS_VOICE", voice);
-        }
-
-        // Capture the child's stdout + stderr and pipe each line into
-        // our tracing log with an `[engine-stderr]` prefix. Without
-        // this, the previous behaviour was to inherit the parent's
-        // stdio — which Tauri's sidecar discards, making Python
-        // crashes invisible. (Last bug: spawn returned success, the
-        // wrapper aborted on an import, and we waited 120 s for a
-        // process that had been dead the whole time.)
+        // Pipe stdout/stderr into our tracing log with a `[tts-…]` prefix.
+        // Without this Tauri's sidecar swallows them, making Python
+        // crashes invisible.
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
         let mut child = cmd
             .spawn()
-            .context("Failed to spawn TTS server subprocess")?;
-        let engine_name = self.engine.clone();
+            .with_context(|| format!("Failed to spawn TTS launcher_command: {command_str}"))?;
         if let Some(stdout) = child.stdout.take() {
-            let label = engine_name.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::info!("[{label}-stdout] {line}");
+                    tracing::info!("[tts-stdout] {line}");
                 }
             });
         }
         if let Some(stderr) = child.stderr.take() {
-            let label = engine_name.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::info!("[{label}-stderr] {line}");
+                    tracing::info!("[tts-stderr] {line}");
                 }
             });
         }
@@ -251,38 +222,25 @@ impl AnimeTtsManager {
         drop(child_guard);
 
         tracing::info!(
-            "avatar: spawned engine={} TTS subprocess on port {} (waiting for /health up to {}s)",
-            self.engine,
-            self.port,
+            "avatar: spawned TTS launcher (waiting for /healthz up to {}s) — `{command_str}`",
             HEALTH_CHECK_TIMEOUT.as_secs(),
         );
         self.wait_for_health().await?;
         Ok(())
     }
 
-    /// Stop the TTS server subprocess gracefully.
-    ///
-    /// Hard-killing a Python TTS process (the previous behavior — bare
-    /// `child.kill()`, which on Windows is `TerminateProcess`) skips
-    /// PyTorch's atexit chain and CUDA context teardown, leaving the
-    /// GPU driver in a fragmented compute-favoring state for ~30–90s.
-    /// User-visible symptom: games stutter for a minute after closing
-    /// the companion. The fix here is two-stage:
-    ///   1. POST `/shutdown` to the TTS server. Our Python wrapper
-    ///      (scripts/tts_launcher.py) catches this and runs
-    ///      torch.cuda.empty_cache() + del model + sys.exit(0) so
-    ///      atexit handlers fire and the CUDA context is released
-    ///      cleanly.
-    ///   2. If the process hasn't exited within `GRACEFUL_TIMEOUT`,
-    ///      fall back to `child.kill()` so we never leak a runaway
-    ///      subprocess on stuck shutdown.
+    /// Stop the TTS server per the lifecycle protocol:
+    ///   1. POST /shutdown (2s request timeout).
+    ///   2. If we own a child: wait up to `GRACEFUL_SHUTDOWN_TIMEOUT` for
+    ///      it to exit on its own.
+    ///   3. If still alive: kill (TerminateProcess on Windows; SIGKILL
+    ///      on POSIX — `tokio::process::Child::kill` is the platform
+    ///      escalation already).
+    ///   4. If we don't own a child (adopted-server case): poll /healthz
+    ///      and warn if the server stays up past the deadline.
     pub async fn stop_server(&self) -> Result<()> {
-        const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-
-        // Best-effort graceful HTTP shutdown. Errors are non-fatal —
-        // the wrapper may not implement /shutdown, the server may
-        // already be dying, or the network call may simply race the
-        // process exit. We just want the request to land.
+        // Best-effort graceful HTTP shutdown. Errors are non-fatal — the
+        // server may already be dying or the request may race the exit.
         let url = format!("{}/shutdown", self.api_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -291,36 +249,56 @@ impl AnimeTtsManager {
         if let Some(c) = client {
             match c.post(&url).send().await {
                 Ok(_) => tracing::info!("avatar: TTS /shutdown requested"),
-                Err(e) => tracing::debug!("avatar: TTS /shutdown not delivered ({e}); falling through"),
+                Err(e) => {
+                    tracing::debug!("avatar: TTS /shutdown not delivered ({e}); falling through")
+                }
             }
         }
 
         let mut child_guard = self.child.lock().await;
         if let Some(ref mut child) = *child_guard {
-            // Wait up to GRACEFUL_TIMEOUT for the process to exit by
-            // itself (i.e., its /shutdown handler ran). On timeout
-            // hard-kill so we don't leak the subprocess.
-            let waited = tokio::time::timeout(GRACEFUL_TIMEOUT, child.wait()).await;
+            let waited = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.wait()).await;
             match waited {
                 Ok(Ok(status)) => {
-                    tracing::info!(
-                        "avatar: TTS server exited gracefully (status={status})"
-                    );
+                    tracing::info!("avatar: TTS launcher exited gracefully (status={status})");
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!("avatar: TTS wait failed ({e}); attempting kill");
+                    tracing::warn!("avatar: TTS child wait failed ({e}); killing");
                     let _ = child.kill().await;
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "avatar: TTS server did not exit within {}s — \
-                         hard-killing (CUDA cleanup may not have run)",
-                        GRACEFUL_TIMEOUT.as_secs()
+                        "avatar: TTS launcher did not exit within {}s — killing \
+                         (engine teardown may not have run)",
+                        GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
                     );
-                    child.kill().await.context("Failed to kill TTS server")?;
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(SIGNAL_SHUTDOWN_TIMEOUT, child.wait()).await;
                 }
             }
-            tracing::info!("avatar: stopped TTS server");
+            tracing::info!("avatar: TTS launcher stopped");
+        } else {
+            // Adopted-server case: poll /healthz until the server actually
+            // stops responding. Warn loudly if it doesn't — the user
+            // pre-spawned this server, so it's theirs to kill.
+            let deadline = std::time::Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
+            loop {
+                if !self.probe_health().await {
+                    tracing::info!("avatar: adopted TTS shut down cleanly");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "avatar: adopted TTS at {} still responding after {}s — \
+                         your externally-managed server didn't honour POST /shutdown. \
+                         Stop it manually.",
+                        self.api_url,
+                        GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                    );
+                    break;
+                }
+                tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
+            }
         }
         *child_guard = None;
         Ok(())
@@ -328,24 +306,56 @@ impl AnimeTtsManager {
 
     /// Synthesize text using the manager's default language.
     pub async fn synthesize(&self, text: &str) -> Result<AudioOutput> {
-        self.synthesize_with(text, &self.default_language).await
+        self.synthesize_with_opts(text, &self.default_language, None, None, None)
+            .await
     }
 
     /// Synthesize text in an explicit language (overrides config default).
     pub async fn synthesize_with(&self, text: &str, language: &str) -> Result<AudioOutput> {
+        self.synthesize_with_opts(text, language, None, None, None).await
+    }
+
+    /// Synthesize with full per-call options. Every overridable field
+    /// is per-call so UI knob changes apply on the next utterance
+    /// without rebuilding the AnimeTtsManager (which would otherwise
+    /// require a TTS subprocess restart).
+    pub async fn synthesize_with_opts(
+        &self,
+        text: &str,
+        language: &str,
+        sample_steps: Option<u8>,
+        speed_override: Option<f32>,
+        voice_override: Option<&str>,
+    ) -> Result<AudioOutput> {
         if text.is_empty() {
             bail!("TTS text must not be empty");
         }
 
-        let url = format!("{}/tts", self.api_url);
-        let mut body = serde_json::json!({
-            "text": text,
+        let url = format!("{}/v1/audio/speech", self.api_url);
+        let speed = speed_override.unwrap_or(self.speed);
+        let effective_voice: &str = voice_override
+            .or(self.voice.as_deref())
+            .unwrap_or("default");
+
+        let mut x_companion = serde_json::json!({
             "language": language,
-            "speed": self.speed,
+            "quality":  self.default_quality.clone().unwrap_or_else(|| "balanced".to_string()),
         });
-        if let Some(ref voice) = self.voice {
-            body["voice"] = serde_json::json!(voice);
+        if let Some(steps) = sample_steps {
+            // Backward-compat: GPT-SoVITS sidecars treated sample_steps as a
+            // direct knob. New sidecars consume it via advanced.* if they
+            // recognise the key; otherwise it's ignored.
+            x_companion["advanced"] = serde_json::json!({ "sample_steps": steps });
         }
+
+        let body = serde_json::json!({
+            "input":           text,
+            "voice":           effective_voice,
+            "speed":           speed,
+            "response_format": "wav",
+            "stream_format":   "audio",
+            "x_companion":     x_companion,
+        });
 
         let resp = self
             .client
@@ -361,7 +371,6 @@ impl AnimeTtsManager {
             bail!("TTS API error ({}): {}", status, err_text);
         }
 
-        // Optional metadata headers — fall back to sensible defaults.
         let sample_rate = resp
             .headers()
             .get("x-sample-rate")
@@ -407,18 +416,18 @@ impl AnimeTtsManager {
 
     /// Check if the TTS server is healthy.
     pub async fn health_check(&self) -> Result<bool> {
-        let url = format!("{}/health", self.api_url);
+        let url = format!("{}/healthz", self.api_url);
         match self.client.get(&url).send().await {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
     }
 
-    /// One quick `/health` GET with a short timeout — used at startup to
-    /// detect a still-warm server left by a prior run (`close_with_companion
-    /// = false`) so we adopt it rather than launch a duplicate.
+    /// One quick `/healthz` GET with a short timeout — used at startup to
+    /// detect a still-warm server left by a prior run so we adopt it
+    /// rather than launch a duplicate.
     async fn probe_health(&self) -> bool {
-        let url = format!("{}/health", self.api_url);
+        let url = format!("{}/healthz", self.api_url);
         match self
             .client
             .get(&url)
@@ -436,12 +445,13 @@ impl AnimeTtsManager {
         let start = std::time::Instant::now();
         loop {
             if self.health_check().await.unwrap_or(false) {
-                tracing::info!("avatar: TTS server is healthy");
+                tracing::info!("avatar: TTS server is healthy at {}", self.api_url);
                 return Ok(());
             }
             if start.elapsed() > HEALTH_CHECK_TIMEOUT {
                 bail!(
-                    "avatar: TTS server did not become healthy within {}s",
+                    "avatar: TTS server at {} did not become healthy within {}s",
+                    self.api_url,
                     HEALTH_CHECK_TIMEOUT.as_secs()
                 );
             }
@@ -458,22 +468,13 @@ mod tests {
 
     fn test_config() -> AvatarTtsConfig {
         AvatarTtsConfig {
-            engine: "edge-tts".to_string(),
             api_url: Some("http://127.0.0.1:9880".to_string()),
-            model_path: None,
-            reference_audio: None,
-            reference_text: None,
-            reference_language: None,
-            gpu_device: -1,
-            port: 9880,
-            launch_command: None,
-            auto_start: false,
-            close_with_companion: true,
             voice: Some("default".to_string()),
             language: "en".to_string(),
             speed: 1.0,
+            quality: None,
             streaming: true,
-            streaming_min_chars: 8,
+            launcher_command: None,
         }
     }
 
@@ -481,18 +482,24 @@ mod tests {
     fn manager_creation() {
         let config = test_config();
         let manager = AnimeTtsManager::new(&config).unwrap();
-        assert_eq!(manager.engine, "edge-tts");
-        assert_eq!(manager.port, 9880);
+        assert_eq!(manager.api_url, "http://127.0.0.1:9880");
         assert_eq!(manager.default_language(), "en");
     }
 
     #[test]
-    fn auto_port_default() {
+    fn auto_api_url_default() {
         let mut config = test_config();
-        config.port = 0;
         config.api_url = None;
         let manager = AnimeTtsManager::new(&config).unwrap();
-        assert_eq!(manager.port, 9880);
+        assert_eq!(manager.api_url, "http://127.0.0.1:9890");
+    }
+
+    #[test]
+    fn empty_launcher_command_treated_as_none() {
+        let mut config = test_config();
+        config.launcher_command = Some("   ".to_string());
+        let manager = AnimeTtsManager::new(&config).unwrap();
+        assert!(manager.launcher_command.is_none());
     }
 
     #[tokio::test]
