@@ -6,6 +6,27 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Avatar audio survives tab switches.** Previously, navigating away from
+  the Avatar tab mid-reply would close the `/ws/avatar` WebSocket, and any
+  in-flight TTS Audio frames broadcast after that would be silently dropped
+  by the server's `tokio::sync::broadcast` (zero receivers). User-visible
+  bug: send a long Chinese story request, switch to Settings while it's
+  still streaming, come back — no audio. Fixed by converting
+  `useAvatarSocket` to a **module-level singleton WebSocket** that lives
+  for the page session, with an **always-on audio handler** that fires
+  `playAudioNative` regardless of which page is mounted. Visual callbacks
+  (lip-sync animation, "isPlaying" UI state) still register/unregister
+  with the Avatar tab's lifecycle; only the audio pipeline is hoisted.
+- **`SO_REUSEADDR` on `companion-server`'s bind.** When a previous
+  instance is hard-killed (Tauri crash, taskkill /F, etc.), Windows
+  holds the LISTENING TCB with the now-defunct PID until the half-closed
+  CloseWait connections age out — potentially hours, breaking every
+  subsequent launch with `failed to bind 127.0.0.1:9181 — Only one
+  usage of each socket address`. With `SO_REUSEADDR`, a fresh instance
+  takes over cleanly. Same behavior on Linux/macOS for the TIME_WAIT
+  equivalent.
+
 ### Added
 - Community files: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, GitHub
   issue + PR templates, and a CI workflow.

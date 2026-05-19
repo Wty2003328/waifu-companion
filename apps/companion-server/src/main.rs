@@ -232,10 +232,35 @@ async fn main() -> Result<()> {
         .with_state(app_state);
 
     // ── 5. Bind ───────────────────────────────────────────────────
+    //
+    // SO_REUSEADDR is set so a hard-killed previous instance doesn't
+    // lock us out for ~2h: Windows otherwise holds the LISTENING TCB
+    // (with the now-defunct PID) until any half-closed CloseWait
+    // connections from prior clients age out, which can take hours
+    // and breaks the dev workflow after every Tauri crash. On Windows
+    // SO_REUSEADDR means "a new bind on the same address wins" (the
+    // OS hands subsequent traffic to the new listener); on Linux/macOS
+    // it bypasses TIME_WAIT for the same address. Both are exactly
+    // the behaviour we want for a singleton local service.
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid bind address {addr}"))?;
+    let socket = if sock_addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }
+    .context("failed to create listening socket")?;
+    socket
+        .set_reuseaddr(true)
+        .context("failed to set SO_REUSEADDR")?;
+    socket
+        .bind(sock_addr)
         .with_context(|| format!("failed to bind {addr}"))?;
+    let listener = socket
+        .listen(1024)
+        .with_context(|| format!("failed to listen on {addr}"))?;
     tracing::info!("companion: listening on http://{addr}");
     tracing::info!("            • avatar UI:  http://{addr}/avatar");
     tracing::info!("            • WS avatar:  ws://{addr}/ws/avatar");
