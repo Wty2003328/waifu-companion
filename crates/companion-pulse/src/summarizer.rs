@@ -21,8 +21,7 @@ use companion_core::{
     zeroclaw::ZeroclawClient,
 };
 
-const SYSTEM_PROMPT: &str =
-    "You are a concise summarizer for a personal feed reader. \
+const SYSTEM_PROMPT: &str = "You are a concise summarizer for a personal feed reader. \
      Reply with 3 to 5 short bullet points capturing the key facts \
      and takeaways. No preamble, no closing remarks. Each bullet \
      one line, starting with '- '.";
@@ -46,8 +45,14 @@ impl Summarizer {
         match self {
             Summarizer::Llm(c) => {
                 let msgs = vec![
-                    ChatMessage { role: Role::System, content: SYSTEM_PROMPT.into() },
-                    ChatMessage { role: Role::User, content: body.to_string() },
+                    ChatMessage {
+                        role: Role::System,
+                        content: SYSTEM_PROMPT.into(),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: body.to_string(),
+                    },
                 ];
                 Ok(c.chat(&msgs).await?.trim().to_string())
             }

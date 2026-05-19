@@ -24,10 +24,11 @@ impl PulseDatabase {
     /// Open or create the database, run migrations.
     pub async fn new(db_path: &str) -> Result<Self> {
         if let Some(parent) = Path::new(db_path).parent()
-            && !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create dir {}", parent.display()))?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create dir {}", parent.display()))?;
+        }
 
         // One-shot bootstrap: WAL + foreign keys.
         let path = db_path.to_string();
@@ -109,7 +110,10 @@ impl PulseDatabase {
             // schema. SQLite errors if the column exists; we swallow that
             // specific error so re-runs are no-ops.
             let _ = c.execute("ALTER TABLE items ADD COLUMN read_at TEXT", []);
-            let _ = c.execute("CREATE INDEX IF NOT EXISTS idx_items_read_at ON items(read_at)", []);
+            let _ = c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_items_read_at ON items(read_at)",
+                [],
+            );
             // summary column added in the agent-summarize iteration. Same
             // idempotent pattern: ignore "duplicate column" errors so old
             // databases pick it up on next start.
@@ -310,10 +314,11 @@ impl PulseDatabase {
         let path = self.path.clone();
         let n = tokio::task::spawn_blocking(move || -> Result<u64> {
             let c = Connection::open(path.as_str())?;
-            let n: i64 =
-                c.query_row("SELECT COUNT(*) FROM items WHERE read_at IS NULL", [], |r| {
-                    r.get(0)
-                })?;
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM items WHERE read_at IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
             Ok(n as u64)
         })
         .await??;
@@ -437,10 +442,7 @@ impl PulseDatabase {
         let cutoff = cutoff_rfc3339.to_string();
         let n = tokio::task::spawn_blocking(move || -> Result<u64> {
             let c = Connection::open(path.as_str())?;
-            let n = c.execute(
-                "DELETE FROM items WHERE collected_at < ?1",
-                params![cutoff],
-            )?;
+            let n = c.execute("DELETE FROM items WHERE collected_at < ?1", params![cutoff])?;
             Ok(n as u64)
         })
         .await??;
@@ -456,9 +458,7 @@ impl PulseDatabase {
 
     /// Returns (platform, channel_id, display_name) tuples for every
     /// configured subscription, ordered by platform then channel_id.
-    pub async fn get_video_channels(
-        &self,
-    ) -> Result<Vec<(String, String, String)>> {
+    pub async fn get_video_channels(&self) -> Result<Vec<(String, String, String)>> {
         let path = self.path.clone();
         let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String)>> {
             let c = Connection::open(path.as_str())?;
@@ -468,7 +468,13 @@ impl PulseDatabase {
                  ORDER BY platform, channel_id",
             )?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -499,11 +505,7 @@ impl PulseDatabase {
         Ok(())
     }
 
-    pub async fn remove_video_channel(
-        &self,
-        platform: &str,
-        channel_id: &str,
-    ) -> Result<()> {
+    pub async fn remove_video_channel(&self, platform: &str, channel_id: &str) -> Result<()> {
         let path = self.path.clone();
         let p = platform.to_string();
         let c = channel_id.to_string();
@@ -620,8 +622,14 @@ mod tests {
     #[tokio::test]
     async fn insert_and_read_feed() {
         let (_d, db) = fresh_db().await;
-        let _ = db.insert_item(&raw_item(Some("https://a.example/1"))).await.unwrap();
-        let _ = db.insert_item(&raw_item(Some("https://a.example/2"))).await.unwrap();
+        let _ = db
+            .insert_item(&raw_item(Some("https://a.example/1")))
+            .await
+            .unwrap();
+        let _ = db
+            .insert_item(&raw_item(Some("https://a.example/2")))
+            .await
+            .unwrap();
         let feed = db.get_feed(10, 0, None, None, false).await.unwrap();
         assert_eq!(feed.len(), 2);
     }
@@ -629,20 +637,28 @@ mod tests {
     #[tokio::test]
     async fn item_summary_round_trip() {
         let (_d, db) = fresh_db().await;
-        let id = db.insert_item(&raw_item(Some("https://a.example/sum"))).await.unwrap();
+        let id = db
+            .insert_item(&raw_item(Some("https://a.example/sum")))
+            .await
+            .unwrap();
 
         // Fresh items have no summary.
         let item = db.get_item(&id).await.unwrap().expect("item should exist");
         assert!(item.summary.is_none());
 
         // Round-trip a summary.
-        db.set_item_summary(&id, Some("- bullet one\n- bullet two")).await.unwrap();
+        db.set_item_summary(&id, Some("- bullet one\n- bullet two"))
+            .await
+            .unwrap();
         let item = db.get_item(&id).await.unwrap().unwrap();
         assert_eq!(item.summary.as_deref(), Some("- bullet one\n- bullet two"));
 
         // Feed query also surfaces the summary, not just get_item.
         let feed = db.get_feed(10, 0, None, None, false).await.unwrap();
-        assert_eq!(feed[0].summary.as_deref(), Some("- bullet one\n- bullet two"));
+        assert_eq!(
+            feed[0].summary.as_deref(),
+            Some("- bullet one\n- bullet two")
+        );
 
         // Clearing wipes the cache.
         db.set_item_summary(&id, None).await.unwrap();
@@ -656,9 +672,19 @@ mod tests {
     #[tokio::test]
     async fn item_exists_by_url_dedup() {
         let (_d, db) = fresh_db().await;
-        db.insert_item(&raw_item(Some("https://a.example/dup"))).await.unwrap();
-        assert!(db.item_exists_by_url("https://a.example/dup").await.unwrap());
-        assert!(!db.item_exists_by_url("https://a.example/none").await.unwrap());
+        db.insert_item(&raw_item(Some("https://a.example/dup")))
+            .await
+            .unwrap();
+        assert!(
+            db.item_exists_by_url("https://a.example/dup")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.item_exists_by_url("https://a.example/none")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -676,7 +702,9 @@ mod tests {
     async fn collector_run_with_error() {
         let (_d, db) = fresh_db().await;
         let run = db.start_collector_run("rss").await.unwrap();
-        db.finish_collector_run(&run, 0, Some("boom")).await.unwrap();
+        db.finish_collector_run(&run, 0, Some("boom"))
+            .await
+            .unwrap();
         let runs = db.get_collector_status().await.unwrap();
         assert_eq!(runs[0].status, "error");
         assert_eq!(runs[0].error.as_deref(), Some("boom"));
@@ -686,7 +714,9 @@ mod tests {
     async fn user_feed_crud() {
         let (_d, db) = fresh_db().await;
         db.add_user_feed("HN", "https://hnrss.org").await.unwrap();
-        db.add_user_feed("Lobsters", "https://lobste.rs/rss").await.unwrap();
+        db.add_user_feed("Lobsters", "https://lobste.rs/rss")
+            .await
+            .unwrap();
         let feeds = db.get_user_feeds().await.unwrap();
         assert_eq!(feeds.len(), 2);
         db.remove_user_feed("https://hnrss.org").await.unwrap();
@@ -710,7 +740,10 @@ mod tests {
             r.collector_id = "rss".into();
             db.insert_item(&r).await.unwrap();
         }
-        let only_hn = db.get_feed(10, 0, Some("hackernews"), None, false).await.unwrap();
+        let only_hn = db
+            .get_feed(10, 0, Some("hackernews"), None, false)
+            .await
+            .unwrap();
         assert_eq!(only_hn.len(), 5);
         let only_rss = db.get_feed(10, 0, Some("rss"), None, false).await.unwrap();
         assert_eq!(only_rss.len(), 3);
@@ -739,22 +772,34 @@ mod tests {
         assert_eq!(rust.len(), 1);
         assert!(rust[0].title.contains("Rust"));
         // matches content (case-insensitive)
-        let webview = db.get_feed(10, 0, None, Some("WEBVIEW"), false).await.unwrap();
+        let webview = db
+            .get_feed(10, 0, None, Some("WEBVIEW"), false)
+            .await
+            .unwrap();
         assert_eq!(webview.len(), 1);
         assert!(webview[0].title.contains("Tauri"));
         // empty search string is treated as no filter
         let all = db.get_feed(10, 0, None, Some("   "), false).await.unwrap();
         assert_eq!(all.len(), 3);
         // no matches
-        let none = db.get_feed(10, 0, None, Some("nodejs"), false).await.unwrap();
+        let none = db
+            .get_feed(10, 0, None, Some("nodejs"), false)
+            .await
+            .unwrap();
         assert_eq!(none.len(), 0);
     }
 
     #[tokio::test]
     async fn read_state_round_trip_and_unread_filter() {
         let (_d, db) = fresh_db().await;
-        let id_a = db.insert_item(&raw_item(Some("https://x/a"))).await.unwrap();
-        let id_b = db.insert_item(&raw_item(Some("https://x/b"))).await.unwrap();
+        let id_a = db
+            .insert_item(&raw_item(Some("https://x/a")))
+            .await
+            .unwrap();
+        let id_b = db
+            .insert_item(&raw_item(Some("https://x/b")))
+            .await
+            .unwrap();
         // both unread initially
         assert_eq!(db.unread_count().await.unwrap(), 2);
         // mark a as read
@@ -806,7 +851,9 @@ mod tests {
     #[tokio::test]
     async fn purge_older_than_cutoff() {
         let (_d, db) = fresh_db().await;
-        db.insert_item(&raw_item(Some("https://a.example/1"))).await.unwrap();
+        db.insert_item(&raw_item(Some("https://a.example/1")))
+            .await
+            .unwrap();
         // Future cutoff → everything is "older" than it
         let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         let n = db.purge_older_than(&future).await.unwrap();
@@ -860,16 +907,22 @@ mod tests {
     async fn video_channel_crud_idempotent_insert() {
         let (_d, db) = fresh_db().await;
         // First insert.
-        db.add_video_channel("youtube", "UCabc", "Alice").await.unwrap();
+        db.add_video_channel("youtube", "UCabc", "Alice")
+            .await
+            .unwrap();
         let rows = db.get_video_channels().await.unwrap();
         assert_eq!(rows.len(), 1);
         // Duplicate key insert with updated display name — should UPSERT.
-        db.add_video_channel("youtube", "UCabc", "Alice Renamed").await.unwrap();
+        db.add_video_channel("youtube", "UCabc", "Alice Renamed")
+            .await
+            .unwrap();
         let rows = db.get_video_channels().await.unwrap();
         assert_eq!(rows.len(), 1, "duplicate key should UPSERT not append");
         assert_eq!(rows[0].2, "Alice Renamed");
         // Different platform with same channel_id is a different row.
-        db.add_video_channel("bilibili", "UCabc", "Bob").await.unwrap();
+        db.add_video_channel("bilibili", "UCabc", "Bob")
+            .await
+            .unwrap();
         let rows = db.get_video_channels().await.unwrap();
         assert_eq!(rows.len(), 2);
         // Remove one.
@@ -885,7 +938,11 @@ mod tests {
         let evil = "https://example.com/feed?q=' OR 1=1--";
         db.insert_item(&raw_item(Some(evil))).await.unwrap();
         assert!(db.item_exists_by_url(evil).await.unwrap());
-        assert!(!db.item_exists_by_url("https://other.example/x").await.unwrap());
+        assert!(
+            !db.item_exists_by_url("https://other.example/x")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -899,8 +956,12 @@ mod tests {
     async fn user_feed_replace_on_same_url() {
         // INSERT OR REPLACE → same URL, new name overrides.
         let (_d, db) = fresh_db().await;
-        db.add_user_feed("First", "https://a.example/feed").await.unwrap();
-        db.add_user_feed("Second", "https://a.example/feed").await.unwrap();
+        db.add_user_feed("First", "https://a.example/feed")
+            .await
+            .unwrap();
+        db.add_user_feed("Second", "https://a.example/feed")
+            .await
+            .unwrap();
         let feeds = db.get_user_feeds().await.unwrap();
         assert_eq!(feeds.len(), 1);
         assert_eq!(feeds[0].0, "Second");
@@ -910,7 +971,9 @@ mod tests {
     async fn feed_limit_offset_clamps_at_table_end() {
         let (_d, db) = fresh_db().await;
         for i in 0..3 {
-            db.insert_item(&raw_item(Some(&format!("https://x/{i}")))).await.unwrap();
+            db.insert_item(&raw_item(Some(&format!("https://x/{i}"))))
+                .await
+                .unwrap();
         }
         // Offset past the end → empty result, not error.
         let v = db.get_feed(10, 100, None, None, false).await.unwrap();

@@ -70,13 +70,14 @@ impl ExpressionMapper {
         let lower = text.to_lowercase();
         for (keyword, emotion) in &self.keyword_map {
             if lower.contains(keyword)
-                && let Some(expr_name) = self.mapping.get(emotion) {
-                    return Live2DExpression {
-                        name: expr_name.clone(),
-                        intensity: 0.8,
-                        duration_ms: Some(3000),
-                    };
-                }
+                && let Some(expr_name) = self.mapping.get(emotion)
+            {
+                return Live2DExpression {
+                    name: expr_name.clone(),
+                    intensity: 0.8,
+                    duration_ms: Some(3000),
+                };
+            }
         }
         Live2DExpression {
             name: self.default_expression.clone(),
@@ -88,22 +89,23 @@ impl ExpressionMapper {
     fn detect_llm_tag(&self, text: &str) -> Live2DExpression {
         let re = regex::Regex::new(r"\[emotion:(\w+)\]").unwrap();
         if let Some(caps) = re.captures(text)
-            && let Some(emotion) = caps.get(1) {
-                let emotion = emotion.as_str();
-                if let Some(expr_name) = self.mapping.get(emotion) {
-                    return Live2DExpression {
-                        name: expr_name.clone(),
-                        intensity: 0.8,
-                        duration_ms: Some(3000),
-                    };
-                }
-                // Fallback: use emotion name directly as expression
+            && let Some(emotion) = caps.get(1)
+        {
+            let emotion = emotion.as_str();
+            if let Some(expr_name) = self.mapping.get(emotion) {
                 return Live2DExpression {
-                    name: emotion.to_string(),
+                    name: expr_name.clone(),
                     intensity: 0.8,
                     duration_ms: Some(3000),
                 };
             }
+            // Fallback: use emotion name directly as expression
+            return Live2DExpression {
+                name: emotion.to_string(),
+                intensity: 0.8,
+                duration_ms: Some(3000),
+            };
+        }
         Live2DExpression {
             name: self.default_expression.clone(),
             intensity: 0.5,

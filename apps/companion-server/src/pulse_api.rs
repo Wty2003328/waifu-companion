@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Query, State, Path},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -111,10 +111,17 @@ pub fn routes() -> Router<Arc<PulseSubsystem>> {
         .route("/items/{id}/summarize", post(handle_summarize))
         .route("/status", get(handle_status))
         .route("/trigger/{id}", post(handle_trigger))
-        .route("/feeds", get(handle_list_feeds).post(handle_add_feed).delete(handle_remove_feed))
+        .route(
+            "/feeds",
+            get(handle_list_feeds)
+                .post(handle_add_feed)
+                .delete(handle_remove_feed),
+        )
         .route(
             "/videos",
-            get(handle_list_videos).post(handle_add_video).delete(handle_remove_video),
+            get(handle_list_videos)
+                .post(handle_add_video)
+                .delete(handle_remove_video),
         )
         .route(
             "/settings/{key}",
@@ -166,7 +173,11 @@ async fn handle_mark_unread(
     State(state): State<Arc<PulseSubsystem>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    state.db.mark_item_read(&id, false).await.map_err(internal)?;
+    state
+        .db
+        .mark_item_read(&id, false)
+        .await
+        .map_err(internal)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -194,12 +205,11 @@ async fn handle_summarize(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, format!("item {id} not found")))?;
 
-    if !force
-        && let Some(ref cached) = item.summary {
-            return Ok(Json(serde_json::json!({
-                "ok": true, "summary": cached, "cached": true,
-            })));
-        }
+    if !force && let Some(ref cached) = item.summary {
+        return Ok(Json(serde_json::json!({
+            "ok": true, "summary": cached, "cached": true,
+        })));
+    }
 
     let summarizer = state.summarizer.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -293,7 +303,11 @@ async fn handle_add_feed(
     if req.name.trim().is_empty() || req.url.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name and url are required".into()));
     }
-    state.db.add_user_feed(&req.name, &req.url).await.map_err(internal)?;
+    state
+        .db
+        .add_user_feed(&req.name, &req.url)
+        .await
+        .map_err(internal)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -336,7 +350,10 @@ async fn handle_add_video(
         ));
     }
     if req.channel_id.trim().is_empty() || req.display_name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "channel_id and display_name required".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "channel_id and display_name required".into(),
+        ));
     }
     state
         .db

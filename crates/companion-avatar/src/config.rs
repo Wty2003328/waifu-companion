@@ -137,10 +137,9 @@ pub fn split_sentences(text: &str, target: usize) -> Vec<String> {
 /// sentence. Lowercased; we strip a trailing `.` from the candidate
 /// word before checking, so `e.g.` → `e.g` matches, `Mr.` → `mr`.
 const ABBREVIATIONS: &[&str] = &[
-    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
-    "e.g", "i.e", "a.m", "p.m", "u.s", "u.k", "u.n", "no", "inc", "ltd",
-    "co", "corp", "fig", "vol", "ch", "pp", "approx", "dept", "est",
-    "min", "max", "esp", "cf", "al", // "et al."
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e", "a.m", "p.m",
+    "u.s", "u.k", "u.n", "no", "inc", "ltd", "co", "corp", "fig", "vol", "ch", "pp", "approx",
+    "dept", "est", "min", "max", "esp", "cf", "al", // "et al."
 ];
 
 /// True if `word` (the run of non-space chars ending right before a
@@ -317,7 +316,10 @@ mod tests_split {
 
     #[test]
     fn no_terminator_returns_whole_text() {
-        assert_eq!(split_sentences("just a phrase no period", T), vec!["just a phrase no period"]);
+        assert_eq!(
+            split_sentences("just a phrase no period", T),
+            vec!["just a phrase no period"]
+        );
     }
 
     /// Round-trip: rejoining the chunks (modulo whitespace) must equal
@@ -331,7 +333,11 @@ mod tests_split {
             "Try this. 1. First tip. 2. Second tip.",
         ] {
             let v = split_sentences(input, T);
-            assert_eq!(rejoin(&v), normspace(input), "round-trip failed for {input:?}");
+            assert_eq!(
+                rejoin(&v),
+                normspace(input),
+                "round-trip failed for {input:?}"
+            );
         }
     }
 
@@ -339,8 +345,14 @@ mod tests_split {
     #[test]
     fn decimal_points_dont_split() {
         let v = split_sentences("Pi is roughly 3.14159 which is enough. Next thing.", T);
-        assert!(v.iter().any(|c| c.contains("3.14159")), "decimal got split: {v:?}");
-        assert!(!v.iter().any(|c| c.trim() == "14159 which is enough."), "split mid-decimal: {v:?}");
+        assert!(
+            v.iter().any(|c| c.contains("3.14159")),
+            "decimal got split: {v:?}"
+        );
+        assert!(
+            !v.iter().any(|c| c.trim() == "14159 which is enough."),
+            "split mid-decimal: {v:?}"
+        );
     }
 
     /// Common abbreviations don't end a sentence.
@@ -348,18 +360,30 @@ mod tests_split {
     fn abbreviations_dont_split() {
         // With a small target so packing wouldn't otherwise glue them.
         let v = split_sentences("Talk to Dr. Smith about it. Then call Mr. Jones.", 24);
-        assert!(v.iter().any(|c| c.contains("Dr. Smith")), "Dr. got split: {v:?}");
-        assert!(v.iter().any(|c| c.contains("Mr. Jones")), "Mr. got split: {v:?}");
+        assert!(
+            v.iter().any(|c| c.contains("Dr. Smith")),
+            "Dr. got split: {v:?}"
+        );
+        assert!(
+            v.iter().any(|c| c.contains("Mr. Jones")),
+            "Mr. got split: {v:?}"
+        );
         // "e.g." mid-sentence.
         let v2 = split_sentences("Use a fast model, e.g. gpt-4o-mini, for this. Done.", 24);
-        assert!(v2.iter().any(|c| c.contains("e.g. gpt-4o-mini")), "e.g. got split: {v2:?}");
+        assert!(
+            v2.iter().any(|c| c.contains("e.g. gpt-4o-mini")),
+            "e.g. got split: {v2:?}"
+        );
     }
 
     /// Ellipsis doesn't fragment.
     #[test]
     fn ellipsis_doesnt_fragment() {
         let v = split_sentences("Hmm... maybe later. Sure.", 24);
-        assert!(v.iter().any(|c| c.contains("Hmm... maybe later.")), "ellipsis fragmented: {v:?}");
+        assert!(
+            v.iter().any(|c| c.contains("Hmm... maybe later.")),
+            "ellipsis fragmented: {v:?}"
+        );
     }
 
     /// No chunk exceeds the hard cap (2× target, min target+32).
@@ -368,7 +392,11 @@ mod tests_split {
         let long_sentence = "あ".repeat(500) + "。"; // a single 501-char sentence
         let cap = (T * 2).max(T + 32);
         for c in split_sentences(&long_sentence, T) {
-            assert!(c.chars().count() <= cap, "chunk over cap: {} chars", c.chars().count());
+            assert!(
+                c.chars().count() <= cap,
+                "chunk over cap: {} chars",
+                c.chars().count()
+            );
         }
     }
 
@@ -382,9 +410,13 @@ mod tests_split {
             T,
         );
         for (i, c) in v.iter().enumerate() {
-            let last_real = c.trim_end_matches(|ch: char| {
-                matches!(ch, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）')
-            }).chars().last().unwrap();
+            let last_real = c
+                .trim_end_matches(|ch: char| {
+                    matches!(ch, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）')
+                })
+                .chars()
+                .last()
+                .unwrap();
             let ok = matches!(last_real, '.' | '!' | '?' | '。' | '！' | '？');
             assert!(ok || i + 1 == v.len(), "chunk {i} ends mid-sentence: {c:?}");
         }
@@ -396,23 +428,36 @@ mod tests_split {
     fn dump_chunks() {
         let cases: &[(&str, &str)] = &[
             ("short-ja", "こんにちは！アスナです。"),
-            ("medium-ja", "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？"),
-            ("long-ja",
-             "こんにちは！アスナです！ゲームでレベルを上げる時でも、実際の試験に備える時でも、本当に役立つ勉強のコツを3つご紹介します。1つ目はポモドーロテクニック。25分集中して5分休憩を繰り返します。2つ目はアクティブリコール。学んだことを思い出す練習をしましょう。3つ目は十分な睡眠です。記憶の定着には睡眠がとても大切なんだよ。"),
-            ("long-en",
-             "Hey, welcome back — long day at work? I figured you'd be tired so I kept it low-key. \
+            (
+                "medium-ja",
+                "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？",
+            ),
+            (
+                "long-ja",
+                "こんにちは！アスナです！ゲームでレベルを上げる時でも、実際の試験に備える時でも、本当に役立つ勉強のコツを3つご紹介します。1つ目はポモドーロテクニック。25分集中して5分休憩を繰り返します。2つ目はアクティブリコール。学んだことを思い出す練習をしましょう。3つ目は十分な睡眠です。記憶の定着には睡眠がとても大切なんだよ。",
+            ),
+            (
+                "long-en",
+                "Hey, welcome back — long day at work? I figured you'd be tired so I kept it low-key. \
               By the way, the answer to your question earlier is roughly 3.14159, give or take. \
               If you want to dig into it more, Dr. Smith's notes (e.g. the section on convergence) cover it well. \
-              Anyway... want to watch something, or are you heading to bed? Either way I'm here."),
-            ("run-on-en",
-             "I think we should first set up the environment then install the dependencies then configure \
+              Anyway... want to watch something, or are you heading to bed? Either way I'm here.",
+            ),
+            (
+                "run-on-en",
+                "I think we should first set up the environment then install the dependencies then configure \
               the database connection then run the migrations then start the dev server and only after \
               all of that is working should we even think about writing the actual feature code because \
-              otherwise we'll be debugging plumbing instead of logic and that's a waste of an evening."),
+              otherwise we'll be debugging plumbing instead of logic and that's a waste of an evening.",
+            ),
         ];
         for (name, text) in cases {
             let v = split_sentences(text, 80);
-            eprintln!("\n=== {name} (input {}c → {} chunk(s)) ===", text.chars().count(), v.len());
+            eprintln!(
+                "\n=== {name} (input {}c → {} chunk(s)) ===",
+                text.chars().count(),
+                v.len()
+            );
             for (i, c) in v.iter().enumerate() {
                 eprintln!("  [{i}] {:>3}c | {c}", c.chars().count());
             }
@@ -823,7 +868,10 @@ impl AvatarSpeechConfig {
         let mut env: Vec<(&'static str, String)> = vec![
             ("SPEECH_PORT", self.port.to_string()),
             ("SPEECH_MODEL_SIZE", self.model_size.clone()),
-            ("SPEECH_WARMUP", if self.warmup { "1".into() } else { "0".into() }),
+            (
+                "SPEECH_WARMUP",
+                if self.warmup { "1".into() } else { "0".into() },
+            ),
         ];
         if !self.device.is_empty() {
             env.push(("SPEECH_DEVICE", self.device.clone()));
@@ -870,7 +918,13 @@ mod tests {
             launch_command = "python ../tts_lab/launch_tts.py --engine sbv2-asuna-v2 --port 9890"
         "#;
         let cfg: AvatarConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.tts.launcher_command.as_deref().unwrap().contains("launch_tts.py"));
+        assert!(
+            cfg.tts
+                .launcher_command
+                .as_deref()
+                .unwrap()
+                .contains("launch_tts.py")
+        );
     }
 
     /// Regression net for the user-facing example file. If a config
@@ -885,8 +939,8 @@ mod tests {
             .join("companion.toml.example");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let cfg: companion_core::CompanionConfig = toml::from_str(&body)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let cfg: companion_core::CompanionConfig =
+            toml::from_str(&body).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         // Strict-deserialize the avatar subtree — that's where most of
         // the user-facing knobs live, and TOML's loose handling of
         // `cfg.avatar: Value` won't catch a wrong shape until startup.

@@ -22,9 +22,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type")]
 pub enum AvatarNotification {
     /// Connection acknowledged.
-    Connected {
-        session_id: String,
-    },
+    Connected { session_id: String },
 
     /// Model loading instruction (sent immediately after connect).
     ModelInfo {
@@ -88,18 +86,14 @@ pub enum AvatarNotification {
     /// Agent text for optional subtitle display. Always in the chat
     /// language (companion.toml `[avatar] chat_language`), regardless
     /// of what TTS speaks.
-    Text {
-        content: String,
-    },
+    Text { content: String },
 
     /// User's typed message, echoed to every connected WS client so
     /// chat history stays consistent across windows. The overlay
     /// (desktop-pet) window can accept input but isn't authoritative
     /// for chat history; without this echo, a user message typed in
     /// the overlay would never reach the main window's chat panel.
-    UserMessage {
-        content: String,
-    },
+    UserMessage { content: String },
 
     /// Optional debug frame: what the subagent actually fed to TTS,
     /// alongside metadata about the analysis. Helps users verify the
@@ -131,9 +125,7 @@ pub enum AvatarNotification {
     Idle,
 
     /// Error notification.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 // ── Client → Server ──────────────────────────────────────────────
@@ -156,15 +148,10 @@ pub enum AvatarMessage {
     },
 
     /// Request to play a specific motion.
-    MotionRequest {
-        group: String,
-        name: String,
-    },
+    MotionRequest { group: String, name: String },
 
     /// Request to change expression.
-    ExpressionRequest {
-        name: String,
-    },
+    ExpressionRequest { name: String },
 }
 
 // ── Lip sync data (wire format) ─────────────────────────────────
@@ -339,7 +326,9 @@ mod tests {
         }"#;
         let msg: AvatarNotification = serde_json::from_str(json).unwrap();
         match msg {
-            AvatarNotification::Audio { turn_id, seq, last, .. } => {
+            AvatarNotification::Audio {
+                turn_id, seq, last, ..
+            } => {
                 assert_eq!(turn_id, "");
                 assert_eq!(seq, 0);
                 assert!(!last);

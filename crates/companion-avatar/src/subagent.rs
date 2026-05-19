@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AvatarSubagentConfig;
 use crate::expression::Live2DExpression;
-use crate::translator::{build_translator, Translator};
+use crate::translator::{Translator, build_translator};
 use companion_core::llm::{ChatMessage, LlmClient, Role};
 use companion_core::zeroclaw::ZeroclawClient;
 
@@ -225,18 +225,17 @@ impl AvatarSubagent {
 
     /// Build with an explicit backend. Useful for tests and for callers
     /// that already have a backend instance they want to inject.
-    pub fn with_backend(
-        backend: Arc<dyn SubagentBackend>,
-        config: &AvatarSubagentConfig,
-    ) -> Self {
+    pub fn with_backend(backend: Arc<dyn SubagentBackend>, config: &AvatarSubagentConfig) -> Self {
         let timeout = Duration::from_secs(config.timeout_secs);
         // Test/injection path keeps the LLM translator regardless of
         // `config.translator.backend` — callers wanting a stub HTTP
         // translator should set it on the subagent post-construction
         // via a future setter, or use the production `::new` path.
-        let translator: Arc<dyn Translator> = Arc::new(
-            crate::translator::LlmTranslator::new(backend.clone(), None, timeout),
-        );
+        let translator: Arc<dyn Translator> = Arc::new(crate::translator::LlmTranslator::new(
+            backend.clone(),
+            None,
+            timeout,
+        ));
         let system_prompt_template = config
             .system_prompt
             .clone()
@@ -297,7 +296,10 @@ impl AvatarSubagent {
         tts_language: &str,
     ) -> Option<SubagentAnalysis> {
         for attempt in 1..=2 {
-            match self.analyze_once(text, chat_language, tts_language, attempt).await {
+            match self
+                .analyze_once(text, chat_language, tts_language, attempt)
+                .await
+            {
                 Some(a) => return Some(a),
                 None if attempt < 2 => {
                     tracing::warn!("avatar subagent: attempt {attempt} failed, retrying");
@@ -337,7 +339,11 @@ impl AvatarSubagent {
         tts_language: &str,
         attempt: u32,
     ) -> Option<SubagentAnalysis> {
-        let truncated = if text.len() > 2000 { &text[..2000] } else { text };
+        let truncated = if text.len() > 2000 {
+            &text[..2000]
+        } else {
+            text
+        };
 
         let system_prompt = self
             .system_prompt_template
@@ -556,13 +562,16 @@ mod tests {
     fn safe_prefix_handles_emoji_at_byte_boundary() {
         // The string is 4 bytes per emoji; asking for byte 3 lands
         // mid-codepoint. safe_prefix must back off to a boundary.
-        let s = "🌸🌟";  // each emoji is 4 UTF-8 bytes
+        let s = "🌸🌟"; // each emoji is 4 UTF-8 bytes
         let p = safe_prefix(s, 3);
         assert!(s.starts_with(p));
         // The returned slice must be a valid UTF-8 string of length 0
         // or 4 (a full first emoji) — never 3 (mid-codepoint).
-        assert!(p.is_empty() || p.len() == 4,
-                "expected 0 or 4 bytes, got {}", p.len());
+        assert!(
+            p.is_empty() || p.len() == 4,
+            "expected 0 or 4 bytes, got {}",
+            p.len()
+        );
     }
 
     #[test]

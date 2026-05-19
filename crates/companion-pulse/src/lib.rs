@@ -22,12 +22,12 @@ pub mod scheduler;
 pub mod storage;
 pub mod summarizer;
 
-pub use config::{PulseConfig, RssConfig, FeedEntry, HackerNewsConfig, VideosConfig};
 pub use collectors::github::GithubReleasesConfig;
+pub use collectors::{Collector, parse_interval};
+pub use config::{FeedEntry, HackerNewsConfig, PulseConfig, RssConfig, VideosConfig};
 pub use models::{CollectorRun, FeedItem, RawItem};
 pub use scheduler::{Scheduler, trigger_collector};
 pub use storage::PulseDatabase;
-pub use collectors::{Collector, parse_interval};
 pub use summarizer::Summarizer;
 
 use std::sync::Arc;
@@ -71,18 +71,25 @@ impl PulseSubsystem {
         // Video subscriptions (YouTube + Bilibili-via-RSSHub). Channels
         // come from the DB, not the toml, so the user can curate them
         // at runtime without a restart.
-        if cfg.collectors.videos.as_ref().map(|v| v.enabled).unwrap_or(false) {
+        if cfg
+            .collectors
+            .videos
+            .as_ref()
+            .map(|v| v.enabled)
+            .unwrap_or(false)
+        {
             list.push(Arc::new(collectors::videos::VideoCollector::new(
                 db.clone(),
             )));
         }
         // GitHub releases — repos in toml, no DB plumbing needed.
         if let Some(gh) = cfg.collectors.github_releases.clone()
-            && gh.enabled {
-                list.push(Arc::new(
-                    collectors::github::GithubReleasesCollector::new(gh),
-                ));
-            }
+            && gh.enabled
+        {
+            list.push(Arc::new(collectors::github::GithubReleasesCollector::new(
+                gh,
+            )));
+        }
 
         tracing::info!("pulse: {} collector(s) registered", list.len());
 

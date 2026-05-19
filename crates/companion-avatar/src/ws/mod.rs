@@ -25,10 +25,8 @@ use axum::{
 
 mod text;
 use text::{
-    detect_source_lang, safe_prefix, strip_emoji_and_markdown_for_tts,
-    strip_thinking_preamble,
+    detect_source_lang, safe_prefix, strip_emoji_and_markdown_for_tts, strip_thinking_preamble,
 };
-
 
 // `split_for_translation` and its test module were removed in 2026-05-14
 // cleanup. They served the per-paragraph LLM fallback path that the
@@ -246,8 +244,8 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     } else {
         "llm"
     };
-    let should_run_subagent = subagent_snap.is_some()
-        && (need_translation || !cfg.subagent.only_when_translating);
+    let should_run_subagent =
+        subagent_snap.is_some() && (need_translation || !cfg.subagent.only_when_translating);
 
     // Streaming branch: when enabled + the backend supports it, take
     // a different path that fires TTS per sentence as the LLM streams
@@ -256,7 +254,10 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let streaming_eligible = should_run_subagent
         && cfg.subagent.streaming
         && need_translation
-        && subagent_snap.as_ref().map(|s| s.supports_streaming()).unwrap_or(false);
+        && subagent_snap
+            .as_ref()
+            .map(|s| s.supports_streaming())
+            .unwrap_or(false);
     if streaming_eligible {
         return run_streaming_speak(
             state,
@@ -300,9 +301,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         }
     } else {
         if subagent_snap.is_some() && !need_translation {
-            tracing::debug!(
-                "avatar: subagent skipped (same language; only_when_translating=true)"
-            );
+            tracing::debug!("avatar: subagent skipped (same language; only_when_translating=true)");
         }
         (keyword_expr, None, None)
     };
@@ -338,9 +337,7 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_default();
         if bulk.is_empty() {
-            tracing::warn!(
-                "avatar: bulk translation empty; SKIPPING TTS for this turn"
-            );
+            tracing::warn!("avatar: bulk translation empty; SKIPPING TTS for this turn");
         } else {
             tracing::info!(
                 "avatar: bulk translation accepted ({} chars)",
@@ -405,7 +402,9 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let motion_for_intro = motion_to_send;
     let mut intro_sent = false;
     let emit_intro_once = |intro_sent: &mut bool| {
-        if *intro_sent { return; }
+        if *intro_sent {
+            return;
+        }
         *intro_sent = true;
         bcast(AvatarNotification::Expression {
             name: expression_name_for_intro.clone(),
@@ -472,7 +471,9 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         let is_last = i + 1 == total;
         tracing::info!(
             "avatar: TTS chunk {}/{} ({}c, last={is_last}, turn_id={turn_id}): {:?}",
-            i + 1, total, chunk.chars().count(),
+            i + 1,
+            total,
+            chunk.chars().count(),
             safe_prefix(chunk, 120)
         );
         match tts
@@ -487,7 +488,8 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         {
             Ok(audio) => {
                 use base64::Engine;
-                let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
+                let audio_b64 =
+                    base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
                 // Emit the chat-bubble + expression intro now — right
                 // before the FIRST audio frame, so the user sees the
                 // text and hears the voice together.
@@ -508,7 +510,8 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             Err(e) => {
                 tracing::warn!(
                     "avatar: TTS synthesize failed on chunk {}/{}: {e}",
-                    i + 1, total
+                    i + 1,
+                    total
                 );
                 // Still mark the last chunk so the frontend doesn't
                 // wait forever for audio that won't arrive. Surface the
@@ -786,12 +789,13 @@ async fn run_streaming_speak(
     let detected = detect_source_lang(&subtitle_text);
     let effective_src_lang: &str = detected.unwrap_or(chat_lang);
     if let Some(d) = detected
-        && d != chat_lang {
-            tracing::info!(
-                "avatar: detected reply language={d:?} differs from chat_language={chat_lang:?}; \
+        && d != chat_lang
+    {
+        tracing::info!(
+            "avatar: detected reply language={d:?} differs from chat_language={chat_lang:?}; \
                  forwarding {d:?} as NMT src",
-            );
-        }
+        );
+    }
     let turn_id = uuid::Uuid::new_v4().to_string();
 
     // Translation backend label (iter 14): "llm" / "nmt" / "none".
@@ -848,8 +852,10 @@ async fn run_streaming_speak(
         macro_rules! emit_intro_once {
             () => {{
                 if !intro_sent {
-                    #[allow(unused_assignments)]  // last-iteration write isn't read
-                    { intro_sent = true; }
+                    #[allow(unused_assignments)] // last-iteration write isn't read
+                    {
+                        intro_sent = true;
+                    }
                     let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
                         AvatarNotification::Expression {
                             name: dispatcher_expr_name.clone(),
@@ -858,7 +864,9 @@ async fn run_streaming_speak(
                         },
                     ));
                     let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
-                        AvatarNotification::Text { content: dispatcher_subtitle.clone() },
+                        AvatarNotification::Text {
+                            content: dispatcher_subtitle.clone(),
+                        },
                     ));
                     let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
                         AvatarNotification::Debug {
@@ -874,20 +882,21 @@ async fn run_streaming_speak(
         }
         macro_rules! send_empty_terminator {
             () => {
-                let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
-                    AvatarNotification::Audio {
-                        audio: String::new(),
-                        format: "wav".into(),
-                        sample_rate: 0,
-                        lip_sync: crate::protocol::LipSyncDataProto {
-                            frames: Vec::new(),
-                            frame_duration_ms: 30,
-                        },
-                        turn_id: dispatcher_turn.clone(),
-                        seq,
-                        last: true,
-                    },
-                ));
+                let _ =
+                    dispatcher_state
+                        .event_tx
+                        .send(AvatarEvent::Frame(AvatarNotification::Audio {
+                            audio: String::new(),
+                            format: "wav".into(),
+                            sample_rate: 0,
+                            lip_sync: crate::protocol::LipSyncDataProto {
+                                frames: Vec::new(),
+                                frame_duration_ms: 30,
+                            },
+                            turn_id: dispatcher_turn.clone(),
+                            seq,
+                            last: true,
+                        }));
             };
         }
         while let Some((sentence_opt, is_final)) = rx.recv().await {
@@ -922,27 +931,26 @@ async fn run_streaming_speak(
             // Helper to broadcast one AudioOutput as a WS frame at a
             // given seq + last flag. Closes over dispatcher state.
             // Returns the next seq value to use.
-            let broadcast_chunk = |audio: crate::tts_server::AudioOutput,
-                                   chunk_seq: u32,
-                                   last: bool| {
-                use base64::Engine;
-                let audio_b64 = base64::engine::general_purpose::STANDARD
-                    .encode(&audio.audio_bytes);
-                let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
-                    AvatarNotification::Audio {
-                        audio: audio_b64,
-                        format: audio.format,
-                        sample_rate: audio.sample_rate,
-                        lip_sync: crate::protocol::LipSyncDataProto {
-                            frames: Vec::new(),
-                            frame_duration_ms: 30,
+            let broadcast_chunk =
+                |audio: crate::tts_server::AudioOutput, chunk_seq: u32, last: bool| {
+                    use base64::Engine;
+                    let audio_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
+                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                        AvatarNotification::Audio {
+                            audio: audio_b64,
+                            format: audio.format,
+                            sample_rate: audio.sample_rate,
+                            lip_sync: crate::protocol::LipSyncDataProto {
+                                frames: Vec::new(),
+                                frame_duration_ms: 30,
+                            },
+                            turn_id: dispatcher_turn.clone(),
+                            seq: chunk_seq,
+                            last,
                         },
-                        turn_id: dispatcher_turn.clone(),
-                        seq: chunk_seq,
-                        last,
-                    },
-                ));
-            };
+                    ));
+                };
 
             // Paragraph-wise synthesis: one blocking synth per paragraph.
             // No SSE intra-paragraph streaming — paragraphs are large
@@ -997,13 +1005,18 @@ async fn run_streaming_speak(
     let buf_clone = translation_buf.clone();
     let tx_clone = tx.clone();
     let full = subagent
-        .translate_stream(&subtitle_text, Some(effective_src_lang), tts_lang, move |delta| {
-            let mut buf = buf_clone.lock().unwrap();
-            buf.push_str(delta);
-            while let Some(paragraph) = pop_first_paragraph(&mut buf) {
-                let _ = tx_clone.send((Some(paragraph), false));
-            }
-        })
+        .translate_stream(
+            &subtitle_text,
+            Some(effective_src_lang),
+            tts_lang,
+            move |delta| {
+                let mut buf = buf_clone.lock().unwrap();
+                buf.push_str(delta);
+                while let Some(paragraph) = pop_first_paragraph(&mut buf) {
+                    let _ = tx_clone.send((Some(paragraph), false));
+                }
+            },
+        )
         .await;
 
     // Send any remaining buffer as the final chunk.
@@ -1025,7 +1038,10 @@ async fn run_streaming_speak(
     // when it couldn't stream (and fell back to chunk-translate, or
     // failed outright). On None we leave spoken_text blank — the panel
     // just stays empty rather than lying.
-    let spoken_full = full.as_deref().map(|s| s.trim().to_string()).unwrap_or_default();
+    let spoken_full = full
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     if !spoken_full.is_empty() {
         bcast(AvatarNotification::Debug {
             chat_text: subtitle_text.clone(),
@@ -1158,7 +1174,8 @@ mod compute_tts_chunks_tests {
         assert!(
             chunks.len() >= 3,
             "expected >=3 chunks for a 6-sentence input, got {}: {:?}",
-            chunks.len(), chunks,
+            chunks.len(),
+            chunks,
         );
     }
 
@@ -1174,7 +1191,8 @@ mod compute_tts_chunks_tests {
         assert!(
             chunks.len() >= 3,
             "expected >=3 chunks for a 3-paragraph input, got {}: {:?}",
-            chunks.len(), chunks,
+            chunks.len(),
+            chunks,
         );
     }
 
@@ -1231,7 +1249,7 @@ mod pop_first_sentence_tests {
         let mut buf = String::from(
             "こんにちは。今日はとても良い天気ですね。\
              公園を散歩していると、桜の花がきれいに咲いていました。\
-             夕方になると、空がきれいなオレンジ色に染まりました。"
+             夕方になると、空がきれいなオレンジ色に染まりました。",
         );
         let mut popped = Vec::new();
         while let Some(s) = pop_first_paragraph(&mut buf) {
@@ -1240,7 +1258,8 @@ mod pop_first_sentence_tests {
         assert!(
             popped.len() >= 3,
             "expected >=3 sentences popped, got {}: {:?}",
-            popped.len(), popped
+            popped.len(),
+            popped
         );
         // Buf should be empty (all sentences ended with terminator).
         assert!(buf.trim().is_empty(), "leftover in buf: {:?}", buf);
@@ -1248,9 +1267,7 @@ mod pop_first_sentence_tests {
 
     #[test]
     fn drains_english_sentences_without_paragraph_breaks() {
-        let mut buf = String::from(
-            "Hello. How are you? I am fine. Today is sunny."
-        );
+        let mut buf = String::from("Hello. How are you? I am fine. Today is sunny.");
         let mut popped = Vec::new();
         while let Some(s) = pop_first_paragraph(&mut buf) {
             popped.push(s);

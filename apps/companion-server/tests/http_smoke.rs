@@ -62,9 +62,10 @@ enabled = false
     let client = reqwest::Client::new();
     for _ in 0..50 {
         if let Ok(r) = client.get(&url).send().await
-            && r.status().is_success() {
-                return (child, port, dir);
-            }
+            && r.status().is_success()
+        {
+            return (child, port, dir);
+        }
         sleep(Duration::from_millis(100)).await;
     }
     panic!("companion-server did not become healthy within 5s");
@@ -101,8 +102,10 @@ async fn status_endpoint_reports_disabled_subsystems() {
         sleep(Duration::from_millis(500)).await;
     }
     assert_eq!(json["ok"], true);
-    assert_eq!(json["zeroclaw_up"], false,
-        "watchdog should have flipped zeroclaw_up to false (URL is :1, unreachable)");
+    assert_eq!(
+        json["zeroclaw_up"], false,
+        "watchdog should have flipped zeroclaw_up to false (URL is :1, unreachable)"
+    );
     assert_eq!(json["avatar_enabled"], false);
     assert_eq!(json["pulse_enabled"], false);
     let _ = child.kill().await;

@@ -40,8 +40,8 @@ pub fn spa_fallback(
     Future = std::pin::Pin<
         Box<
             dyn std::future::Future<
-                Output = Result<axum::response::Response, std::convert::Infallible>,
-            > + Send,
+                    Output = Result<axum::response::Response, std::convert::Infallible>,
+                > + Send,
         >,
     >,
 > + Clone
@@ -64,8 +64,8 @@ pub fn spa_fallback(
             as std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                        Output = Result<axum::response::Response, std::convert::Infallible>,
-                    > + Send,
+                            Output = Result<axum::response::Response, std::convert::Infallible>,
+                        > + Send,
                 >,
             >
     })

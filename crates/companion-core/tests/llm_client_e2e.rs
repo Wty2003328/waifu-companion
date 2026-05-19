@@ -69,7 +69,10 @@ async fn chat_propagates_5xx_error() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|| async {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "upstream broke")
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "upstream broke",
+            )
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

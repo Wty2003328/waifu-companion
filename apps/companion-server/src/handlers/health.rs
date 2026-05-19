@@ -8,8 +8,8 @@
 
 use std::sync::atomic::Ordering;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 
 use crate::state::AppState;
 
@@ -68,9 +68,10 @@ pub async fn run_health_watchdog(state: AppState) {
         let zc = state.zeroclaw.load_full();
         match zc.health().await {
             Ok(true) => state.health.set_agent(true, None),
-            Ok(false) => state
-                .health
-                .set_agent(false, Some(format!("{}/health returned non-2xx", zc.base_url()))),
+            Ok(false) => state.health.set_agent(
+                false,
+                Some(format!("{}/health returned non-2xx", zc.base_url())),
+            ),
             Err(e) => state.health.set_agent(false, Some(format!("{e}"))),
         }
 

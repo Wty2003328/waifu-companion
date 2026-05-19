@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 
 use crate::characters;
 use crate::state::AppState;
@@ -114,7 +114,11 @@ pub async fn handle_chat(
     // this request is in flight, we keep using the old one for this
     // response (safe — Arc cloned), and the next request picks up the new.
     let zc = state.zeroclaw.load_full();
-    let session_id = req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let session_id = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if let Some(sid) = session_id {
         tracing::debug!("companion: /api/chat in session {sid}");
     }
@@ -204,8 +208,7 @@ pub async fn handle_avatar_asr(
     if !cfg.speech.enabled {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "speech subsystem disabled in companion.toml ([avatar.speech] enabled = false)"
-                .into(),
+            "speech subsystem disabled in companion.toml ([avatar.speech] enabled = false)".into(),
         ));
     }
     drop(cfg);

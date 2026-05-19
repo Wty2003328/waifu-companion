@@ -91,7 +91,10 @@ impl Collector for GithubReleasesCollector {
 
         let mut out = Vec::new();
         for repo in &self.cfg.repos {
-            let url = format!("https://github.com/{}/releases.atom", repo.trim_matches('/'));
+            let url = format!(
+                "https://github.com/{}/releases.atom",
+                repo.trim_matches('/')
+            );
             match self.fetch_repo(&url, repo).await {
                 Ok(mut items) => out.append(&mut items),
                 Err(e) => tracing::warn!("github_releases: {repo} failed: {e}"),
@@ -164,7 +167,11 @@ impl GithubReleasesCollector {
                     collector_id: "github_releases".to_string(),
                     title,
                     url: Some(release_url),
-                    content: if summary.is_empty() { None } else { Some(summary) },
+                    content: if summary.is_empty() {
+                        None
+                    } else {
+                        Some(summary)
+                    },
                     metadata,
                     published_at: Some(published),
                 }

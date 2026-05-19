@@ -177,10 +177,7 @@ impl VideoCollector {
                     .first()
                     .map(|l| l.href.clone())
                     .unwrap_or_else(|| Self::watch_url(platform, &video_id));
-                let published = entry
-                    .published
-                    .or(entry.updated)
-                    .unwrap_or_else(Utc::now);
+                let published = entry.published.or(entry.updated).unwrap_or_else(Utc::now);
                 let thumbnail = entry
                     .media
                     .first()

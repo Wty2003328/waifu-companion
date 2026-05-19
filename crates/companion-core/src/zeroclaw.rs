@@ -52,9 +52,7 @@ pub enum AgentEvent {
     },
     /// Something else we don't classify. `raw` carries the original JSON
     /// so callers can pattern-match on payload shape if they care.
-    Other {
-        raw: serde_json::Value,
-    },
+    Other { raw: serde_json::Value },
 }
 
 /// Client for the upstream agent HTTP gateway.
@@ -178,10 +176,7 @@ impl ZeroclawClient {
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "{} /webhook returned {status}: {txt}",
-                self.kind.label()
-            );
+            anyhow::bail!("{} /webhook returned {status}: {txt}", self.kind.label());
         }
         let payload: serde_json::Value = resp.json().await?;
         for key in &["response", "reply", "text", "content", "output"] {
@@ -211,9 +206,7 @@ impl ZeroclawClient {
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "openclaw /v1/chat/completions returned {status}: {txt}"
-            );
+            anyhow::bail!("openclaw /v1/chat/completions returned {status}: {txt}");
         }
         let payload: serde_json::Value = resp.json().await?;
         if let Some(s) = payload
@@ -224,10 +217,7 @@ impl ZeroclawClient {
         }
         // OpenAI streaming/delta fallback shapes — unlikely without
         // stream:true but cheap to try before giving up.
-        if let Some(s) = payload
-            .pointer("/choices/0/text")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(s) = payload.pointer("/choices/0/text").and_then(|v| v.as_str()) {
             return Ok(s.to_string());
         }
         if let Some(arr) = payload.get("error") {

@@ -4,9 +4,9 @@
 //! The roster's *storage* layer lives in [`crate::characters`]; this
 //! module is the thin axum binding over it.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 
 use crate::characters;
 use crate::state::AppState;
@@ -28,8 +28,8 @@ pub async fn handle_upsert_character(
         return Err((StatusCode::BAD_REQUEST, "id required".into()));
     }
     let path = characters::characters_path(&state.config_path);
-    let mut file = characters::load(&path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut file =
+        characters::load(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if let Some(existing) = file.characters.iter_mut().find(|c| c.id == req.id) {
         *existing = req;
     } else {
@@ -50,8 +50,8 @@ pub async fn handle_set_active_character(
     Json(req): Json<ActivateCharacterReq>,
 ) -> axum::response::Result<StatusCode, (StatusCode, String)> {
     let path = characters::characters_path(&state.config_path);
-    let mut file = characters::load(&path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut file =
+        characters::load(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // Empty id allowed — clears active.
     if !req.id.is_empty() && !file.characters.iter().any(|c| c.id == req.id) {
         return Err((
@@ -70,15 +70,12 @@ pub async fn handle_delete_character(
     Path(id): Path<String>,
 ) -> axum::response::Result<StatusCode, (StatusCode, String)> {
     let path = characters::characters_path(&state.config_path);
-    let mut file = characters::load(&path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut file =
+        characters::load(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let before = file.characters.len();
     file.characters.retain(|c| c.id != id);
     if file.characters.len() == before {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("no character with id {id}"),
-        ));
+        return Err((StatusCode::NOT_FOUND, format!("no character with id {id}")));
     }
     if file.active_id == id {
         file.active_id.clear();
@@ -127,8 +124,8 @@ pub async fn handle_get_character_attachment(
         ));
     }
     let path = characters::character_dir(&state.config_path, &id).join(&file);
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let body =
+        std::fs::read_to_string(&path).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     Ok(Json(serde_json::json!({ "name": file, "body": body })))
 }
 

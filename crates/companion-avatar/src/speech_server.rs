@@ -245,9 +245,7 @@ impl SpeechManager {
         {
             match c.post(&url).send().await {
                 Ok(_) => tracing::info!("speech: /shutdown requested"),
-                Err(e) => tracing::debug!(
-                    "speech: /shutdown not delivered ({e}); falling through"
-                ),
+                Err(e) => tracing::debug!("speech: /shutdown not delivered ({e}); falling through"),
             }
         }
 
@@ -361,21 +359,28 @@ mod tests {
         cfg.device = "cuda".into();
         cfg.compute_type = "float16".into();
         cfg.default_language = "ja".into();
-        let env: std::collections::HashMap<_, _> =
-            cfg.spawn_env().into_iter().collect();
+        let env: std::collections::HashMap<_, _> = cfg.spawn_env().into_iter().collect();
         assert_eq!(env.get("SPEECH_PORT").map(String::as_str), Some("9882"));
-        assert_eq!(env.get("SPEECH_MODEL_SIZE").map(String::as_str), Some("small"));
+        assert_eq!(
+            env.get("SPEECH_MODEL_SIZE").map(String::as_str),
+            Some("small")
+        );
         assert_eq!(env.get("SPEECH_WARMUP").map(String::as_str), Some("1"));
         assert_eq!(env.get("SPEECH_DEVICE").map(String::as_str), Some("cuda"));
-        assert_eq!(env.get("SPEECH_COMPUTE_TYPE").map(String::as_str), Some("float16"));
-        assert_eq!(env.get("SPEECH_DEFAULT_LANG").map(String::as_str), Some("ja"));
+        assert_eq!(
+            env.get("SPEECH_COMPUTE_TYPE").map(String::as_str),
+            Some("float16")
+        );
+        assert_eq!(
+            env.get("SPEECH_DEFAULT_LANG").map(String::as_str),
+            Some("ja")
+        );
     }
 
     #[test]
     fn spawn_env_omits_unset_optionals() {
         let cfg = test_config();
-        let env: std::collections::HashMap<_, _> =
-            cfg.spawn_env().into_iter().collect();
+        let env: std::collections::HashMap<_, _> = cfg.spawn_env().into_iter().collect();
         assert!(!env.contains_key("SPEECH_DEVICE"));
         assert!(!env.contains_key("SPEECH_COMPUTE_TYPE"));
         assert!(!env.contains_key("SPEECH_DEFAULT_LANG"));
@@ -385,8 +390,7 @@ mod tests {
     fn warmup_flag_is_forwarded() {
         let mut cfg = test_config();
         cfg.warmup = false;
-        let env: std::collections::HashMap<_, _> =
-            cfg.spawn_env().into_iter().collect();
+        let env: std::collections::HashMap<_, _> = cfg.spawn_env().into_iter().collect();
         assert_eq!(env.get("SPEECH_WARMUP").map(String::as_str), Some("0"));
     }
 }

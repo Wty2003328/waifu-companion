@@ -108,7 +108,7 @@ pub(super) fn strip_thinking_preamble(text: &str, prefer_cjk: bool) -> String {
         "let me store",
         "let me respond",
         "let me look",
-        "let me ",  // catch-all "let me X"
+        "let me ", // catch-all "let me X"
         "looking at the context",
         "looking at ",
         "based on the context",
@@ -220,7 +220,7 @@ pub(super) fn is_cjk(c: char) -> bool {
 pub(super) fn detect_source_lang(text: &str) -> Option<&'static str> {
     let total: usize = text.chars().filter(|c| !c.is_whitespace()).count();
     if total < 4 {
-        return None;  // too short to judge
+        return None; // too short to judge
     }
     let mut kana = 0usize;
     let mut han = 0usize;
@@ -242,11 +242,21 @@ pub(super) fn detect_source_lang(text: &str) -> Option<&'static str> {
         }
     }
     let t = total as f64;
-    if (kana as f64) / t >= 0.08 { return Some("ja"); }
-    if (han as f64) / t >= 0.30 { return Some("zh"); }
-    if (hangul as f64) / t >= 0.30 { return Some("ko"); }
-    if (cyrillic as f64) / t >= 0.50 { return Some("ru"); }
-    if (arabic as f64) / t >= 0.50 { return Some("ar"); }
+    if (kana as f64) / t >= 0.08 {
+        return Some("ja");
+    }
+    if (han as f64) / t >= 0.30 {
+        return Some("zh");
+    }
+    if (hangul as f64) / t >= 0.30 {
+        return Some("ko");
+    }
+    if (cyrillic as f64) / t >= 0.50 {
+        return Some("ru");
+    }
+    if (arabic as f64) / t >= 0.50 {
+        return Some("ar");
+    }
     None
 }
 

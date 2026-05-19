@@ -61,7 +61,9 @@ struct MockRequest {
 impl MockRequest {
     /// Convenience accessors mirroring the old test API so existing
     /// assertions don't need to thread through `x_companion`.
-    fn text(&self) -> &str { &self.input }
+    fn text(&self) -> &str {
+        &self.input
+    }
     fn language(&self) -> &str {
         self.x_companion.language.as_deref().unwrap_or("")
     }
@@ -98,9 +100,9 @@ async fn boot_mock(state: MockState) -> (u16, Arc<Mutex<Vec<MockRequest>>>) {
     let captured = Arc::clone(&state.requests);
     let app = Router::new()
         .route("/healthz", get(handle_health))
-        .route("/health", get(handle_health))   // legacy alias
+        .route("/health", get(handle_health)) // legacy alias
         .route("/v1/audio/speech", post(handle_tts))
-        .route("/tts", post(handle_tts))         // legacy alias
+        .route("/tts", post(handle_tts)) // legacy alias
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

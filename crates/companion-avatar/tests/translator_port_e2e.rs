@@ -14,9 +14,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use companion_avatar::{
-    HttpTranslator, Translator, TranslatorConfig, TranslatorManager,
-};
+use companion_avatar::{HttpTranslator, Translator, TranslatorConfig, TranslatorManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -125,7 +123,9 @@ async fn boot_mock(state: MockState) -> (u16, Arc<Mutex<Vec<MockRequest>>>, Arc<
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
     // Tiny grace so the listener is accepting.
     tokio::time::sleep(Duration::from_millis(20)).await;
     (port, captured_reqs, captured_shutdowns)
@@ -159,11 +159,8 @@ async fn http_translator_round_trip() {
     };
     let (port, captured, _) = boot_mock(state).await;
 
-    let t = HttpTranslator::new(
-        &format!("http://127.0.0.1:{port}"),
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let t =
+        HttpTranslator::new(&format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
 
     let result = t.translate("hello, world", Some("en"), "ja").await;
     assert_eq!(result.as_deref(), Some("こんにちは、世界"));
@@ -191,16 +188,16 @@ async fn http_translator_omits_src_lang_when_none() {
     };
     let (port, captured, _) = boot_mock(state).await;
 
-    let t = HttpTranslator::new(
-        &format!("http://127.0.0.1:{port}"),
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let t =
+        HttpTranslator::new(&format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
 
     let _ = t.translate("hello", None, "ja").await;
     let reqs = captured.lock().await;
     assert_eq!(reqs.len(), 1);
-    assert!(reqs[0].src_lang.is_none(), "src_lang must be omitted when None");
+    assert!(
+        reqs[0].src_lang.is_none(),
+        "src_lang must be omitted when None"
+    );
 }
 
 #[tokio::test]
@@ -212,11 +209,8 @@ async fn http_translator_empty_text_returns_none() {
     };
     let (port, captured, _) = boot_mock(state).await;
 
-    let t = HttpTranslator::new(
-        &format!("http://127.0.0.1:{port}"),
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let t =
+        HttpTranslator::new(&format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
 
     assert_eq!(t.translate("", Some("en"), "ja").await, None);
     assert_eq!(t.translate("   ", Some("en"), "ja").await, None);
@@ -236,11 +230,8 @@ async fn http_translator_500_returns_none() {
     };
     let (port, _captured, _) = boot_mock(state).await;
 
-    let t = HttpTranslator::new(
-        &format!("http://127.0.0.1:{port}"),
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let t =
+        HttpTranslator::new(&format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
 
     assert_eq!(t.translate("hello", Some("en"), "ja").await, None);
 }
@@ -254,11 +245,8 @@ async fn http_translator_streaming_emits_full_result_once() {
     };
     let (port, _captured, _) = boot_mock(state).await;
 
-    let t = HttpTranslator::new(
-        &format!("http://127.0.0.1:{port}"),
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let t =
+        HttpTranslator::new(&format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
 
     let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
     let chunks_clone = Arc::clone(&chunks);
@@ -275,7 +263,11 @@ async fn http_translator_streaming_emits_full_result_once() {
     assert_eq!(result.as_deref(), Some("全文を一度に"));
 
     let chunks = chunks.lock().await;
-    assert_eq!(chunks.len(), 1, "HTTP backend fires the callback exactly once");
+    assert_eq!(
+        chunks.len(),
+        1,
+        "HTTP backend fires the callback exactly once"
+    );
     assert_eq!(chunks[0], "全文を一度に");
 }
 
@@ -344,7 +336,9 @@ async fn manager_warns_when_adopted_sidecar_ignores_shutdown() {
     mgr.start_server().await.expect("adopt external sidecar");
 
     let start = std::time::Instant::now();
-    mgr.stop_server().await.expect("graceful stop returns Ok even when wedged");
+    mgr.stop_server()
+        .await
+        .expect("graceful stop returns Ok even when wedged");
     let elapsed = start.elapsed();
 
     // NMT_GRACEFUL_TIMEOUT is 8s — we should observe at least most
@@ -356,7 +350,8 @@ async fn manager_warns_when_adopted_sidecar_ignores_shutdown() {
         "expected stop_server to poll for ~the full grace window when wedged (took {elapsed:?})",
     );
     assert_eq!(
-        *shutdowns.lock().await, 1,
+        *shutdowns.lock().await,
+        1,
         "exactly one /shutdown POST even though the sidecar ignored it",
     );
 }

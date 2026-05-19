@@ -312,7 +312,8 @@ impl AnimeTtsManager {
 
     /// Synthesize text in an explicit language (overrides config default).
     pub async fn synthesize_with(&self, text: &str, language: &str) -> Result<AudioOutput> {
-        self.synthesize_with_opts(text, language, None, None, None).await
+        self.synthesize_with_opts(text, language, None, None, None)
+            .await
     }
 
     /// Synthesize with full per-call options. Every overridable field

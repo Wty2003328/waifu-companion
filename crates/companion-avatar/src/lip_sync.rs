@@ -206,7 +206,11 @@ mod tests {
         let data = analyzer.analyze(&audio);
         // All frames should have near-zero mouth_open
         for frame in &data.frames {
-            assert!(frame.mouth_open < 0.01, "expected silence, got {}", frame.mouth_open);
+            assert!(
+                frame.mouth_open < 0.01,
+                "expected silence, got {}",
+                frame.mouth_open
+            );
         }
     }
 
@@ -215,9 +219,9 @@ mod tests {
         let config = default_config();
         let analyzer = LipSyncAnalyzer::new(&config);
         // Max amplitude sine-ish signal
-        let loud: Vec<i16> = (0..22050).map(|i| {
-            ((i as f32 * 0.1).sin() * 32000.0) as i16
-        }).collect();
+        let loud: Vec<i16> = (0..22050)
+            .map(|i| ((i as f32 * 0.1).sin() * 32000.0) as i16)
+            .collect();
         let audio = super::super::tts_server::AudioOutput {
             audio_bytes: make_wav_audio(&loud),
             sample_rate: 22050,
@@ -226,8 +230,15 @@ mod tests {
         };
         let data = analyzer.analyze(&audio);
         // At least some frames should have significant mouth_open
-        let max_open = data.frames.iter().map(|f| f.mouth_open).fold(0.0_f32, f32::max);
-        assert!(max_open > 0.3, "expected loud signal to open mouth, max was {max_open}");
+        let max_open = data
+            .frames
+            .iter()
+            .map(|f| f.mouth_open)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_open > 0.3,
+            "expected loud signal to open mouth, max was {max_open}"
+        );
     }
 
     #[test]
@@ -254,7 +265,10 @@ mod tests {
             format: "wav".into(),
         };
         let data = analyzer.analyze(&audio);
-        assert!(!data.frames.is_empty(), "must always emit at least one frame");
+        assert!(
+            !data.frames.is_empty(),
+            "must always emit at least one frame"
+        );
     }
 
     #[test]
@@ -319,9 +333,9 @@ mod tests {
         // Raw PCM (no WAV header) should decode straight from bytes.
         let config = default_config();
         let analyzer = LipSyncAnalyzer::new(&config);
-        let samples: Vec<i16> = (0..22050).map(|i| {
-            ((i as f32 * 0.3).sin() * 16000.0) as i16
-        }).collect();
+        let samples: Vec<i16> = (0..22050)
+            .map(|i| ((i as f32 * 0.3).sin() * 16000.0) as i16)
+            .collect();
         let mut bytes = Vec::with_capacity(samples.len() * 2);
         for s in &samples {
             bytes.extend_from_slice(&s.to_le_bytes());
@@ -335,8 +349,15 @@ mod tests {
         let data = analyzer.analyze(&audio);
         assert!(!data.frames.is_empty());
         // Mid-volume sine should land mouth_open in (0, 1) somewhere.
-        let max = data.frames.iter().map(|f| f.mouth_open).fold(0.0_f32, f32::max);
-        assert!(max > 0.0, "RMS-driven mouth_open should activate for non-silent signal");
+        let max = data
+            .frames
+            .iter()
+            .map(|f| f.mouth_open)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max > 0.0,
+            "RMS-driven mouth_open should activate for non-silent signal"
+        );
     }
 
     #[test]
@@ -374,9 +395,12 @@ mod tests {
         };
         let data = analyzer.analyze(&audio);
         for w in data.frames.windows(2) {
-            assert!(w[1].timestamp_ms >= w[0].timestamp_ms,
-                    "non-monotonic timestamp: {} → {}",
-                    w[0].timestamp_ms, w[1].timestamp_ms);
+            assert!(
+                w[1].timestamp_ms >= w[0].timestamp_ms,
+                "non-monotonic timestamp: {} → {}",
+                w[0].timestamp_ms,
+                w[1].timestamp_ms
+            );
         }
     }
 
@@ -397,9 +421,12 @@ mod tests {
         };
         let lo = analyzer_lo.analyze(&audio);
         let hi = analyzer_hi.analyze(&audio);
-        assert!(hi.frames.len() > lo.frames.len() * 2,
-                "60fps={} frames vs 15fps={} frames — expected ≥2× ratio",
-                hi.frames.len(), lo.frames.len());
+        assert!(
+            hi.frames.len() > lo.frames.len() * 2,
+            "60fps={} frames vs 15fps={} frames — expected ≥2× ratio",
+            hi.frames.len(),
+            lo.frames.len()
+        );
     }
 
     #[test]
@@ -412,7 +439,7 @@ mod tests {
         // First half loud, second half silent — a clear step.
         let mut samples: Vec<i16> = Vec::new();
         samples.extend(vec![i16::MAX / 4; 22050 / 2]); // 0.5s loud
-        samples.extend(vec![0i16; 22050 / 2]);          // 0.5s silent
+        samples.extend(vec![0i16; 22050 / 2]); // 0.5s silent
         let audio = super::super::tts_server::AudioOutput {
             audio_bytes: make_wav_audio(&samples),
             sample_rate: 22050,
@@ -429,18 +456,21 @@ mod tests {
             if frames.len() < 2 {
                 return 0.0;
             }
-            let mean = frames.iter().map(|f| f.mouth_open).sum::<f32>()
-                / frames.len() as f32;
-            frames.iter()
+            let mean = frames.iter().map(|f| f.mouth_open).sum::<f32>() / frames.len() as f32;
+            frames
+                .iter()
                 .map(|f| (f.mouth_open - mean).powi(2))
-                .sum::<f32>() / frames.len() as f32
+                .sum::<f32>()
+                / frames.len() as f32
         }
 
         let v_unsmoothed = variance(&unsmoothed.frames);
         let v_smoothed = variance(&smoothed.frames);
         // Unsmoothed should have higher variance than heavily-smoothed.
-        assert!(v_unsmoothed > v_smoothed,
-                "smoothing should reduce variance; got unsmoothed={v_unsmoothed} smoothed={v_smoothed}");
+        assert!(
+            v_unsmoothed > v_smoothed,
+            "smoothing should reduce variance; got unsmoothed={v_unsmoothed} smoothed={v_smoothed}"
+        );
     }
 
     #[test]

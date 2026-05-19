@@ -276,10 +276,11 @@ impl LlmClient {
                         .and_then(|c| c.get("delta"))
                         .and_then(|d| d.get("content"))
                         .and_then(|t| t.as_str())
-                        && !delta.is_empty() {
-                            full.push_str(delta);
-                            on_chunk(delta);
-                        }
+                        && !delta.is_empty()
+                    {
+                        full.push_str(delta);
+                        on_chunk(delta);
+                    }
                 }
             }
         }
@@ -294,15 +295,19 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 
 fn resolve_api_key(cfg: &LlmConfig) -> Option<String> {
     if let Some(ref key) = cfg.api_key
-        && !key.is_empty() {
-            return Some(key.clone());
-        }
+        && !key.is_empty()
+    {
+        return Some(key.clone());
+    }
     if let Some(ref var) = cfg.api_key_env
         && let Ok(v) = std::env::var(var)
-            && !v.is_empty() {
-                return Some(v);
-            }
-    std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty())
+        && !v.is_empty()
+    {
+        return Some(v);
+    }
+    std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]

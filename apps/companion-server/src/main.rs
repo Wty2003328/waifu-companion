@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
@@ -54,7 +54,10 @@ async fn main() -> Result<()> {
     // informational log line, so fire it off the critical path.
     {
         let zc_probe = zc.clone();
-        let (kind_label, url) = (cfg.zeroclaw.kind.label().to_string(), cfg.zeroclaw.url.clone());
+        let (kind_label, url) = (
+            cfg.zeroclaw.kind.label().to_string(),
+            cfg.zeroclaw.url.clone(),
+        );
         tokio::spawn(async move {
             match zc_probe.health().await {
                 Ok(true) => tracing::info!("companion: {kind_label} at {url} is up"),
@@ -116,7 +119,10 @@ async fn main() -> Result<()> {
     let mut router = Router::new()
         .route("/health", get(handlers::health::handle_health))
         .route("/api/status", get(handlers::health::handle_status))
-        .route("/api/chat", axum::routing::post(handlers::chat::handle_chat))
+        .route(
+            "/api/chat",
+            axum::routing::post(handlers::chat::handle_chat),
+        )
         .route("/api/config", get(handlers::config::handle_get_config))
         .route(
             "/api/config/subagent",
@@ -318,7 +324,10 @@ fn config_path() -> Result<PathBuf> {
         return Ok(local);
     }
     if let Some(home) = directories::UserDirs::new() {
-        let home_cfg = home.home_dir().join(".waifu-companion").join("companion.toml");
+        let home_cfg = home
+            .home_dir()
+            .join(".waifu-companion")
+            .join("companion.toml");
         return Ok(home_cfg);
     }
     Ok(local)
@@ -330,8 +339,7 @@ async fn build_avatar(
 ) -> Result<Option<Arc<AvatarWsState>>> {
     // Avatar config lives under [avatar] in companion.toml. We deserialize
     // here (companion-core kept it as a Value to stay decoupled).
-    let avatar_cfg: AvatarConfig =
-        serde_json::from_value(cfg.avatar.clone()).unwrap_or_default();
+    let avatar_cfg: AvatarConfig = serde_json::from_value(cfg.avatar.clone()).unwrap_or_default();
     if !avatar_cfg.enabled {
         tracing::info!("companion: avatar disabled in config");
         return Ok(None);
@@ -360,7 +368,9 @@ async fn build_avatar(
                 Some(Arc::new(s))
             }
             Err(e) => {
-                tracing::warn!("companion: avatar subagent init failed; using keyword fallback: {e}");
+                tracing::warn!(
+                    "companion: avatar subagent init failed; using keyword fallback: {e}"
+                );
                 None
             }
         }
@@ -427,9 +437,7 @@ async fn build_avatar(
                     let mgr_clone = Arc::clone(&mgr);
                     tokio::spawn(async move {
                         if let Err(e) = mgr_clone.start_server().await {
-                            tracing::warn!(
-                                "companion: speech sidecar auto-start failed: {e}"
-                            );
+                            tracing::warn!("companion: speech sidecar auto-start failed: {e}");
                         }
                     });
                 }
@@ -454,7 +462,11 @@ async fn build_avatar(
         avatar_cfg.chat_language,
         avatar_cfg.tts.language,
         avatar_cfg.tts.api_url.as_deref().unwrap_or("<unset>"),
-        if avatar_cfg.speech.enabled { "on" } else { "off" },
+        if avatar_cfg.speech.enabled {
+            "on"
+        } else {
+            "off"
+        },
     );
 
     Ok(Some(Arc::new(AvatarWsState {
@@ -472,8 +484,7 @@ async fn build_pulse(
     cfg: &CompanionConfig,
     summarizer: Option<Arc<companion_pulse::Summarizer>>,
 ) -> Result<Option<Arc<PulseSubsystem>>> {
-    let pulse_cfg: PulseConfig =
-        serde_json::from_value(cfg.pulse.clone()).unwrap_or_default();
+    let pulse_cfg: PulseConfig = serde_json::from_value(cfg.pulse.clone()).unwrap_or_default();
     if !pulse_cfg.enabled {
         tracing::info!("companion: pulse disabled in config");
         return Ok(None);
@@ -515,9 +526,7 @@ fn build_pulse_summarizer(
                 Some(Arc::new(companion_pulse::Summarizer::Llm(c)))
             }
             Err(e) => {
-                tracing::warn!(
-                    "companion: pulse summarize unavailable (LLM init failed: {e})"
-                );
+                tracing::warn!("companion: pulse summarize unavailable (LLM init failed: {e})");
                 None
             }
         }

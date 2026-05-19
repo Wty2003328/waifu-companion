@@ -26,13 +26,20 @@ use companion_avatar::{AnimeTtsManager, config::AvatarTtsConfig};
 
 fn workspace_root() -> PathBuf {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    here.parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf()
+    here.parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn smoke_config(engine: &str, port: u16) -> AvatarTtsConfig {
     let launcher = workspace_root()
         .join("tts_lab/launch_tts.py")
-        .to_string_lossy().to_string();
+        .to_string_lossy()
+        .to_string();
     let python = "python";
 
     AvatarTtsConfig {
@@ -52,21 +59,31 @@ fn smoke_config(engine: &str, port: u16) -> AvatarTtsConfig {
 #[ignore = "requires TTS weights + GPU; ~60s wall time"]
 async fn qwen3_sidecar_e2e() {
     // Use a port disjoint from production (9890) so concurrent runs don't collide.
-    let mgr = AnimeTtsManager::new(&smoke_config("qwen3-tts-1.7b", 9892))
-        .expect("manager construct");
-    mgr.start_server().await.expect("sidecar should start within 240s");
+    let mgr =
+        AnimeTtsManager::new(&smoke_config("qwen3-tts-1.7b", 9892)).expect("manager construct");
+    mgr.start_server()
+        .await
+        .expect("sidecar should start within 240s");
 
-    let out = mgr.synthesize_with("こんにちは、私は人工知能アシスタントです。", "ja")
+    let out = mgr
+        .synthesize_with("こんにちは、私は人工知能アシスタントです。", "ja")
         .await
         .expect("synthesis should succeed");
 
-    assert!(!out.audio_bytes.is_empty(), "audio body should be non-empty");
+    assert!(
+        !out.audio_bytes.is_empty(),
+        "audio body should be non-empty"
+    );
     assert_eq!(out.format, "wav");
     assert_eq!(out.channels, 1);
     assert_eq!(&out.audio_bytes[..4], b"RIFF");
     assert_eq!(&out.audio_bytes[8..12], b"WAVE");
 
-    println!("synthesized {} bytes of WAV @ {} Hz", out.audio_bytes.len(), out.sample_rate);
+    println!(
+        "synthesized {} bytes of WAV @ {} Hz",
+        out.audio_bytes.len(),
+        out.sample_rate
+    );
 
     mgr.stop_server().await.expect("teardown");
     tokio::time::sleep(Duration::from_secs(2)).await;

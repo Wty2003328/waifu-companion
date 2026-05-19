@@ -57,7 +57,10 @@ async fn run_collector(collector: &Arc<dyn Collector>, db: &PulseDatabase) {
     let run_id = match db.start_collector_run(collector.id()).await {
         Ok(id) => id,
         Err(e) => {
-            tracing::error!("pulse: failed to record run start for {}: {e}", collector.id());
+            tracing::error!(
+                "pulse: failed to record run start for {}: {e}",
+                collector.id()
+            );
             return;
         }
     };
@@ -91,7 +94,9 @@ async fn run_collector(collector: &Arc<dyn Collector>, db: &PulseDatabase) {
         }
         Err(e) => {
             tracing::error!("pulse: collector {} failed: {e}", collector.id());
-            let _ = db.finish_collector_run(&run_id, 0, Some(&e.to_string())).await;
+            let _ = db
+                .finish_collector_run(&run_id, 0, Some(&e.to_string()))
+                .await;
         }
     }
 }
@@ -113,8 +118,8 @@ pub async fn trigger_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HackerNewsConfig, RssConfig};
     use crate::collectors::{hackernews::HackerNewsCollector, rss::RssCollector};
+    use crate::config::{HackerNewsConfig, RssConfig};
 
     #[test]
     fn scheduler_skips_disabled_collectors() {

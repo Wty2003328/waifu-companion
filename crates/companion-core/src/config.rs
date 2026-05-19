@@ -42,7 +42,6 @@ pub enum AgentKind {
     Custom,
 }
 
-
 impl AgentKind {
     /// Default port each agent's gateway binds to. Used by the Settings
     /// UI to prefill the URL when the user picks a kind, and by the
@@ -98,7 +97,10 @@ impl CompanionConfig {
     /// the loaded TOML — that's where per-machine UI overrides live.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let mut cfg = if !path.exists() {
-            tracing::info!("companion.toml not found at {}; using defaults", path.display());
+            tracing::info!(
+                "companion.toml not found at {}; using defaults",
+                path.display()
+            );
             Self::default()
         } else {
             let body = std::fs::read_to_string(path)?;
@@ -374,8 +376,12 @@ impl RuntimeOverride {
                 || a.tts_streaming.is_some()
                 || a.tts_launcher_command.is_some();
             if needs_tts_obj {
-                let tts = avatar_obj.entry("tts").or_insert_with(|| serde_json::json!({}));
-                if !tts.is_object() { *tts = serde_json::json!({}); }
+                let tts = avatar_obj
+                    .entry("tts")
+                    .or_insert_with(|| serde_json::json!({}));
+                if !tts.is_object() {
+                    *tts = serde_json::json!({});
+                }
                 let tts_obj = tts.as_object_mut().unwrap();
                 if let Some(ref v) = a.tts_api_url {
                     tts_obj.insert("api_url".into(), serde_json::Value::String(v.clone()));
@@ -384,9 +390,10 @@ impl RuntimeOverride {
                     tts_obj.insert("language".into(), serde_json::Value::String(v.clone()));
                 }
                 if let Some(v) = a.tts_speed
-                    && let Some(n) = serde_json::Number::from_f64(v) {
-                        tts_obj.insert("speed".into(), serde_json::Value::Number(n));
-                    }
+                    && let Some(n) = serde_json::Number::from_f64(v)
+                {
+                    tts_obj.insert("speed".into(), serde_json::Value::Number(n));
+                }
                 if let Some(ref v) = a.tts_voice {
                     tts_obj.insert("voice".into(), serde_json::Value::String(v.clone()));
                 }
@@ -397,7 +404,10 @@ impl RuntimeOverride {
                     tts_obj.insert("streaming".into(), serde_json::Value::Bool(v));
                 }
                 if let Some(ref v) = a.tts_launcher_command {
-                    tts_obj.insert("launcher_command".into(), serde_json::Value::String(v.clone()));
+                    tts_obj.insert(
+                        "launcher_command".into(),
+                        serde_json::Value::String(v.clone()),
+                    );
                 }
             }
             // Subagent toggles (avatar.subagent.{enabled,only_when_translating}).
@@ -405,8 +415,12 @@ impl RuntimeOverride {
                 || a.subagent_only_when_translating.is_some()
                 || a.subagent_streaming.is_some()
             {
-                let sub = avatar_obj.entry("subagent").or_insert_with(|| serde_json::json!({}));
-                if !sub.is_object() { *sub = serde_json::json!({}); }
+                let sub = avatar_obj
+                    .entry("subagent")
+                    .or_insert_with(|| serde_json::json!({}));
+                if !sub.is_object() {
+                    *sub = serde_json::json!({});
+                }
                 let sub_obj = sub.as_object_mut().unwrap();
                 if let Some(v) = a.subagent_enabled {
                     sub_obj.insert("enabled".into(), serde_json::Value::Bool(v));
@@ -445,10 +459,7 @@ impl RuntimeOverride {
                 sub_obj.insert("use_zeroclaw_webhook".into(), serde_json::Value::Bool(v));
             }
             if let Some(v) = s.timeout_secs {
-                sub_obj.insert(
-                    "timeout_secs".into(),
-                    serde_json::Value::Number(v.into()),
-                );
+                sub_obj.insert("timeout_secs".into(), serde_json::Value::Number(v.into()));
             }
             // LLM nested table.
             if s.api_key.is_some()
@@ -481,7 +492,9 @@ impl RuntimeOverride {
                 let tr = sub_obj
                     .entry("translator")
                     .or_insert_with(|| serde_json::json!({}));
-                if !tr.is_object() { *tr = serde_json::json!({}); }
+                if !tr.is_object() {
+                    *tr = serde_json::json!({});
+                }
                 let tr_obj = tr.as_object_mut().unwrap();
                 if let Some(ref v) = t.backend {
                     tr_obj.insert("backend".into(), serde_json::Value::String(v.clone()));
@@ -490,10 +503,16 @@ impl RuntimeOverride {
                     tr_obj.insert("url".into(), serde_json::Value::String(v.clone()));
                 }
                 if let Some(v) = t.http_timeout_secs {
-                    tr_obj.insert("http_timeout_secs".into(), serde_json::Value::Number(v.into()));
+                    tr_obj.insert(
+                        "http_timeout_secs".into(),
+                        serde_json::Value::Number(v.into()),
+                    );
                 }
                 if let Some(ref v) = t.nmt_quality_preset {
-                    tr_obj.insert("nmt_quality_preset".into(), serde_json::Value::String(v.clone()));
+                    tr_obj.insert(
+                        "nmt_quality_preset".into(),
+                        serde_json::Value::String(v.clone()),
+                    );
                 }
                 if let Some(ref v) = t.nmt_model_id {
                     // Empty string → clear the override so the preset
@@ -520,13 +539,19 @@ impl RuntimeOverride {
                     tr_obj.insert("nmt_tgt_lang".into(), serde_json::Value::String(v.clone()));
                 }
                 if let Some(ref v) = t.nmt_launch_command {
-                    tr_obj.insert("nmt_launch_command".into(), serde_json::Value::String(v.clone()));
+                    tr_obj.insert(
+                        "nmt_launch_command".into(),
+                        serde_json::Value::String(v.clone()),
+                    );
                 }
                 if let Some(v) = t.nmt_auto_start {
                     tr_obj.insert("nmt_auto_start".into(), serde_json::Value::Bool(v));
                 }
                 if let Some(v) = t.nmt_close_with_companion {
-                    tr_obj.insert("nmt_close_with_companion".into(), serde_json::Value::Bool(v));
+                    tr_obj.insert(
+                        "nmt_close_with_companion".into(),
+                        serde_json::Value::Bool(v),
+                    );
                 }
                 if let Some(v) = t.nmt_port {
                     tr_obj.insert("nmt_port".into(), serde_json::Value::Number(v.into()));
@@ -540,9 +565,10 @@ impl RuntimeOverride {
                 cfg.zeroclaw.kind = k;
             }
             if let Some(ref v) = z.url
-                && !v.trim().is_empty() {
-                    cfg.zeroclaw.url = v.trim().trim_end_matches('/').to_string();
-                }
+                && !v.trim().is_empty()
+            {
+                cfg.zeroclaw.url = v.trim().trim_end_matches('/').to_string();
+            }
             if let Some(ref v) = z.pair_token {
                 cfg.zeroclaw.pair_token = if v.is_empty() { None } else { Some(v.clone()) };
             }
@@ -718,8 +744,8 @@ mod tests {
                 "tts_streaming": true
             }
         }"#;
-        let over: RuntimeOverride = serde_json::from_str(json)
-            .expect("legacy fields must be tolerated");
+        let over: RuntimeOverride =
+            serde_json::from_str(json).expect("legacy fields must be tolerated");
         assert_eq!(over.avatar.unwrap().tts_streaming, Some(true));
     }
 

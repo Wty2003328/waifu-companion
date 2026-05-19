@@ -35,17 +35,20 @@ pub trait Collector: Send + Sync {
 pub fn parse_interval(s: &str) -> Duration {
     let s = s.trim();
     if let Some(rest) = s.strip_suffix('s')
-        && let Ok(n) = rest.parse::<u64>() {
-            return Duration::from_secs(n);
-        }
+        && let Ok(n) = rest.parse::<u64>()
+    {
+        return Duration::from_secs(n);
+    }
     if let Some(rest) = s.strip_suffix('m')
-        && let Ok(n) = rest.parse::<u64>() {
-            return Duration::from_secs(n * 60);
-        }
+        && let Ok(n) = rest.parse::<u64>()
+    {
+        return Duration::from_secs(n * 60);
+    }
     if let Some(rest) = s.strip_suffix('h')
-        && let Ok(n) = rest.parse::<u64>() {
-            return Duration::from_secs(n * 3600);
-        }
+        && let Ok(n) = rest.parse::<u64>()
+    {
+        return Duration::from_secs(n * 3600);
+    }
     Duration::from_secs(30 * 60)
 }
 

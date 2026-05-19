@@ -133,11 +133,9 @@ async fn shutdown_endpoint_terminates_within_grace() {
 #[tokio::test]
 async fn spa_fallthrough_returns_html_or_404_for_unknown_api_path() {
     let (mut child, port, _dir) = boot_with("http://127.0.0.1:1", false, false).await;
-    let r = reqwest::get(format!(
-        "http://127.0.0.1:{port}/api/this-does-not-exist"
-    ))
-    .await
-    .unwrap();
+    let r = reqwest::get(format!("http://127.0.0.1:{port}/api/this-does-not-exist"))
+        .await
+        .unwrap();
     // Without a web/dist build available, expect 404 (no SPA fallback
     // file). With one, expect 200 + HTML body. Either is fine; what we
     // disallow is a 5xx (server crash).
@@ -215,7 +213,8 @@ async fn zeroclaw_override_round_trips() {
         .await
         .unwrap();
     assert_eq!(
-        cfg["zeroclaw"]["url"], serde_json::Value::String(new_url.into()),
+        cfg["zeroclaw"]["url"],
+        serde_json::Value::String(new_url.into()),
         "zeroclaw URL didn't round-trip: {cfg:?}",
     );
     let _ = child.kill().await;

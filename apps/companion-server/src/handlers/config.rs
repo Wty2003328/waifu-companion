@@ -15,12 +15,14 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 
 use companion_avatar::{AnimeTtsManager, AvatarConfig, AvatarSubagent, TranslatorBackendKind};
-use companion_core::{AgentKind, CompanionConfig, RuntimeOverride, ZeroclawClient, runtime_override_path};
+use companion_core::{
+    AgentKind, CompanionConfig, RuntimeOverride, ZeroclawClient, runtime_override_path,
+};
 
 use crate::state::AppState;
 
@@ -142,7 +144,11 @@ pub async fn handle_list_models(_state: State<AppState>) -> Json<serde_json::Val
             if !p.is_dir() {
                 continue;
             }
-            let dir_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let dir_name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
             if dir_name.is_empty() {
                 continue;
             }
@@ -310,7 +316,10 @@ pub async fn handle_post_subagent_override(
         set_str!(nmt_tgt_lang, req.translator_nmt_tgt_lang);
         set_str!(nmt_launch_command, req.translator_nmt_launch_command);
         set_val!(nmt_auto_start, req.translator_nmt_auto_start);
-        set_val!(nmt_close_with_companion, req.translator_nmt_close_with_companion);
+        set_val!(
+            nmt_close_with_companion,
+            req.translator_nmt_close_with_companion
+        );
         set_val!(nmt_port, req.translator_nmt_port);
         sub.translator = Some(tr);
     }
@@ -386,7 +395,7 @@ pub async fn handle_post_subagent_override(
         let old_mgr = avatar_state.translator_mgr.load_full();
         let want_http = new_tr.backend == TranslatorBackendKind::Http;
         let manager_settings_changed: bool = match old_mgr.as_ref() {
-            None => want_http, // None → Some(http) is a change
+            None => want_http,                     // None → Some(http) is a change
             Some(_existing) if !want_http => true, // Some → None (flipped to llm)
             Some(existing) => {
                 // Both sides are http; respawn only when a field that's
@@ -414,14 +423,10 @@ pub async fn handle_post_subagent_override(
                     if let Some(ref m) = old_mgr_for_stop
                         && let Err(e) = m.stop_server().await
                     {
-                        tracing::warn!(
-                            "companion: NMT stop_server returned {e} during swap"
-                        );
+                        tracing::warn!("companion: NMT stop_server returned {e} during swap");
                     }
                     avatar_clone.translator_mgr.store(None);
-                    tracing::info!(
-                        "companion: NMT sidecar stopped (translator flipped to LLM)"
-                    );
+                    tracing::info!("companion: NMT sidecar stopped (translator flipped to LLM)");
                 });
                 nmt_swap_summary = Some("stopped (backend → llm)".to_string());
             } else {
@@ -438,9 +443,7 @@ pub async fn handle_post_subagent_override(
                             if let Some(ref m) = old_mgr_for_stop
                                 && let Err(e) = m.stop_server().await
                             {
-                                tracing::warn!(
-                                    "companion: prev NMT stop_server returned {e}"
-                                );
+                                tracing::warn!("companion: prev NMT stop_server returned {e}");
                             }
                             // 2) Publish the new handle so the
                             //    subagent's HttpTranslator (which will
@@ -449,16 +452,10 @@ pub async fn handle_post_subagent_override(
                             //    point at it.
                             avatar_clone.translator_mgr.store(Some(new_mgr.clone()));
                             // 3) Start it.
-                            if auto_start
-                                && let Err(e) = new_mgr.start_server().await
-                            {
-                                tracing::warn!(
-                                    "companion: new NMT start_server failed: {e}"
-                                );
+                            if auto_start && let Err(e) = new_mgr.start_server().await {
+                                tracing::warn!("companion: new NMT start_server failed: {e}");
                             }
-                            tracing::info!(
-                                "companion: NMT sidecar hot-swap completed"
-                            );
+                            tracing::info!("companion: NMT sidecar hot-swap completed");
                         });
                         nmt_swap_summary = Some(if old_mgr.is_some() {
                             "respawned (config changed)".to_string()
@@ -562,8 +559,7 @@ pub async fn handle_post_avatar_override(
     // Per the lifecycle protocol, only the URL and the opaque launcher
     // command can force a manager rebuild — synth knobs (language /
     // speed / voice / quality / streaming) are hot-applied per call.
-    let tts_process_affected =
-        req.tts_api_url.is_some() || req.tts_launcher_command.is_some();
+    let tts_process_affected = req.tts_api_url.is_some() || req.tts_launcher_command.is_some();
 
     let mut av = over.avatar.unwrap_or_default();
     if let Some(v) = req.enabled {
@@ -701,19 +697,14 @@ pub async fn handle_post_avatar_override(
                         //    externally-managed server).
                         match new_mgr.start_server().await {
                             Ok(()) => {
-                                tracing::info!(
-                                    "companion: TTS hot-swap completed successfully"
-                                );
+                                tracing::info!("companion: TTS hot-swap completed successfully");
                                 health.set_tts(true, None);
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     "companion: TTS start_server failed in hot-swap: {e}"
                                 );
-                                health.set_tts(
-                                    false,
-                                    Some(format!("TTS start failed: {e}")),
-                                );
+                                health.set_tts(false, Some(format!("TTS start failed: {e}")));
                             }
                         }
                     });
@@ -802,7 +793,11 @@ pub async fn handle_post_zeroclaw_override(
     }
     if let Some(v) = req.url {
         let trimmed = v.trim().trim_end_matches('/').to_string();
-        zc.url = if trimmed.is_empty() { None } else { Some(trimmed) };
+        zc.url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
     }
     if let Some(v) = req.pair_token {
         zc.pair_token = if v.is_empty() { None } else { Some(v) };

@@ -41,7 +41,6 @@ use serde::{Deserialize, Serialize};
 use crate::subagent::SubagentBackend;
 use companion_core::llm::LlmClient;
 
-
 /// Boxed callback type used by [`Translator::translate_stream`]. Owned
 /// (not borrowed) so the trait object stays object-safe and downstream
 /// implementations can hand it to closures that capture state across
@@ -79,11 +78,9 @@ pub trait Translator: Send + Sync {
     ) -> Option<String>;
 }
 
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-
 
 /// Which translator backend the subagent uses.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,8 +95,6 @@ pub enum TranslatorBackendKind {
     /// non-streaming. Plain-register output (no persona). Latency-optimized.
     Http,
 }
-
-
 
 /// `[avatar.subagent.translator]` section in companion.toml.
 ///
@@ -191,18 +186,36 @@ pub struct TranslatorConfig {
     pub nmt_port: u16,
 }
 
-fn default_http_url() -> String { "http://127.0.0.1:9881".to_string() }
-fn default_http_timeout() -> u64 { 8 }
-fn default_quality_preset() -> String { "balanced".to_string() }
-fn default_nmt_device() -> String { "cpu".to_string() }
-fn default_nmt_precision() -> String { "auto".to_string() }
-fn default_src_lang() -> String { "en".to_string() }
-fn default_tgt_lang() -> String { "ja".to_string() }
+fn default_http_url() -> String {
+    "http://127.0.0.1:9881".to_string()
+}
+fn default_http_timeout() -> u64 {
+    8
+}
+fn default_quality_preset() -> String {
+    "balanced".to_string()
+}
+fn default_nmt_device() -> String {
+    "cpu".to_string()
+}
+fn default_nmt_precision() -> String {
+    "auto".to_string()
+}
+fn default_src_lang() -> String {
+    "en".to_string()
+}
+fn default_tgt_lang() -> String {
+    "ja".to_string()
+}
 fn default_nmt_launch_command() -> String {
     "python tools/avatar/nmt_translator_server.py".to_string()
 }
-fn default_nmt_port() -> u16 { 9881 }
-fn default_true() -> bool { true }
+fn default_nmt_port() -> u16 {
+    9881
+}
+fn default_true() -> bool {
+    true
+}
 
 impl TranslatorConfig {
     /// Env vars to forward to the NMT sidecar at spawn time. Matches
@@ -225,11 +238,9 @@ impl TranslatorConfig {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // LLM translator
 // ---------------------------------------------------------------------------
-
 
 /// Translator that prompts the subagent's LLM. Preserves the existing
 /// streaming-token surface when the backend is a direct `LlmClient`.
@@ -248,7 +259,11 @@ impl LlmTranslator {
         stream_client: Option<Arc<LlmClient>>,
         timeout: Duration,
     ) -> Self {
-        Self { backend, stream_client, timeout }
+        Self {
+            backend,
+            stream_client,
+            timeout,
+        }
     }
 
     fn build_prompt(text: &str, target_language: &str) -> String {
@@ -289,18 +304,12 @@ impl Translator for LlmTranslator {
         let attempt_budget = std::cmp::min(self.timeout, Duration::from_secs(30));
         for attempt in 1..=3 {
             let started = std::time::Instant::now();
-            let result = tokio::time::timeout(
-                attempt_budget,
-                self.backend.ask("", &prompt),
-            )
-            .await;
+            let result = tokio::time::timeout(attempt_budget, self.backend.ask("", &prompt)).await;
             match result {
                 Ok(Ok(out)) => {
                     let cleaned = Self::clean(&out);
                     if cleaned.is_empty() {
-                        tracing::warn!(
-                            "llm translator: empty response (attempt {attempt})"
-                        );
+                        tracing::warn!("llm translator: empty response (attempt {attempt})");
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -315,9 +324,7 @@ impl Translator for LlmTranslator {
                 Ok(Err(e)) => {
                     let msg = e.to_string();
                     let is_rate_limit = msg.contains("429") || msg.contains("Rate limit");
-                    tracing::warn!(
-                        "llm translator: backend failed (attempt {attempt}): {e}"
-                    );
+                    tracing::warn!("llm translator: backend failed (attempt {attempt}): {e}");
                     if attempt < 3 {
                         let wait = if is_rate_limit { 1u64 << attempt } else { 1 };
                         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -346,9 +353,7 @@ impl Translator for LlmTranslator {
     ) -> Option<String> {
         let Some(ref client) = self.stream_client else {
             // Webhook / non-streaming backend — degrade to one-shot.
-            tracing::debug!(
-                "llm translator: backend has no streaming surface; one-shot fallback"
-            );
+            tracing::debug!("llm translator: backend has no streaming surface; one-shot fallback");
             let out = self.translate(text, source_language, target_language).await;
             if let Some(ref t) = out {
                 on_chunk(t);
@@ -358,8 +363,14 @@ impl Translator for LlmTranslator {
         let prompt = Self::build_prompt(text, target_language);
         use companion_core::llm::{ChatMessage, Role};
         let messages = vec![
-            ChatMessage { role: Role::System, content: String::new() },
-            ChatMessage { role: Role::User, content: prompt },
+            ChatMessage {
+                role: Role::System,
+                content: String::new(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: prompt,
+            },
         ];
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
@@ -375,7 +386,11 @@ impl Translator for LlmTranslator {
                     cleaned.chars().count(),
                     started.elapsed().as_millis(),
                 );
-                if cleaned.is_empty() { None } else { Some(cleaned) }
+                if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                }
             }
             Ok(Err(e)) => {
                 tracing::warn!("llm translator (stream): backend failed: {e}");
@@ -392,11 +407,9 @@ impl Translator for LlmTranslator {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // HTTP (NMT sidecar) translator
 // ---------------------------------------------------------------------------
-
 
 /// Translator that calls the NMT sidecar via localhost HTTP.
 ///
@@ -453,7 +466,8 @@ impl Translator for HttpTranslator {
             return None;
         }
         let started = std::time::Instant::now();
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.url)
             .json(&TranslateRequest {
                 text,
@@ -463,35 +477,30 @@ impl Translator for HttpTranslator {
             .send()
             .await;
         match resp {
-            Ok(r) if r.status().is_success() => {
-                match r.json::<TranslateResponse>().await {
-                    Ok(body) => {
-                        let cleaned = body.text.trim().to_string();
-                        if cleaned.is_empty() {
-                            tracing::warn!("http translator: empty response");
-                            return None;
-                        }
-                        tracing::info!(
-                            "http translator: {}c → {}c in {}ms",
-                            text.chars().count(),
-                            cleaned.chars().count(),
-                            started.elapsed().as_millis(),
-                        );
-                        Some(cleaned)
+            Ok(r) if r.status().is_success() => match r.json::<TranslateResponse>().await {
+                Ok(body) => {
+                    let cleaned = body.text.trim().to_string();
+                    if cleaned.is_empty() {
+                        tracing::warn!("http translator: empty response");
+                        return None;
                     }
-                    Err(e) => {
-                        tracing::warn!("http translator: response parse failed: {e}");
-                        None
-                    }
+                    tracing::info!(
+                        "http translator: {}c → {}c in {}ms",
+                        text.chars().count(),
+                        cleaned.chars().count(),
+                        started.elapsed().as_millis(),
+                    );
+                    Some(cleaned)
                 }
-            }
+                Err(e) => {
+                    tracing::warn!("http translator: response parse failed: {e}");
+                    None
+                }
+            },
             Ok(r) => {
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
-                tracing::warn!(
-                    "http translator: status {} body={:.200}",
-                    status, body,
-                );
+                tracing::warn!("http translator: status {} body={:.200}", status, body,);
                 None
             }
             Err(e) => {
@@ -519,11 +528,9 @@ impl Translator for HttpTranslator {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
-
 
 /// Build the translator instance the subagent should use.
 ///
@@ -537,23 +544,21 @@ pub fn build_translator(
 ) -> Result<Arc<dyn Translator>> {
     match config.backend {
         TranslatorBackendKind::Llm => Ok(Arc::new(LlmTranslator::new(
-            llm_backend, stream_client, llm_timeout,
+            llm_backend,
+            stream_client,
+            llm_timeout,
         ))),
         TranslatorBackendKind::Http => {
-            let http = HttpTranslator::new(
-                &config.url,
-                Duration::from_secs(config.http_timeout_secs),
-            )?;
+            let http =
+                HttpTranslator::new(&config.url, Duration::from_secs(config.http_timeout_secs))?;
             Ok(Arc::new(http))
         }
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Sidecar subprocess manager (HTTP backend only)
 // ---------------------------------------------------------------------------
-
 
 /// Subprocess lifecycle for the NMT translator sidecar.
 ///
@@ -793,7 +798,8 @@ impl TranslatorManager {
     /// to detect a still-warm sidecar left by a prior companion run.
     async fn probe_health(&self) -> bool {
         let url = format!("{}/health", self.api_url);
-        match self.client
+        match self
+            .client
             .get(&url)
             .timeout(Duration::from_secs(2))
             .send()

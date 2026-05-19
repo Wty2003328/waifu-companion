@@ -55,14 +55,18 @@ pub fn read_attachments(toml_path: &Path, char_id: &str) -> Vec<(String, String)
     let mut out: Vec<(String, String)> = Vec::new();
     for ent in entries.flatten() {
         let path = ent.path();
-        if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("md"))
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("md"))
             == Some(true)
             && let (Some(name), Ok(body)) = (
                 path.file_name().and_then(|s| s.to_str()).map(String::from),
                 std::fs::read_to_string(&path),
-            ) {
-                out.push((name, body));
-            }
+            )
+        {
+            out.push((name, body));
+        }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
