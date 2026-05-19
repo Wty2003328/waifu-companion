@@ -14,7 +14,7 @@ upper layer assumes the ones below it have already passed.
 ## L1 — Compile and lint (≈30 s)
 
 ```bash
-cd zeroclaw-companion
+cd waifu-companion
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cd web && npx tsc --noEmit
@@ -62,13 +62,13 @@ a stale instance).
 
 ```bash
 # TTS HTTP wire
-/e/miniconda/envs/tts/python.exe tts_tools/test_server_e2e.py
+$COMPANION_TTS_PYTHON tts_tools/test_server_e2e.py
 #   port:    TTS_PORT (default 9880)
 #   asserts: /health, /tts default, /tts sample_steps override,
 #            empty-text → 400, /shutdown → exit 0
 
 # NMT HTTP wire
-/e/miniconda/envs/tts/python.exe tts_tools/test_nmt_e2e.py
+$COMPANION_TTS_PYTHON tts_tools/test_nmt_e2e.py
 #   port:    NMT_PORT (default 9881)
 #   asserts: /translate en→ja for 4 sentence shapes, latency,
 #            empty-text → 400, wrong-langs → 400, /shutdown → exit 0
@@ -79,7 +79,7 @@ a stale instance).
 ## L4 — Multi-service audio integrity (≈2 min, GPU)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_audio_integrity.py
+$COMPANION_TTS_PYTHON tts_tools/test_audio_integrity.py
 #   spins: mock zeroclaw (42617) + real TTS sidecar (9880)
 #          + companion-server (19182)
 #   sends 4 multi-sentence canned replies through the full
@@ -98,7 +98,7 @@ surrounding sentences carry the duration.
 ## L5 — Running-binary lifecycle (≈30 s)  ← the layer that catches multi-process bugs
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_lifecycle.py
+$COMPANION_TTS_PYTHON tts_tools/test_lifecycle.py
 ```
 
 This is the layer the cargo suite cannot replace. It:
@@ -133,7 +133,7 @@ lifecycle MUST run L5.**
 ## L6a — Backend HTTP coverage (≈10 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_backend_api.py
+$COMPANION_TTS_PYTHON tts_tools/test_backend_api.py
 ```
 
 Boots the full mock stack (mock zeroclaw + TTS + NMT + companion-server
@@ -160,7 +160,7 @@ the rig is one `_check(...)` line each.
 ## L6b — Frontend systematic coverage (≈15 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_frontend_e2e.py
+$COMPANION_TTS_PYTHON tts_tools/test_frontend_e2e.py
 ```
 
 A Playwright suite organized by axis — SMOKE / NAV / SETTINGS /
@@ -268,7 +268,7 @@ config bundle (table above).
 ## L6d — Extended backend HTTP/WS coverage (≈30 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_backend_api_extended.py
+$COMPANION_TTS_PYTHON tts_tools/test_backend_api_extended.py
 ```
 
 Fills the holes in L6a:
@@ -295,7 +295,7 @@ Fills the holes in L6a:
 ## L6e — Integration (full pipeline) (≈3 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_integration_full.py
+$COMPANION_TTS_PYTHON tts_tools/test_integration_full.py
 ```
 
 End-to-end wiring through the mock stack:
@@ -315,7 +315,7 @@ End-to-end wiring through the mock stack:
 ## L6f — Chaos / recovery (≈3 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_chaos.py
+$COMPANION_TTS_PYTHON tts_tools/test_chaos.py
 ```
 
 Drives the mock stack's control plane (`POST :9883/_set`) into known
@@ -340,8 +340,8 @@ that don't need it can set `control_enabled=False` to save a port.
 ## L6f-prop — Property-based state-transition fuzz (≈20 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_state_transitions.py
-/e/miniconda/envs/tts/python.exe tts_tools/test_state_transitions.py \
+$COMPANION_TTS_PYTHON tts_tools/test_state_transitions.py
+$COMPANION_TTS_PYTHON tts_tools/test_state_transitions.py \
     --ops 500 --seed 42      # deterministic, larger walk
 ```
 
@@ -362,7 +362,7 @@ repros deterministic.
 ## L6f-sec — Security / safety adversarial inputs (≈2 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_security.py
+$COMPANION_TTS_PYTHON tts_tools/test_security.py
 ```
 
 Hits the server with deliberately-malicious inputs. Pass criteria for
@@ -389,7 +389,7 @@ each: server stays alive, no 5xx, sensitive output not leaked.
 ## L6sse — SSE bridge invariants (≈3 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_sse_bridge.py
+$COMPANION_TTS_PYTHON tts_tools/test_sse_bridge.py
 ```
 
 The companion subscribes to upstream zeroclaw's `/api/events` SSE
@@ -410,7 +410,7 @@ stream. This rig verifies the bridge:
 ## L6flows — Extended UI flows + multi-viewport visual baselines (≈45 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_frontend_flows.py
+$COMPANION_TTS_PYTHON tts_tools/test_frontend_flows.py
 ```
 
 Goes deeper than L6g:
@@ -440,8 +440,8 @@ canonical CI / dev host with `--full` so the baselines are stable.
 ## L6perf — Performance regression guard (advisory in --full)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_perf_regression.py
-/e/miniconda/envs/tts/python.exe tts_tools/test_perf_regression.py \
+$COMPANION_TTS_PYTHON tts_tools/test_perf_regression.py
+$COMPANION_TTS_PYTHON tts_tools/test_perf_regression.py \
     --tolerance 2.0
 ```
 
@@ -458,8 +458,8 @@ companion-server twice (≈10 s extra wallclock).
 ## L6report — HTML report rendering (`render_report.py`)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/render_report.py
-/e/miniconda/envs/tts/python.exe tts_tools/render_report.py \
+$COMPANION_TTS_PYTHON tts_tools/render_report.py
+$COMPANION_TTS_PYTHON tts_tools/render_report.py \
     tts_samples/run_all/20260515_191218
 ```
 
@@ -478,7 +478,7 @@ Self-contained — no external CSS/JS — suitable as a CI artifact.
 ## L6g — Extended frontend coverage (≈30 s)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/test_frontend_e2e_extended.py
+$COMPANION_TTS_PYTHON tts_tools/test_frontend_e2e_extended.py
 ```
 
 Playwright extensions on top of L6b:
@@ -504,7 +504,7 @@ Playwright extensions on top of L6b:
 ## L6h — Latency benchmarks (≈40 s, advisory)
 
 ```bash
-/e/miniconda/envs/tts/python.exe tts_tools/bench_latency.py
+$COMPANION_TTS_PYTHON tts_tools/bench_latency.py
 ```
 
 NOT pass/fail. Records to `tts_samples/bench/<timestamp>/results.csv`:
@@ -524,22 +524,22 @@ real-world latency regression that no pass/fail test catches.
 
 ```bash
 # Full sweep (mocks + Rust + Python + benchmarks, no GPU-heavy rigs)
-/e/miniconda/envs/tts/python.exe tts_tools/run_all.py --quick
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --quick
 
 # Full sweep including perf-regression, fuzz, visual baselines
-/e/miniconda/envs/tts/python.exe tts_tools/run_all.py --full
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --full
 
 # Pick a single suite (any combination)
-/e/miniconda/envs/tts/python.exe tts_tools/run_all.py --suites integration,chaos
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --suites integration,chaos
 
 # Skip `cargo build` if you trust target/release is fresh
-/e/miniconda/envs/tts/python.exe tts_tools/run_all.py --quick --no-rebuild
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --quick --no-rebuild
 
 # List every available suite
-/e/miniconda/envs/tts/python.exe tts_tools/run_all.py --list
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --list
 
 # Skip HTML report rendering
-/e/miniconda/envs/tts/python.exe tts_tools/run_all.py --quick --no-report
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --quick --no-report
 ```
 
 Outputs:

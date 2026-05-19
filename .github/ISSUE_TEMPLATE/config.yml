@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and discussion
+    url: https://github.com/Wty2003328/waifu-companion/discussions
+    about: "Ask a question, share a setup, or float an idea before filing a feature request."
+  - name: Adding a new TTS engine
+    url: https://github.com/Wty2003328/waifu-companion/blob/main/docs/ADDING-A-TTS-ENGINE.md
+    about: "Step-by-step how-to. The TTS Provider Spec v1 is the only contract."
+  - name: Adding a new Pulse collector
+    url: https://github.com/Wty2003328/waifu-companion/blob/main/docs/ADDING-A-PULSE-COLLECTOR.md
+    about: "Implement the Collector trait in crates/companion-pulse."

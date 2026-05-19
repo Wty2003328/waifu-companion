@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Live2D anime avatar subsystem for waifu-companion."
+description = "Live2D avatar subsystem (TTS, subagent, lip-sync, WebSocket transport) for waifu-companion."
+homepage = "https://github.com/Wty2003328/waifu-companion"
+readme = "../../README.md"
+keywords = ["waifu-companion", "live2d", "tts", "avatar", "lip-sync"]
+categories = ["multimedia"]
 
 [dependencies]
 companion-core.workspace = true

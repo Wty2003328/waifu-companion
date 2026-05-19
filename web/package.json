@@ -3,11 +3,31 @@
   "private": true,
   "version": "0.1.0",
   "license": "(MIT OR Apache-2.0)",
+  "description": "Web UI for waifu-companion: Live2D viewer, settings, character roster, chat, and the Pulse dashboard.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wty2003328/waifu-companion.git",
+    "directory": "web"
+  },
+  "homepage": "https://github.com/Wty2003328/waifu-companion#readme",
+  "bugs": "https://github.com/Wty2003328/waifu-companion/issues",
+  "author": "waifu-companion contributors",
+  "keywords": [
+    "waifu-companion",
+    "live2d",
+    "tts",
+    "tauri",
+    "react",
+    "avatar"
+  ],
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:ui": "vitest --ui"
   },
   "dependencies": {
     "@pixi/unsafe-eval": "^7.4.3",
@@ -22,10 +42,16 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.5.2",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",
     "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
     "typescript": "~5.7.2",
-    "vite": "^6.4.2"
+    "vite": "^6.4.2",
+    "vitest": "^2.1.8"
   }
 }

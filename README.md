@@ -4,9 +4,11 @@
 > synthesis, multi-character roster, and an ambient information
 > dashboard.
 
+[![CI](https://github.com/Wty2003328/waifu-companion/actions/workflows/ci.yml/badge.svg)](https://github.com/Wty2003328/waifu-companion/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tauri 2](https://img.shields.io/badge/tauri-2.x-brightgreen.svg)](https://tauri.app/)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 `waifu-companion` is a Tauri 2 desktop application that gives a
 self-hosted AI agent a face, a voice, and a workspace. The agent runs
@@ -22,6 +24,15 @@ Three agent flavors are supported out of the box:
 [hermes-agent](https://github.com/NousResearch/hermes-agent).
 Anything else that speaks zeroclaw's `/webhook` shape works as
 `custom`.
+
+<!--
+  Screenshots and demo GIFs live in assets/. Drop in your own and
+  uncomment the lines below. See assets/README.md for conventions.
+
+  ![Main window](assets/screenshots/main.png)
+  ![Desktop pet overlay](assets/screenshots/overlay.png)
+  ![Pulse dashboard](assets/screenshots/pulse.png)
+-->
 
 ## Features
 
@@ -436,33 +447,52 @@ cd apps/companion-tauri && cargo tauri dev
 build, so a `cargo build -p companion-server --release` followed by
 `cargo tauri build` always ships the latest sidecar.
 
-End-to-end test suites under `scripts/` cover canvas preferences,
-overlay drag, model swap, character CRUD, parameter sliders, webcam
-tracking, multi-window chat history, the subagent pipeline, and
-audio chunk fingerprinting. Each is runnable in isolation against a
-`companion-server` listening on `:9181`:
+The deeper test layers (wire-contract rigs, lifecycle tests, frontend
+e2e, chaos, Tauri smoke) live under `tts_tools/` and are driven by a
+single orchestrator:
 
 ```bash
-python scripts/e2e_characters_test.py
-./scripts/smoke.sh             # full sweep
+# Pre-set this once, or rely on the auto-detection. See
+# docs/DEVELOPMENT-SETUP.md for the resolution order.
+export COMPANION_TTS_PYTHON=/path/to/your/python
+
+# Full sweep — runs roughly L1 through L6 of the testing protocol.
+# Add --no-gpu to skip the audio-integrity rig.
+$COMPANION_TTS_PYTHON tts_tools/run_all.py --quick
 ```
+
+See [`docs/TESTING-SOP.md`](docs/TESTING-SOP.md) for the layered
+testing protocol, what each layer proves, and how to run pieces
+individually. `scripts/e2e_*.py` are bug-flavored regression nets,
+not core coverage — most assume a fully-configured running stack.
 
 ## Contributing
 
-Pull requests welcome. Entry points worth knowing:
+Pull requests welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for
+the full guide. Three good entry points for a first PR:
 
-- **New TTS engine** — write a wrapper that implements the
-  [TTS Provider Spec v1](docs/TTS-PROVIDER-SPEC.md) (4 HTTP endpoints),
-  then point `[avatar.tts] launch_command` at it. The two reference
-  sidecars in `tools/avatar/` (Qwen3-TTS local, OpenAI cloud proxy)
-  are working examples.
+- **New TTS engine** — implement the four endpoints of the
+  [TTS Provider Spec v1](docs/TTS-PROVIDER-SPEC.md) in any language,
+  then point `[avatar.tts] launch_command` at it. Step-by-step:
+  [`docs/ADDING-A-TTS-ENGINE.md`](docs/ADDING-A-TTS-ENGINE.md).
 - **New Live2D model** — drop the directory under
   `web/public/live2d/models/`; it will appear in the model picker.
-- **New Pulse collector** — implement `Collector` in
-  `crates/companion-pulse/src/collectors.rs`.
+- **New Pulse collector** — implement the `Collector` trait in
+  `crates/companion-pulse`. Step-by-step:
+  [`docs/ADDING-A-PULSE-COLLECTOR.md`](docs/ADDING-A-PULSE-COLLECTOR.md).
 
-Run `cargo test --workspace` and `./scripts/smoke.sh` before opening
-a PR.
+Before opening a PR:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cd web && npm run build && cd ..
+```
+
+For deeper checks (wire contract, lifecycle, e2e):
+`$COMPANION_TTS_PYTHON tts_tools/run_all.py --quick`. See
+[`docs/DEVELOPMENT-SETUP.md`](docs/DEVELOPMENT-SETUP.md) for the
+Python sidecar bootstrap.
 
 ## License
 

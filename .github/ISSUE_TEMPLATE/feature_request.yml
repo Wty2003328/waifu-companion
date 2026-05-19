@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest a new feature, a new TTS / agent / collector backend, or a UX improvement.
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Before filing, please skim the open
+        issues and the design docs under `docs/` (specifically the
+        `PLAN-*.md` files, which capture deferred designs and the
+        reasoning around them).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem you're trying to solve?
+      description: Describe the user-facing situation, not the implementation.
+      placeholder: e.g. I'd like the avatar to greet me by name when I open the app.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Optional. If you have a specific idea, describe it.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this affect?
+      multiple: true
+      options:
+        - "Avatar / Live2D"
+        - "TTS / voice"
+        - "Subagent (translation / expression)"
+        - "Pulse dashboard"
+        - "Chat / agent integration"
+        - "Settings UI"
+        - "Tauri desktop shell"
+        - "Docs / examples"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Have you tried anything that almost works? Are there workarounds?

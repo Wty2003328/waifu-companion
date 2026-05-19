@@ -355,15 +355,36 @@ class CheckReporter:
 # Misc
 # ---------------------------------------------------------------------------- #
 def python_exe() -> str:
-    """Return the Python interpreter to use for spawning sidecars. Mirrors the
-    auto-resolve order in companion-avatar/src/tts_server.rs:
-      1. $COMPANION_TTS_PYTHON
-      2. E:/miniconda/envs/tts/python.exe (canonical Windows dev path)
-      3. sys.executable (whatever's running this rig)
+    """Return the Python interpreter to use for spawning sidecars.
+
+    Resolution order (mirrors companion-avatar/src/tts_server.rs):
+      1. $COMPANION_TTS_PYTHON — explicit override; always wins.
+      2. A list of common conda env paths across OSes — covers the
+         typical "I made a `tts` env on Windows/Linux/Mac" case.
+      3. sys.executable — the interpreter running this rig.
+
+    Most contributors will either set $COMPANION_TTS_PYTHON once or
+    rely on (3) by running the rig from the conda env directly. The
+    (2) auto-detection list is just a courtesy for the common case.
     """
     if (p := os.environ.get("COMPANION_TTS_PYTHON")):
         return p
-    canonical = "E:/miniconda/envs/tts/python.exe"
-    if Path(canonical).exists():
-        return canonical
+
+    home = Path.home()
+    candidates = [
+        # Windows conda
+        Path("E:/miniconda/envs/tts/python.exe"),
+        Path("C:/miniconda3/envs/tts/python.exe"),
+        Path("C:/ProgramData/miniconda3/envs/tts/python.exe"),
+        home / "miniconda3" / "envs" / "tts" / "python.exe",
+        home / "anaconda3" / "envs" / "tts" / "python.exe",
+        # POSIX conda
+        home / "miniconda3" / "envs" / "tts" / "bin" / "python",
+        home / "anaconda3" / "envs" / "tts" / "bin" / "python",
+        Path("/opt/miniconda3/envs/tts/bin/python"),
+        Path("/opt/anaconda3/envs/tts/bin/python"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
     return sys.executable

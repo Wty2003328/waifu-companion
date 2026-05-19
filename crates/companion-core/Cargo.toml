@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Shared types, zeroclaw API client, and OpenAI-compatible LLM client for waifu-companion."
+description = "Shared types, agent API client, and OpenAI-compatible LLM client for waifu-companion."
+homepage = "https://github.com/Wty2003328/waifu-companion"
+readme = "../../README.md"
+keywords = ["waifu-companion", "agent", "llm", "sse"]
+categories = ["api-bindings", "network-programming"]
 
 [dependencies]
 tokio.workspace = true

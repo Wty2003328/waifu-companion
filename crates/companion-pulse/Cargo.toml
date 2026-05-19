@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Pulse dashboard subsystem (collectors, scheduler, storage) for waifu-companion."
+homepage = "https://github.com/Wty2003328/waifu-companion"
+readme = "../../README.md"
+keywords = ["waifu-companion", "rss", "feed", "collector", "pulse"]
+categories = ["multimedia", "database"]
 
 [dependencies]
 companion-core.workspace = true

@@ -21,6 +21,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["waifu-companion contributors"]
 repository = "https://github.com/Wty2003328/waifu-companion"
+homepage = "https://github.com/Wty2003328/waifu-companion"
 rust-version = "1.88"
 
 [workspace.dependencies]

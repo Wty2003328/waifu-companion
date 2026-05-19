@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "waifu-companion server: serves the avatar/Pulse UI, drives TTS, bridges to the upstream zeroclaw daemon."
+description = "waifu-companion server: serves the avatar/Pulse UI, drives TTS, and bridges to the upstream agent (zeroclaw / openclaw / hermes / custom)."
+homepage = "https://github.com/Wty2003328/waifu-companion"
+readme = "../../README.md"
+keywords = ["live2d", "tts", "avatar", "tauri", "agent"]
+categories = ["multimedia", "web-programming::http-server"]
 
 [[bin]]
 name = "companion-server"
